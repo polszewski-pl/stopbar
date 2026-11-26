@@ -8,7 +8,7 @@ const cmd = argv[0] ?? 'help'
 
 const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code hooks)
 
-  stopbar init --build "<cmd>" --test "<cmd>" [--profile default|ts|python|strict] [--max-retries 3] [--cap 500]
+  stopbar init --build "<cmd>" --test "<cmd>" [--profile default|ts|python|strict] [--base-ref <ref>] [--max-retries 3] [--cap 500]
                [--cost 1] [--hooks claude,claude-project,cursor,codex,gemini,antigravity,git] [--no-pin] [--force] [--force-hooks] [--repo <dir>]
   stopbar hook [--adapter auto|claude|cursor|codex|gemini|antigravity]
                                    the agent hook (JSON on stdin); auto detects the client from the payload

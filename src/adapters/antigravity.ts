@@ -11,7 +11,7 @@ const READ = new Set(['view_file', 'view_file_outline', 'view_code_item', 'view_
 const OUT = new Set(['read_url_content', 'search_web', 'open_browser_url', 'read_browser_page', 'execute_browser_javascript', 'click_browser_pixel', 'mcp_tool', 'call_mcp_tool'])
 
 function tool(name: string, args: Record<string, any>): ToolClass {
-  if (name === 'run_command' || name === 'shell_exec' || name === 'send_command_input' || name === 'notebook_execution') return shell(commandText(args.CommandLine ?? args.Command ?? args.command ?? args.Input ?? ''))
+  if (name === 'run_command' || name === 'shell_exec' || name === 'send_command_input' || name === 'notebook_execution') return shell(commandText(args.CommandLine ?? args.Command ?? args.command ?? args.Input ?? ''), args.IsDaemon === true)
   if (EDIT.has(name)) return edit(pathsOf(args))
   if (READ.has(name)) return read(pathsOf(args))
   if (name === 'grep_search') return {tool_name: 'Grep', tool_input: {pattern: args.Query ?? args.query, path: args.SearchPath ?? args.SearchDirectory}}

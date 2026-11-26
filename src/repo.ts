@@ -166,11 +166,23 @@ export function differsFromHead(r: Repo, now: Entries): boolean {
   }
 }
 
-/** Which of `paths` exist in HEAD (one git process, only when test files changed). */
-export function inHead(root: string, paths: string[]): Set<string> {
+/** Does `ref` resolve to a git tree? */
+export function hasRefTree(root: string, ref: string): boolean {
+  try { git(root, ['rev-parse', '-q', '--verify', `${ref}^{tree}`]); return true } catch { return false }
+}
+
+/** Which of `paths` exist in `ref` (one git process, only when test files changed).
+ *  For an explicit non-HEAD ref, fails closed if the ref cannot be resolved so existing tests are never treated as new. */
+export function inRef(root: string, ref: string, paths: string[]): Set<string> {
   if (!paths.length) return new Set()
   try {
-    const out = git(root, ['--literal-pathspecs', '-c', 'core.quotepath=false', 'ls-tree', '-r', '-z', '--name-only', '--full-tree', 'HEAD', '--', ...paths])
+    const out = git(root, ['--literal-pathspecs', '-c', 'core.quotepath=false', 'ls-tree', '-r', '-z', '--name-only', '--full-tree', ref, '--', ...paths])
     return new Set(out.split('\0').filter(Boolean))
-  } catch { return new Set() }
+  } catch {
+    if (ref === 'HEAD') return new Set()
+    throw new FailClosed(`baseRef ${JSON.stringify(ref)} could not be resolved in git`, 'a human restores the ref or runs `stopbar init --force ... --base-ref <ref>`')
+  }
 }
+
+/** Which of `paths` exist in HEAD (one git process, only when test files changed). */
+export const inHead = (root: string, paths: string[]) => inRef(root, 'HEAD', paths)

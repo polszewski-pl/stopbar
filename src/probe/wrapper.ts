@@ -18,8 +18,8 @@ type Action =
   | {t: 'shellEdit'; file: string; content: string}
   | {t: 'shellDelete'; file: string}
   | {t: 'humanEdit'; file: string; content: string}
-  | {t: 'build'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted'}
-  | {t: 'fulltest'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted'}
+  | {t: 'build'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted' | 'bgPre' | 'bgPost'}
+  | {t: 'fulltest'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted' | 'bgPre' | 'bgPost'}
   | {t: 'partial'; pass: boolean}
   | {t: 'shell'; cmd: 'ls -la' | 'curl --version' | 'cat .env' | 'git status'}
   | {t: 'read'; file: string}
@@ -56,8 +56,8 @@ function genRun(seed: number): Run {
     [4, () => ({t: 'shellEdit', file: anyFile(), content: content()})],
     [2, () => ({t: 'shellDelete', file: anyFile()})],
     [2, () => ({t: 'humanEdit', file: anyFile(), content: content()})],
-    [10, () => ({t: 'build', outcome: pick(['pass', 'pass', 'pass', 'fail', 'interrupt', 'interrupted'] as const)})],
-    [10, () => ({t: 'fulltest', outcome: pick(['pass', 'pass', 'pass', 'fail', 'fail', 'interrupt', 'interrupted'] as const)})],
+    [10, () => ({t: 'build', outcome: pick(['pass', 'pass', 'pass', 'fail', 'interrupt', 'interrupted', 'bgPre', 'bgPost'] as const)})],
+    [10, () => ({t: 'fulltest', outcome: pick(['pass', 'pass', 'pass', 'fail', 'fail', 'interrupt', 'interrupted', 'bgPre', 'bgPost'] as const)})],
     [3, () => ({t: 'partial', pass: r() < 0.6})],
     [5, () => ({t: 'shell', cmd: pick(['ls -la', 'curl --version', 'cat .env', 'git status'] as const)})],
     [4, () => ({t: 'read', file: pick(['.env', 'src/c0.mjs', 'secrets/key.txt', 'README.md'])})],
@@ -188,8 +188,19 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
       case 'humanEdit': put(a.file, a.content); break
       case 'build': case 'fulltest': {
         const command = a.t === 'build' ? 'node build.mjs' : 'node --test'
+        if (a.outcome === 'bgPre') {
+          expCode = 2
+          gotCode = hook('PreToolUse', 'Bash', {command, run_in_background: true})
+          break
+        }
         expCode = expectPre(); gotCode = hook('PreToolUse', 'Bash', {command})
         if (gotCode !== 0 || expCode !== 0) break
+        if (a.outcome === 'bgPost') {
+          mSync(0)
+          expCode = 2
+          gotCode = hook('PostToolUse', 'Bash', {command}, {tool_response: {...okResp.tool_response, backgroundTaskId: 'bg-task-1'}})
+          break
+        }
         const op = a.t === 'build' ? 'RUN_BUILD' : 'RUN_TESTS'
         if (a.outcome !== 'interrupt') kstep({op, passed: a.outcome === 'pass', fullSuite: a.t === 'fulltest', cost})
         expCode = postCode(mSync(0))

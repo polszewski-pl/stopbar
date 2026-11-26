@@ -7,10 +7,21 @@ const norm = (p: string) => p.replace(/\\/g, '/')
 
 export const isTestPath = (p: string, paths: Paths) => matchAny(norm(p), paths.tests)
 export const isTestConfigPath = (p: string, paths: Paths) => matchAny(norm(p), paths.testConfig)
-/** Secret by file name. Absolute paths match too (a pattern may match any suffix of the path). */
+// Source-code extensions that a wildcard `secrets.*` pattern must not treat as secret data files
+// (e.g. `src/integration/secrets.ts` is a TypeScript module, not a secret store).
+const CODE_EXT = /\.(?:[cm]?[jt]sx?|py|go|rs|java|cs|rb|php|swift|kt|scala|c|cc|cpp|h|hpp|md)$/i
+const WILDCARD_EXT_SECRET = /^(?:\*\*\/)?secrets\.\*$/i
+
+function matchesSecretGlob(p: string, g: string): boolean {
+  const n = norm(p)
+  if (!matchAnySuffix(n, [g])) return false
+  if (WILDCARD_EXT_SECRET.test(g) && CODE_EXT.test(n)) return false
+  return true
+}
+
 /** The first secret pattern a path matches, or null. Absolute paths match too (a pattern may match any suffix). */
 export function secretPattern(p: string, paths: Paths): string | null {
-  for (const g of paths.secrets) if (matchAnySuffix(norm(p), [g])) return g
+  for (const g of paths.secrets) if (matchesSecretGlob(p, g)) return g
   return null
 }
 export const isSecretPath = (p: string, paths: Paths) => secretPattern(p, paths) !== null
@@ -117,7 +128,7 @@ export type SecretHit = {token: string; pattern: string}
 /** The first secret path named in a command (e.g. `cat .env`, `type secrets\\db.txt`), with the pattern it matched. */
 export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true): SecretHit | null {
   for (const tok of cmd.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)) {
-    const hits = paths.secrets.filter((g) => matchAnySuffix(norm(tok), [g]))
+    const hits = paths.secrets.filter((g) => matchesSecretGlob(tok, g))
     if (!hits.length) continue
     const strong = hits.find((g) => !EXT_ONLY.test(g))
     if (strong) return {token: tok, pattern: strong}
@@ -197,6 +208,44 @@ const DOT_GIT = SEG('.git')
 const AGENT_DIRS: [RegExp, string][] = [[SEG('.claude'), '.claude'], [SEG('.cursor'), '.cursor'], [SEG('.codex'), '.codex'], [SEG('.gemini'), '.gemini'], [SEG('.agents'), '.agents']]
 const HUMAN_ONLY = /\b(approve-tests|approve-shell)\b|\bSTOPBAR_[A-Z_]+/i
 const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|doctor\s+--fix)\b/i
+
+/** Command text inspected by self-protection. For a plain single-command `git commit` (chain-free, no substitution),
+ *  strips the commit message (safe heredoc body or quoted `-m` / `--message` string) because git treats it as data. */
+export function commandForSelfProtect(cmd: string, shell: 'bash' | 'powershell' = 'bash'): string {
+  if (shell !== 'bash') return cmd
+  const c = cmd.trim()
+  const hd = parseSafeHeredocCommit(c)
+  if (hd) return hd.prefix
+  if (!COMMIT_ONLY_RE.test(c) || scanPlain(c).chain) return cmd
+  // Quote-aware strip of top-level `-m "..."` / `-am '...'` / `--message="..."` literals.
+  let out = ''
+  for (let i = 0; i < c.length;) {
+    const ch = c[i]
+    if (ch === "'" || ch === '"') {
+      const start = i++
+      while (i < c.length && c[i] !== ch) { if (ch === '"' && c[i] === '\\') i++; i++ }
+      i++
+      out += c.slice(start, i)
+      continue
+    }
+    if (ch === '\\') { out += c.slice(i, i + 2); i += 2; continue }
+    const atWordStart = i === 0 || /\s/.test(c[i - 1])
+    if (atWordStart && ch === '-') {
+      const m = /^(?:-[a-zA-Z]*m(?:\s+|(?=["']))|--message(?:=|\s+))/.exec(c.slice(i))
+      if (m) {
+        const after = i + m[0].length
+        const q = c[after]
+        if (q === '"' || q === "'") {
+          let j = after + 1
+          while (j < c.length && c[j] !== q) { if (q === '"' && c[j] === '\\') j++; j++ }
+          if (j < c.length) { out += '-m ""'; i = j + 1; continue }
+        }
+      }
+    }
+    out += ch; i++
+  }
+  return out
+}
 
 /** Shell command text. Returns the reason for a block, or null. Text matching only: see SECURITY.md. */
 export function protectedCommand(cmd: string, pr: Protect): string | null {

@@ -5,7 +5,7 @@ import {type Config, ConfigError, validateConfig} from './config.ts'
 import {CODEC} from './kernel.gen.js'
 import {FailClosed, type Repo} from './repo.ts'
 
-export const VERSION = '1.1.0'
+export const VERSION = '1.1.1'
 export type KState = {scalars: Record<string, number>; maps: Record<string, unknown>}
 export type Saved = {version: 2; kernel: KState; snapshot: string; params: {maxRetries: number; cap: number}}
 

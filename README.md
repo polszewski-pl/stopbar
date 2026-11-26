@@ -76,8 +76,11 @@ Requirements: Node.js 22.18 or later, git, a git repository.
    `doctor` checks Node, git, the kernel link, `config.json`, `state.json`, the event log and the hooks of every client
    it finds, and makes a dry run of the real hook pipeline on a scratch repository.
 
-The agent must run the gate commands exactly as configured and alone, for example `npm test` and not
-`npm test | tail`. Commits must be one command. The quoted heredoc form that agents use is allowed:
+The agent must run the gate commands exactly as configured, alone and in the foreground, for example `npm test` and not
+`npm test | tail` or with `run_in_background`. For long-running gates (>10 min), run `npx stopbar run build` /
+`npx stopbar run test` (safe to run in the background: Stopbar records the real exit status only when the process
+finishes, and discards the result if the working tree changed in the meantime). Commits must be one command. The quoted
+heredoc form that agents use is allowed:
 
 ```sh
 git commit -m "$(cat <<'EOF'
@@ -92,7 +95,7 @@ EOF
 
 | Command | Who | What it does |
 |---|---|---|
-| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. |
+| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). |
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
 | `stopbar run build\|test` | human, agent, CI | Runs the configured gate command and records its real exit status. |
@@ -138,6 +141,11 @@ profile by editing the lists: no code change is necessary.
   other pattern (`.env*`, `id_rsa*`) count always. `stopbar status` says why the secret gate is on, for example
   `secret read yes (matched *.key (server.key) in Bash at rev 3)`; `events.jsonl` keeps the pattern and the token,
   never the file content.
+- **`baseRef`** (optional, set via `stopbar init --base-ref <ref>`) controls which git ref defines an "existing" test
+  file (default: `HEAD`). On a multi-commit feature branch, `--base-ref main` (or a base commit SHA) lets the agent
+  refine new test files it added on that branch across commits without triggering `testsTainted`, while existing tests
+  from `baseRef` and all test-config files remain protected. A configured non-`HEAD` ref that cannot be resolved fails
+  closed.
 - **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default is
   `["mcp__ccd_turn__*"]`, the task-list and turn-summary tools of Claude Desktop. It only exempts tools from the
   outbound gate (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before, and a halted
@@ -196,12 +204,12 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 28/28 | 237/237 | 201/201 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 28/28 | 237/237 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 31/31 | 258/258 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 31/31 | 258/258 | 202/202 sequences | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
-git commits and pushes. The probe runs the same 200 seeds plus 1 regression on both platforms, with the same 5007 steps
-and 7085 hook calls. `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
+git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5007 steps
+and 7176 hook calls. `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry`.
 
 ## License

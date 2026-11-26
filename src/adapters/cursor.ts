@@ -6,7 +6,7 @@
 import {type Adapter, byName, commandText, edit, exitCodeIn, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
 
 function tool(name: string, ti: Record<string, any>): ToolClass {
-  if (name === 'Shell') return shell(commandText(ti.command))
+  if (name === 'Shell') return shell(commandText(ti.command), ti.is_background === true || ti.run_in_background === true)
   if (name === 'Read') return read(pathsOf(ti))
   if (['Write', 'Edit', 'Delete', 'StrReplace', 'MultiEdit', 'ApplyPatch'].includes(name)) return edit(pathsOf(ti))
   if (name === 'Grep' || name === 'Glob') return {tool_name: name, tool_input: {pattern: ti.pattern, path: ti.path}}

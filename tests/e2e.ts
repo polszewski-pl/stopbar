@@ -779,6 +779,119 @@ say('\nS27 why the secret gate is on, no *.key false alarm on code, safeTools fo
   keepEvents(repo, 's27-secrets')
 }
 
+// ---------------------------------------------------------------- S28 background gates (P0 regression: backgroundTaskId)
+say('\nS28 background gates (run_in_background / backgroundTaskId) never pass build/test; stale stopbar run discarded')
+{
+  const repo = setupRepo('s28-background-gate')
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // bg\n')
+  const preB = hook(repo, 'PreToolUse', 'Bash', {command: 'node build.mjs', run_in_background: true})
+  const preT = hook(repo, 'PreToolUse', 'Bash', {command: 'node --test', run_in_background: true})
+  check('PreToolUse blocks buildCmd with run_in_background=true (exit 2) and points to stopbar run build',
+    preB.code === 2 && /^BLOCK/.test(preB.msg) && /stopbar run build/.test(preB.msg), preB.msg.slice(0, 140))
+  check('PreToolUse blocks fullTestCmd with run_in_background=true (exit 2) and points to stopbar run test',
+    preT.code === 2 && /^BLOCK/.test(preT.msg) && /stopbar run test/.test(preT.msg), preT.msg.slice(0, 140))
+  // defense in depth: even if PostToolUse arrives directly with backgroundTaskId, never mark build or fulltest as passed
+  const postB = hook(repo, 'PostToolUse', 'Bash', {command: 'node build.mjs', run_in_background: true},
+    {stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: 'bg-build-1'})
+  const postT = hook(repo, 'PostToolUse', 'Bash', {command: 'node --test'},
+    {stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: 'bg-test-1'})
+  const v = status(repo)
+  check('PostToolUse with backgroundTaskId refuses to pass build or tests (exit 2, gates stay unpassed)',
+    postB.code === 2 && postT.code === 2 && v.buildOkRev !== v.treeRev && v.testsOkRev !== v.treeRev,
+    `buildOkRev=${v.buildOkRev} testsOkRev=${v.testsOkRev} treeRev=${v.treeRev}`)
+  check('commit and Stop remain blocked after background launches',
+    hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q -m "bg bypass"'}).code === 2 && hook(repo, 'Stop', '', {}).code === 2)
+  // npx stopbar run test in background is allowed in PreToolUse and its immediate background PostToolUse does NOT pass the gate
+  const preRun = hook(repo, 'PreToolUse', 'Bash', {command: 'npx stopbar run test', run_in_background: true})
+  const postRun = hook(repo, 'PostToolUse', 'Bash', {command: 'npx stopbar run test', run_in_background: true},
+    {stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg-run-1'})
+  check('background `npx stopbar run test` is allowed in PreToolUse and does not prematurely pass tests',
+    preRun.code === 0 && postRun.code === 0 && status(repo).testsOkRev !== status(repo).treeRev)
+  // stale stopbar run: if a concurrent edit bumps treeRev while `stopbar run build` is running, the pass is discarded
+  writeFileSync(join(repo, 'build.mjs'),
+    `import {writeFileSync} from 'node:fs'\nimport {spawnSync} from 'node:child_process'\n` +
+    `writeFileSync('src/sum.mjs', 'export const sum = (a, b) => a + b // edited mid-build\\n')\n` +
+    `spawnSync(process.execPath, [${JSON.stringify(CLI)}, 'hook'], {input: JSON.stringify({hook_event_name: 'PostToolUse', tool_name: 'Write', tool_input: {file_path: 'src/sum.mjs'}, cwd: ${JSON.stringify(repo)}}), encoding: 'utf8'})\n`)
+  const stale = spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo], {encoding: 'utf8', cwd: repo})
+  const vStale = status(repo)
+  check('stale stopbar run (working tree changed mid-run) is discarded and does not pass the new revision',
+    stale.status !== 0 && /working tree changed while/.test(stale.stderr + stale.stdout) && vStale.buildOkRev !== vStale.treeRev,
+    `status=${stale.status} buildOkRev=${vStale.buildOkRev} treeRev=${vStale.treeRev}`)
+  keepEvents(repo, 's28-background-gate')
+}
+
+// ---------------------------------------------------------------- S29 secrets.ts false alarm + .git in plain commit -m
+say('\nS29 secrets.ts is not a secret read (strict & legacy secrets.*); plain git commit -m may mention .git/.claude')
+{
+  const repo = setupRepo('s29-secrets-ts', 3, false, ['--profile', 'strict', '--no-pin'])
+  mkdirSync(join(repo, 'src', 'integration'), {recursive: true})
+  writeFileSync(join(repo, 'src', 'integration', 'secrets.ts'), 'export const getSecret = () => "ok"\n')
+  check('strict profile: Read and Bash naming src/integration/secrets.ts do not taint secrets',
+    agentRead(repo, 'src/integration/secrets.ts').code === 0 &&
+    agentBashCC(repo, 'node -e "console.log(\'../../../src/integration/secrets.ts\')"').pre.code === 0 &&
+    status(repo).secretTainted === false)
+  // legacy v1.1.0 config.json containing bare "secrets.*"
+  const cf = join(stateDir(repo), 'config.json')
+  const c = JSON.parse(readFileSync(cf, 'utf8')); c.paths.secrets.push('secrets.*'); writeFileSync(cf, JSON.stringify(c, null, 2))
+  check('legacy config with "secrets.*" still skips src/integration/secrets.ts',
+    agentRead(repo, 'src/integration/secrets.ts').code === 0 &&
+    agentBashCC(repo, 'node -e "console.log(\'../../../src/integration/secrets.ts\')"').pre.code === 0 &&
+    status(repo).secretTainted === false)
+  // plain git commit -m mentioning .git/stopbar, .claude and approve-tests is allowed after green gates
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test'); agentBashCC(repo, 'git add -A')
+  const n = commits(repo)
+  const cm = agentBashCC(repo, 'git commit -q -m "docs: mention .git/stopbar, .claude and approve-tests"')
+  check('plain git commit -m mentioning .git/.claude/approve-tests = ALLOW and creates commit',
+    cm.pre.code === 0 && cm.ran && commits(repo) === n + 1, cm.pre.msg)
+  check('git -C .git commit still blocked', hook(repo, 'PreToolUse', 'Bash', {command: 'git -C .git commit -q -m "x"'}).code === 2)
+  // real secrets.json still triggers READ_SECRET
+  writeFileSync(join(repo, 'secrets.json'), '{"k":"v"}\n')
+  check('secrets.json still sets secretTainted = true', agentRead(repo, 'secrets.json').code === 0 && status(repo).secretTainted === true)
+  keepEvents(repo, 's29-secrets-ts')
+}
+
+// ---------------------------------------------------------------- S30 --base-ref for multi-commit TDD branches
+say('\nS30 --base-ref <ref>: iterating on new tests across commits without taint; existing tests in baseRef stay protected')
+{
+  const repo = setupRepo('s30-base-ref')
+  const baseBranch = run('git rev-parse --abbrev-ref HEAD', repo).stdout.trim()
+  run('git checkout -q -b feat/tdd', repo)
+  check('init rejects a nonexistent --base-ref',
+    human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--base-ref', 'no-such-ref', '--no-pin').code === 1)
+  const ini = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--base-ref', baseBranch, '--no-pin')
+  check('init with valid --base-ref succeeds and prints base ref', ini.code === 0 && ini.out.includes(`base ref: ${baseBranch}`), ini.out.slice(0, 140))
+  check('status and attest (json + md) report baseRef',
+    human(repo, 'status').out.includes(`base ref ${baseBranch}`) &&
+    JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout).config.baseRef === baseBranch &&
+    spawnSync(process.execPath, [CLI, 'attest', '--format', 'md', '--repo', repo], {encoding: 'utf8'}).stdout.includes(`| Base ref | \`${baseBranch}\` |`))
+  // Commit 1: add new test file tests/mul.test.mjs
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b\nexport const mul = (a, b) => a * b\n')
+  const w1 = agentWrite(repo, 'tests/mul.test.mjs', "import {test} from 'node:test'\nimport assert from 'node:assert/strict'\nimport {mul} from '../src/sum.mjs'\ntest('mul', () => assert.equal(mul(2, 3), 6))\n")
+  check('commit 1: brand-new test file does not taint', w1.post?.code === 0 && status(repo).testsTainted === false)
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test'); agentBashCC(repo, 'git add -A')
+  const c1 = agentBashCC(repo, 'git commit -q -m "tdd commit 1"')
+  check('commit 1 allowed', c1.pre.code === 0 && c1.ran)
+  // Commit 2: edit tests/mul.test.mjs (now in HEAD, NOT in baseBranch!)
+  const w2 = agentWrite(repo, 'tests/mul.test.mjs', "import {test} from 'node:test'\nimport assert from 'node:assert/strict'\nimport {mul} from '../src/sum.mjs'\ntest('mul', () => { assert.equal(mul(2, 3), 6); assert.equal(mul(0, 5), 0) })\n")
+  check('commit 2: editing branch-new test file (in HEAD, not in baseRef) does NOT taint',
+    w2.post?.code === 0 && status(repo).testsTainted === false, w2.post?.msg)
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test'); agentBashCC(repo, 'git add -A')
+  const c2 = agentBashCC(repo, 'git commit -q -m "tdd commit 2"')
+  check('commit 2 allowed without approve-tests', c2.pre.code === 0 && c2.ran)
+  // Editing a test that existed in baseBranch STILL taints!
+  const w3 = agentWrite(repo, 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  check('editing existing test from baseRef STILL taints (PAUSE)', w3.post?.code === 2 && status(repo).testsTainted === true)
+  // Broken baseRef fails closed and doctor catches it
+  const cf = join(stateDir(repo), 'config.json')
+  const cfgObj = JSON.parse(readFileSync(cf, 'utf8')); cfgObj.baseRef = 'deleted-ref'; writeFileSync(cf, JSON.stringify(cfgObj, null, 2))
+  const dBad = human(repo, 'doctor')
+  check('doctor reports FAIL on unresolvable baseRef', dBad.code === 1 && /\[FAIL\] baseRef/.test(dBad.out))
+  const wFail = agentWrite(repo, 'tests/mul.test.mjs', '// touch\n')
+  check('unresolvable baseRef fails closed on test edit (exit 2, FAIL-CLOSED)',
+    wFail.post?.code === 2 && /FAIL-CLOSED: baseRef/.test(wFail.post?.msg ?? ''), wFail.post?.msg)
+  keepEvents(repo, 's30-base-ref')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

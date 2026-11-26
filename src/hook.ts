@@ -6,7 +6,7 @@ import * as K from './classify.ts'
 import {type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
 import {matchAny} from './glob.ts'
 import {decode, kstep, type Req, type View} from './engine.ts'
-import {changesSinceHead, countedEntries, diffEntries, differsFromHead, FailClosed, findRepo, gitCalls, inHead, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
+import {changesSinceHead, countedEntries, diffEntries, differsFromHead, FailClosed, findRepo, gitCalls, inRef, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
 import {appendEvent, readConfig, readState, type Saved, withLock, writeState} from './store.ts'
 import {codeDirs} from './pkg.ts'
 
@@ -53,8 +53,8 @@ function syncTree(ctx: Ctx, cost: number, source: string) {
     appendEvent(repo, {source: `${source}:fallback-diff`, note: 'counted snapshot copy missing; diff against HEAD'})
   }
   const testPaths = changes.map((c) => c.path).filter((p) => K.isTestPath(p, cfg.paths) && !K.isTestConfigPath(p, cfg.paths))
-  const head = testPaths.length ? inHead(repo.root, testPaths) : new Set<string>()
-  const cls = K.classifyTreeChange(changes, (p) => head.has(p), cfg.paths)
+  const existing = testPaths.length ? inRef(repo.root, cfg.baseRef ?? 'HEAD', testPaths) : new Set<string>()
+  const cls = K.classifyTreeChange(changes, (p) => existing.has(p), cfg.paths)
   const {before, after} = step(ctx, {op: cls.op, suspicious: cls.suspicious, cost}, `${source}:tree ${cls.why.join(', ') || `${changes.length} file(s)`}`)
   // not executed (halted or over budget): the change stays pending and is counted later
   if (after.treeRev > before.treeRev) { s.snapshot = snap.id; markCounted(repo); ctx.dirty = true }
@@ -62,6 +62,16 @@ function syncTree(ctx: Ctx, cost: number, source: string) {
 }
 
 const block = (reason: string): Out => ({code: 2, msg: `BLOCK (stopbar): ${reason}`})
+
+function isBackgroundInput(ti: any): boolean {
+  return ti?.run_in_background === true || ti?.run_in_background === 'true' || ti?.background === true
+}
+function isBackgroundResponse(tr: any): boolean {
+  if (!tr || typeof tr !== 'object') return false
+  return (typeof tr.backgroundTaskId === 'string' && tr.backgroundTaskId.length > 0) ||
+    (typeof tr.background_task_id === 'string' && tr.background_task_id.length > 0) ||
+    tr.isAsync === true || tr.background === true
+}
 
 // ---------------------------------------------------------------- PreToolUse
 function pre(ctx: Ctx, input: any): Out {
@@ -77,8 +87,7 @@ function pre(ctx: Ctx, input: any): Out {
   }
   if (SHELL_TOOLS.has(tool)) {
     const cmd = String(ti.command ?? '')
-    const hd = tool === 'Bash' ? K.parseSafeHeredocCommit(cmd.trim()) : null
-    const why = K.protectedCommand(hd ? hd.prefix : cmd, ctx.protect)
+    const why = K.protectedCommand(K.commandForSelfProtect(cmd, tool === 'PowerShell' ? 'powershell' : 'bash'), ctx.protect)
     if (why) { appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: why}); return block(`${why}. Ask the human.`) }
   }
   const v = decode(ctx.s.kernel)
@@ -110,7 +119,15 @@ function pre(ctx: Ctx, input: any): Out {
       appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: `chained gate command (${k.reason})`})
       return block(`run \`${k.gate}\` exactly as configured, alone: no ;, &&, ||, |, redirections or $(...). Chained operators hide its exit status.`)
     }
-    if (k.kind === 'build' || k.kind === 'fulltest') return {code: 0} // the result is recorded in PostToolUse
+    if (k.kind === 'build' || k.kind === 'fulltest') {
+      if (isBackgroundInput(ti)) {
+        const which = k.kind === 'build' ? 'build' : 'test'
+        const gate = k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd
+        appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: `background gate command (${k.kind})`})
+        return block(`do not run \`${gate}\` in the background (run_in_background): the hook fires before the process finishes, so its exit status is unknown. Run \`${gate}\` in the foreground, or start \`npx stopbar run ${which}\` in the background so Stopbar records the real exit status only when it finishes.`)
+      }
+      return {code: 0} // the result is recorded in PostToolUse
+    }
     if (k.kind === 'commit') {
       syncTree(ctx, 0, 'pre:commit-sync') // a change nobody reported (background job, human edit) is counted first
       const {after} = step(ctx, {op: 'COMMIT', cost}, `pre:${tool}:commit${k.heredoc ? ':heredoc' : ''}`)
@@ -156,6 +173,9 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
     const meta = input.stopbar ?? {}
     appendEvent(repo, {source: `payload:${input.hook_event_name}`, tool, ...(meta.adapter ? {adapter: meta.adapter, rawKeys: meta.rawKeys} : {inputKeys: Object.keys(input)}),
       toolResponseKeys: tr && typeof tr === 'object' ? Object.keys(tr) : typeof tr})
+    const bg = isBackgroundInput(ti) || isBackgroundResponse(tr)
+    const staleRun = typeof meta.expectedSnapshot === 'string' &&
+      (meta.expectedSnapshot !== ctx.s.snapshot || (typeof meta.expectedRev === 'number' && meta.expectedRev !== decode(ctx.s.kernel).treeRev))
     const code = exitCodeOf(tr)
     const flagged = input.is_error === true || tr?.is_error === true || tr?.interrupted === true
     // some clients send the same post event for success and failure: then only an explicit exit code 0 is a pass
@@ -165,6 +185,19 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
     if (failure && input.is_interrupt === true) {
       // Ctrl+C by the user: not a failed gate and not a retry; the tree is still checked below
       appendEvent(repo, {source: 'post:user-interrupt', tool, kind: k.kind})
+    } else if (!failure && bg && (k.kind === 'build' || k.kind === 'fulltest' || (k.kind === 'shell' && k.partialTests))) {
+      // a background launch fires PostToolUse before the process finishes (e.g. Claude Code backgroundTaskId): never count it
+      appendEvent(repo, {source: 'post:background-gate-ignored', tool, kind: k.kind === 'shell' ? 'partial-tests' : k.kind,
+        ...(typeof tr?.backgroundTaskId === 'string' ? {backgroundTaskId: tr.backgroundTaskId} : typeof tr?.background_task_id === 'string' ? {backgroundTaskId: tr.background_task_id} : {})})
+      if (k.kind !== 'shell') {
+        const which = k.kind === 'build' ? 'build' : 'test'
+        const gate = k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd
+        msgs.push(`BLOCK (stopbar): \`${gate}\` was started in the background, so its exit status is not known yet and the run is not recorded. Run \`${gate}\` in the foreground, or start \`npx stopbar run ${which}\` in the background.`)
+      }
+    } else if (staleRun && (k.kind === 'build' || k.kind === 'fulltest')) {
+      const curRev = decode(ctx.s.kernel).treeRev
+      appendEvent(repo, {source: 'post:stale-gate-run', tool, kind: k.kind, expectedRev: meta.expectedRev, currentRev: curRev})
+      msgs.push(`NOTE (stopbar): working tree changed while \`${k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd}\` was running (started at revision ${meta.expectedRev}, now ${curRev}), so the result was not recorded. Re-run on the current tree.`)
     } else if (!failure && unknown && (k.kind === 'build' || k.kind === 'fulltest' || (k.kind === 'shell' && k.partialTests))) {
       // no exit status in the client's post event: neither a pass nor a failure is recorded (no evidence either way)
       appendEvent(repo, {source: 'post:gate-without-exit-code', tool, kind: k.kind})

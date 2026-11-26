@@ -53,7 +53,7 @@ export function patchPaths(patch: unknown): string[] {
   return [...patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$/gm)].map((m) => m[1])
 }
 
-export const shell = (command: string): ToolClass => ({tool_name: 'Bash', tool_input: {command}})
+export const shell = (command: string, background = false): ToolClass => ({tool_name: 'Bash', tool_input: background ? {command, run_in_background: true} : {command}})
 export function edit(paths: string[]): ToolClass {
   return {tool_name: 'Write', tool_input: {file_path: paths[0] ?? '', file_paths: paths}}
 }

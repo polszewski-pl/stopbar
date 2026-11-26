@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.1 (2026-11-26)
+
+- **Security fix (background gate commands):** Claude Code fires `PostToolUse` immediately with `backgroundTaskId` when
+  a command runs with `run_in_background: true`, before the process finishes. Previously Stopbar treated that immediate
+  event as a passing gate. Now `PreToolUse` blocks `buildCmd` and `fullTestCmd` invoked with `run_in_background: true`
+  (guiding long-running gates to `npx stopbar run build|test`), and `PostToolUse` refuses to record any gate result that
+  carries `backgroundTaskId` or `run_in_background: true` (defense in depth, fail closed).
+- **`stopbar run build|test` stale-tree check:** `stopbar run` captures the tree snapshot before starting the command
+  and discards the result if the working tree changes while it runs (for example during a background `stopbar run`), so
+  a gate started on an older revision never passes a newer one.
+- **No secret false alarm on source code (`secrets.ts`):** `PROFILES.strict` replaces bare `secrets.*` with explicit
+  secret data/config extensions, and the matcher skips source-code extensions (`.ts`, `.js`, `.py`, `.go`, `.rs`, ...)
+  for legacy `secrets.*` patterns in existing `config.json` files. Explicit entries and data files (`secrets.json`,
+  `secrets.yaml`, `secrets.env`) still trigger the secret gate.
+- **`--base-ref <ref>` on `stopbar init` (default `HEAD`):** marks which git ref defines an "existing" test file.
+  Agents on a multi-commit feature branch (e.g. `--base-ref main`) can iterate on new tests added on that branch across
+  commits without triggering `testsTainted`, while existing tests in `baseRef` and all test-config files remain
+  protected. `inRef` fails closed if a configured non-`HEAD` ref cannot be resolved; `status`, `doctor` and `attest`
+  report `baseRef`.
+- **Plain `git commit -m` messages:** for a verified chain-free `git commit` command in Bash, self-protection strips
+  quoted `-m` / `--message` strings (matching the safe heredoc commit behaviour), so commit messages mentioning
+  `.git/stopbar`, `.claude` or `approve-tests` are not falsely blocked.
+
 ## 1.1.0 (2026-11-26)
 
 - Adapters for Cursor, Codex CLI, Gemini CLI and Antigravity CLI next to Claude Code. One internal event, one kernel;

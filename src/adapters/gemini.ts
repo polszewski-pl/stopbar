@@ -7,7 +7,7 @@ const UNIQUE = new Set(['BeforeTool', 'AfterTool', 'BeforeAgent', 'AfterAgent', 
 
 function tool(name: string, ti: Record<string, any>): ToolClass {
   switch (name) {
-    case 'run_shell_command': return shell(commandText(ti.command))
+    case 'run_shell_command': return shell(commandText(ti.command), ti.is_background === true || ti.run_in_background === true)
     case 'write_file': case 'replace': return edit(pathsOf(ti))
     case 'read_file': case 'read_many_files': return read([...pathsOf(ti), ...(Array.isArray(ti.include) ? ti.include : [])])
     case 'glob': return {tool_name: 'Glob', tool_input: {pattern: ti.pattern, path: ti.dir_path}}

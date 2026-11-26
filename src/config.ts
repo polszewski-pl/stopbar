@@ -13,6 +13,8 @@ export type Config = {
   paths: Paths
   /** Tools that are local and never outbound (globs on the tool name); missing = DEFAULT_SAFE_TOOLS. */
   safeTools?: string[]
+  /** Git ref against which a changed test file is judged "existing" (default: HEAD). */
+  baseRef?: string
 }
 
 const TEST_COMMON = ['**/tests/**', '**/test/**', '**/__tests__/**']
@@ -39,7 +41,7 @@ export const PROFILES: Record<string, Paths> = {
   strict: {
     tests: [...TEST_COMMON, ...TEST_PY],
     testConfig: [...CFG_COMMON, ...CFG_PY, 'quality.sh', '**/quality*.sh', 'scripts/quality*', 'uv.lock', 'Dockerfile*', 'docker-compose*.yml', 'hypothesis*.ini'],
-    secrets: [...SECRETS, '*.age', 'secrets.*'],
+    secrets: [...SECRETS, '*.age', 'secrets.{json,yaml,yml,toml,env,ini,txt,cfg,conf,xml,properties,age,enc,key,pem,local,prod,dev,staging}'],
   },
 }
 
@@ -79,17 +81,26 @@ export function validateConfig(c: unknown): Config {
       try { globToRegExp(g) } catch (e) { throw new ConfigError(`config.safeTools: ${(e as Error).message}`) }
     }
   }
+  if (o.baseRef !== undefined) {
+    if (typeof o.baseRef !== 'string' || !isSafeRef(o.baseRef)) throw new ConfigError(`config.baseRef must be a valid git ref (no whitespace, ranges or leading '-'), got ${JSON.stringify(o.baseRef)}`)
+  }
   return o as unknown as Config
 }
 
-export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number}): Config {
+export function isSafeRef(ref: string): boolean {
+  return ref.length > 0 && !ref.startsWith('-') && !ref.includes('..') && !ref.endsWith('.') && !ref.endsWith('/') && /^[A-Za-z0-9._/@^~-]+$/.test(ref)
+}
+
+export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number; baseRef?: string}): Config {
   const profile = a.profile ?? 'default'
   const paths = PROFILES[profile]
   if (!paths) throw new ConfigError(`unknown profile ${JSON.stringify(profile)}; known: ${Object.keys(PROFILES).join(', ')}`)
+  const baseRef = a.baseRef?.trim()
   return validateConfig({
     version: 1, profile, buildCmd: a.buildCmd.trim(), fullTestCmd: a.fullTestCmd.trim(),
     maxRetries: a.maxRetries ?? DEFAULTS.maxRetries, cap: a.cap ?? DEFAULTS.cap, costPerCall: a.costPerCall ?? DEFAULTS.costPerCall,
     paths: {tests: [...paths.tests], testConfig: [...paths.testConfig], secrets: [...paths.secrets]},
     safeTools: [...DEFAULT_SAFE_TOOLS],
+    ...(baseRef && baseRef !== 'HEAD' ? {baseRef} : {}),
   })
 }

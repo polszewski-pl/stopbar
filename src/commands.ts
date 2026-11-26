@@ -8,7 +8,7 @@ import {type Config, ConfigError, makeConfig, PROFILES} from './config.ts'
 import {decode, initKernel, kstep, MACHINE, type Req} from './engine.ts'
 import {whyBlocked} from './hook.ts'
 import {PKG_ROOT} from './pkg.ts'
-import {findRepo, forgetSnapshots, markCounted, type Repo, snapshot} from './repo.ts'
+import {findRepo, forgetSnapshots, hasRefTree, markCounted, type Repo, snapshot} from './repo.ts'
 import {appendEvent, paths, readConfig, readEvents, readState, type Saved, VERSION, withLock, writeConfig, writeState} from './store.ts'
 
 export type Out = {code: number; msg?: string}
@@ -58,8 +58,11 @@ export function init(o: Opts): Out {
   if (existsSync(paths(repo).config) && !o.has('force')) return {code: 1, msg: `already initialised (${paths(repo).config}); use --force to replace config and state`}
   let cfg: Config
   try {
-    cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1)})
+    cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1), baseRef: o.get('base-ref')})
   } catch (e) { if (e instanceof ConfigError) return {code: 1, msg: e.message}; throw e }
+  if (cfg.baseRef && !hasRefTree(repo.root, cfg.baseRef)) {
+    return {code: 1, msg: `--base-ref ${JSON.stringify(cfg.baseRef)} does not resolve to a commit/tree in ${repo.root}`}
+  }
   const hooksOpt = o.get('hooks')
   const targets = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
   mkdirSync(repo.stateDir, {recursive: true})
@@ -70,7 +73,7 @@ export function init(o: Opts): Out {
     const runtime = pin ? pinRuntime(repo) : PKG_ROOT
     const command = hookCommand(runtime)
     appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE})
-    const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}`,
+    const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}${cfg.baseRef ? `; base ref: ${cfg.baseRef}` : ''}`,
       `  hooks run: ${command}`]
     if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
     else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
@@ -99,7 +102,7 @@ function statusText(repo: Repo, cfg: Config, s: Saved): string {
   const torn = readEvents(repo).torn.length
   return [
     `Stopbar ${VERSION}   repo ${repo.root}`,
-    `revision   ${v.treeRev}   (tree ${s.snapshot.slice(0, 12)})`,
+    `revision   ${v.treeRev}   (tree ${s.snapshot.slice(0, 12)})${cfg.baseRef ? `   base ref ${cfg.baseRef}` : ''}`,
     `build      ${ok(v.buildOkRev)}      (${cfg.buildCmd})`,
     `full tests ${ok(v.testsOkRev)}      (${cfg.fullTestCmd})`,
     `tainted    ${yn(v.testsTainted)}   secret read ${v.secretTainted ? `yes (${secretReason(repo)?.text ?? 'reason not in the event log'})` : 'no'}   shell approval held ${yn(v.shellToken)}`,

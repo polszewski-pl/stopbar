@@ -1,0 +1,54 @@
+{
+ "found": "2026-11-26T17:00:00.000Z",
+ "mismatch": {
+  "step": 2,
+  "action": {
+   "t": "fulltest",
+   "outcome": "bgPost"
+  },
+  "what": "kernel state (backgroundTaskId marked RUN_TESTS passed before completion)",
+  "expected": "testsOkRev != treeRev",
+  "actual": "testsOkRev == treeRev"
+ },
+ "run": {
+  "seed": 1101,
+  "params": {
+   "maxRetries": 2,
+   "cap": 20,
+   "cost": 1
+  },
+  "actions": [
+   {
+    "t": "edit",
+    "tool": "Write",
+    "file": "src/c0.mjs",
+    "content": "// bg-gate-regression\n"
+   },
+   {
+    "t": "build",
+    "outcome": "bgPre"
+   },
+   {
+    "t": "build",
+    "outcome": "bgPost"
+   },
+   {
+    "t": "fulltest",
+    "outcome": "bgPre"
+   },
+   {
+    "t": "fulltest",
+    "outcome": "bgPost"
+   },
+   {
+    "t": "commit",
+    "heredoc": false,
+    "msg": "must be blocked after background gates"
+   },
+   {
+    "t": "stop",
+    "active": false
+   }
+  ]
+ }
+}

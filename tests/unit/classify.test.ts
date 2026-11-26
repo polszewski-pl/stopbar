@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {classifyBash, classifyTreeChange, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath} from '../../dist/classify.js'
+import {classifyBash, classifyTreeChange, commandForSelfProtect, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath} from '../../dist/classify.js'
 import {makeConfig, PROFILES, validateConfig} from '../../dist/config.js'
 import {globToRegExp, matchAny} from '../../dist/glob.js'
 
@@ -126,4 +126,54 @@ test('config: safeTools defaults to the Claude Desktop turn tools and is validat
   assert.ok(validateConfig({...cfg, safeTools: undefined}))
   assert.throws(() => validateConfig({...cfg, safeTools: 'x'}), /safeTools must be a list/)
   assert.throws(() => validateConfig({...cfg, safeTools: ['a**']}), /safeTools/)
+})
+
+test('secrets.* wildcard does not flag source code files such as secrets.ts', () => {
+  const legacyStrict = {...P, secrets: [...P.secrets, 'secrets.*']}
+  for (const p of ['../../../src/integration/secrets.ts', 'src/secrets.test.ts', 'pkg/secrets.py', 'internal/secrets.go', 'src/secrets.mjs', 'docs/secrets.md']) {
+    assert.equal(secretPattern(p, legacyStrict), null, `legacy secrets.* must skip code file ${p}`)
+    assert.equal(secretPattern(p, PROFILES.strict), null, `strict profile must skip code file ${p}`)
+    assert.equal(secretInCommand(`cat ${p}`, legacyStrict), null, `bash legacy secrets.* must skip ${p}`)
+  }
+  for (const p of ['secrets.json', 'config/secrets.yaml', 'secrets.yml', 'secrets.env', 'secrets.txt', 'secrets.prod', 'secrets.age']) {
+    assert.ok(secretPattern(p, legacyStrict), `legacy secrets.* must still catch ${p}`)
+    assert.ok(secretPattern(p, PROFILES.strict), `strict profile must catch ${p}`)
+  }
+  // explicit non-wildcard config entry still matches
+  assert.equal(secretPattern('src/secrets.ts', {...P, secrets: ['secrets.ts']}), 'secrets.ts')
+})
+
+test('self-protection: plain git commit -m text may mention .git/.claude/approve-tests; unsafe forms stay blocked', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  for (const c of [
+    'git commit -m "docs: explain .git/stopbar and .claude hooks"',
+    "git commit -am 'fix .git/hooks and approve-tests wording'",
+    'git commit -qm "a \\"quoted\\" .git/config mention"',
+    'git commit --message="mention .git/stopbar" -m "second body .claude"',
+  ]) {
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr), null, c)
+  }
+  for (const c of [
+    'git commit -m "$(rm -rf .git)"',
+    'git commit -m "ok" && rm -rf .git/stopbar',
+    'git -C .git commit -m "x"',
+    'git commit -m "ok" .git/config',
+    'python -c "open(\'.git/config\')"',
+    'echo ".git/stopbar" > report.md',
+  ]) {
+    assert.ok(protectedCommand(commandForSelfProtect(c, 'bash'), pr), c)
+  }
+  // PowerShell keeps full text check
+  assert.ok(protectedCommand(commandForSelfProtect('git commit -m ".git/config"', 'powershell'), pr))
+})
+
+test('config: baseRef validation and makeConfig defaults', () => {
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't'}).baseRef, undefined)
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't', baseRef: 'HEAD'}).baseRef, undefined)
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't', baseRef: 'main'}).baseRef, 'main')
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't', baseRef: 'origin/main'}).baseRef, 'origin/main')
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't', baseRef: 'a50627e'}).baseRef, 'a50627e')
+  for (const bad of ['', '  ', '--evil', 'main..HEAD', 'a b', 'main.', 'main/', 'a;b']) {
+    assert.throws(() => validateConfig({...cfg, baseRef: bad}), /baseRef/, JSON.stringify(bad))
+  }
 })

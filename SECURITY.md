@@ -43,18 +43,25 @@ The wrapper turns tool calls into kernel requests. These rules are plain code. T
 stateful prober (`stopbar probe`, real git repositories, compared with gdp-wired's interpreter) test them.
 There is no proof for them.
 
-- **Gates by exact command.** Only the exact configured `buildCmd` and `fullTestCmd`, alone, count as gate runs. With
-  `;`, `&&`, `||`, `|`, a redirection or `$(...)`, the command is blocked before it runs, because operators hide its exit
-  status. Other test runners count as partial runs: they can fail a session, but they never pass the gate.
+- **Gates by exact command, never in the background.** Only the exact configured `buildCmd` and `fullTestCmd`, alone and
+  in the foreground, count as gate runs. With `;`, `&&`, `||`, `|`, a redirection or `$(...)`, the command is blocked
+  before it runs, because operators hide its exit status. With `run_in_background: true`, the command is blocked before
+  it runs, and any `PostToolUse` carrying `backgroundTaskId` is ignored (never recorded as a pass), because clients fire
+  `PostToolUse` immediately before the background process exits. For long-running gates, use `stopbar run build|test`,
+  which records the real exit status only when the process completes and discards the result if the working tree changed
+  while it was running. Other test runners count as partial runs: they can fail a session, but they never pass the gate.
 - **Results from the event type.** Claude Code sends `PostToolUseFailure` for a failed command and `PostToolUse`
   without an exit code for a successful one. A user interrupt (`is_interrupt`) does not count as a failure.
 - **Tree changes from content.** A private git index in `.git/stopbar/` gives a content snapshot after every edit and
-  every shell call: edits, deletions and new files that are not ignored. A change to a test file that exists in HEAD,
-  or to any test-config file, is suspicious. The path patterns are in `config.json`.
+  every shell call: edits, deletions and new files that are not ignored. A change to a test file that exists in
+  `config.baseRef` (default `HEAD`), or to any test-config file, is suspicious. A configured non-`HEAD` `baseRef` that
+  cannot be resolved fails closed. The path patterns are in `config.json`.
 - **Commits.** `git commit` and `git push` must be one command without operators, also with git global options before
   the subcommand. The one allowed form of command substitution is the quoted heredoc that Claude Code writes:
   `git commit ... -m "$(cat <<'EOF'` … `EOF` `)"`. The delimiter is in single quotes, so bash expands nothing in the
   message. Nothing else may be in the command. Unquoted `<<EOF`, any other `$(...)`, backticks and chains are blocked.
+  For a chain-free `git commit` in Bash, quoted `-m` / `--message` text and the quoted heredoc body are treated as
+  commit-message data by self-protection.
 - **Self-protection, before the kernel, also when halted.** Edit and Write may not touch any `.git/` directory (Stopbar
   state, git hooks, `.git/config`), the hook configuration of a supported agent (`.claude/*settings*.json`,
   `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`, `.gemini/**/hooks.json`,
@@ -89,8 +96,10 @@ that tries to defeat it:
    `claim.key` is not a file); a command that names a `.key` file which does not exist yet is therefore not a read.
    Tools listed in `config.safeTools` (default: Claude Desktop's `mcp__ccd_turn__*` UI tools) are not treated as
    outbound; a human who adds a glob there vouches that those tools send nothing out.
-4. **Weak new tests.** A new test file is not suspicious. A mock of the system under test or an empty assertion in a
-   new file passes. Hard-coded answers in production code are an ordinary code edit.
+4. **Weak new tests and mutable `baseRef`.** A new test file is not suspicious. A mock of the system under test or an
+   empty assertion in a new file passes. Hard-coded answers in production code are an ordinary code edit. When
+   `config.baseRef` is a mutable local branch name (such as `main`) rather than a commit SHA, an agent with shell access
+   can move that branch ref; pass a commit hash (`--base-ref <sha>`) if you want an immutable baseline.
 5. **Ignored files.** Files ignored by `.gitignore` are invisible to the snapshot (for example patches in
    `node_modules`). A change to `.gitignore` itself is suspicious.
 6. **Other commit paths.** Git aliases, `git commit-tree`, `gh pr create` and similar are not detected. The Stop hook
@@ -122,7 +131,7 @@ For a hostile-agent threat model, run the agent in a container or VM: no network
 read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
 the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
 
-## Known limits of 1.1.0
+## Known limits of 1.1.1
 
 - Lean: the check needs Docker and a one-time image build with network access. The base image is pinned by digest and
   the Lean archive by sha256, both recorded at the first build (trust on first use). The Lean export is not

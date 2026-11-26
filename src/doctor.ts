@@ -9,7 +9,7 @@ import {DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
 import {decode, MACHINE} from './engine.ts'
 import {runHook} from './hook.ts'
 import {PKG_ROOT} from './pkg.ts'
-import {FailClosed, findRepo, type Repo} from './repo.ts'
+import {FailClosed, findRepo, hasRefTree, type Repo} from './repo.ts'
 import {paths, readConfig, readEvents, readState, VERSION, writeConfig, writeState} from './store.ts'
 
 type Check = {status: 'OK' | 'WARN' | 'FAIL'; name: string; detail: string}
@@ -156,7 +156,8 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     try {
       const cfg = readConfig(repo); cfgOk = true
       add('OK', 'config.json', `profile ${cfg.profile}; build \`${cfg.buildCmd}\`; full tests \`${cfg.fullTestCmd}\`; maxRetries ${cfg.maxRetries}; cap ${cfg.cap}; ` +
-        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}`)
+        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}${cfg.baseRef ? `; baseRef ${cfg.baseRef}` : ''}`)
+      if (cfg.baseRef) add(hasRefTree(repo.root, cfg.baseRef) ? 'OK' : 'FAIL', 'baseRef', hasRefTree(repo.root, cfg.baseRef) ? `${cfg.baseRef} resolves to a tree` : `${cfg.baseRef} does not resolve in git (existing-test checks will fail closed)`)
       for (const [k, v] of [['buildCmd', cfg.buildCmd], ['fullTestCmd', cfg.fullTestCmd]]) if (hasChain(v)) add('FAIL', 'config.json', `${k} has shell operators: it can never pass as a gate`)
       try {
         const s = readState(repo), v = decode(s.kernel)
