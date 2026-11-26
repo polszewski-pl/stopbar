@@ -67,7 +67,8 @@ function pre(ctx: Ctx, input: any): Out {
   const {repo, cfg} = ctx
   // self-protection: unconditional, before the kernel, also when halted
   if (EDIT_TOOLS.has(tool)) {
-    for (const p of [ti.file_path, ti.notebook_path, ti.path].filter((x) => typeof x === 'string' && x)) {
+    const list = [ti.file_path, ti.notebook_path, ti.path, ...(Array.isArray(ti.file_paths) ? ti.file_paths : [])]
+    for (const p of list.filter((x) => typeof x === 'string' && x)) {
       const why = K.protectedPath(resolve(repo.root, p), repo.root, ctx.protect)
       if (why) { appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: why, path: p}); return block(`writing ${p} is not allowed: ${why}. Ask the human.`) }
     }
@@ -85,7 +86,7 @@ function pre(ctx: Ctx, input: any): Out {
   }
   const cost = cfg.costPerCall
   if (READ_TOOLS.has(tool)) {
-    const ps = [ti.file_path, ti.path, ti.glob, ti.pattern].filter((x) => typeof x === 'string' && x)
+    const ps = [ti.file_path, ti.path, ti.glob, ti.pattern, ...(Array.isArray(ti.file_paths) ? ti.file_paths : [])].filter((x) => typeof x === 'string' && x)
     if (ps.some((p: string) => K.isSecretPath(p, cfg.paths))) step(ctx, {op: 'READ_SECRET', cost}, `pre:${tool}`)
     return {code: 0}
   }
@@ -144,12 +145,15 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
   if (SHELL_TOOLS.has(tool)) {
     const k = K.classifyBash(String(ti.command ?? ''), cfg, tool === 'PowerShell' ? 'powershell' : 'bash')
     const tr = input.tool_response
-    appendEvent(repo, {source: `payload:${input.hook_event_name}`, tool, inputKeys: Object.keys(input),
+    const meta = input.stopbar ?? {}
+    appendEvent(repo, {source: `payload:${input.hook_event_name}`, tool, ...(meta.adapter ? {adapter: meta.adapter, rawKeys: meta.rawKeys} : {inputKeys: Object.keys(input)}),
       toolResponseKeys: tr && typeof tr === 'object' ? Object.keys(tr) : typeof tr})
     const code = exitCodeOf(tr)
     const flagged = input.is_error === true || tr?.is_error === true || tr?.interrupted === true
-    const passed = failure ? false : code !== undefined ? code === 0 : !flagged
-    const note = failure ? ' (PostToolUseFailure)' : code !== undefined ? ` (exit ${code})` : ` (no exit code; is_error/interrupted=${flagged})`
+    // some clients send the same post event for success and failure: then only an explicit exit code 0 is a pass
+    const unknown = meta.requireExitCode === true && code === undefined
+    const passed = failure ? false : code !== undefined ? code === 0 : !flagged && !unknown
+    const note = failure ? ' (PostToolUseFailure)' : code !== undefined ? ` (exit ${code})` : unknown ? ' (no exit code: not counted as a pass)' : ` (no exit code; is_error/interrupted=${flagged})`
     if (failure && input.is_interrupt === true) {
       // Ctrl+C by the user: not a failed gate and not a retry; the tree is still checked below
       appendEvent(repo, {source: 'post:user-interrupt', tool, kind: k.kind})
@@ -187,11 +191,16 @@ export function failMsg(e: unknown): string {
   return `STOPBAR FAIL-CLOSED: ${e instanceof Error ? e.message : String(e)}`
 }
 
-/** One hook call. `raw` is the JSON Claude Code writes on stdin. Never throws. */
+/** One hook call with Claude Code's JSON on stdin (the v1.0 interface). Never throws. */
 export function runHook(raw: string, t0 = performance.now()): Out {
   let input: any
   try { input = JSON.parse(raw) } catch (e) { return {code: 2, msg: `STOPBAR FAIL-CLOSED: hook input is not JSON (${(e as Error).message})`} }
   if (!input || typeof input !== 'object') return {code: 2, msg: 'STOPBAR FAIL-CLOSED: hook input must be a JSON object'}
+  return runEvent(input, t0)
+}
+
+/** One normalised hook event (Claude Code's shape; adapters translate other clients into it). Never throws. */
+export function runEvent(input: any, t0 = performance.now()): Out {
   try {
     const repo = findRepo(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd())
     const g0 = gitCalls
@@ -204,7 +213,7 @@ export function runHook(raw: string, t0 = performance.now()): Out {
           : ev === 'PostToolUseFailure' ? post(ctx, input, true)
             : ev === 'Stop' ? stop(ctx, input) : {code: 0}
       if (ctx.dirty) writeState(repo, ctx.s)
-      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, exit: res.code, gitCalls: gitCalls - g0,
+      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, ...(input.stopbar?.adapter ? {adapter: input.stopbar.adapter} : {}), exit: res.code, gitCalls: gitCalls - g0,
         handlerMs: Math.round(performance.now() - t0), processMs: Math.round(process.uptime() * 1000)})
       return res
     })

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0 (2026-11-26)
+
+- Adapters for Cursor, Codex CLI, Gemini CLI and Antigravity CLI next to Claude Code. One internal event, one kernel;
+  each adapter renders the decision in the client's own protocol.
+- `stopbar hook --adapter auto|claude|cursor|codex|gemini|antigravity`. `auto` (the default) detects the client from
+  the payload; v1.0 Claude Code settings keep working; an unknown or damaged payload fails closed.
+- `stopbar init --hooks` takes `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`,
+  `antigravity` (`agy`) and `git`, comma separated, and merges into existing config files.
+- Git fallback: `stopbar git-hook pre-commit|pre-push`, installed by `init --hooks git` (an existing user hook is kept
+  unless `--force-hooks`), and `stopbar run build|test` to record gate runs for tools without hooks.
+- Self-protection also covers `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`,
+  `.gemini/**/hooks.json` and `.agents/hooks.json`.
+- `stopbar doctor` checks the hooks of every client it finds and the git hooks.
+- Package metadata: repository, homepage and bugs links.
+
 ## 1.0.0 (2026-11-26)
 
 First public release.

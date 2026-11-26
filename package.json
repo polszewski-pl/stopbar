@@ -1,9 +1,17 @@
 {
   "name": "stopbar",
-  "version": "1.0.0",
-  "description": "Proven gates for coding agents: no commit without a passing build and a full passing test suite, no silent test weakening, no exfiltration after a secret read. Claude Code hooks backed by a formally proven kernel.",
+  "version": "1.1.0",
+  "description": "A formally proven execution gate for AI coding agents: hooks for Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, plus git hooks. No commit without a passing build and full test suite, no silent test weakening, no exfiltration after a secret read.",
   "author": "Paweł Olszewski <kontakt@polszewski.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/polszewski-pl/stopbar.git"
+  },
+  "homepage": "https://github.com/polszewski-pl/stopbar#readme",
+  "bugs": {
+    "url": "https://github.com/polszewski-pl/stopbar/issues"
+  },
   "type": "module",
   "bin": {
     "stopbar": "bin/stopbar.mjs"
@@ -35,6 +43,11 @@
   },
   "keywords": [
     "claude-code",
+    "cursor",
+    "codex",
+    "gemini-cli",
+    "antigravity",
+    "ai-agents",
     "hooks",
     "coding-agent",
     "guardrails",

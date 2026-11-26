@@ -1,15 +1,40 @@
 # Stopbar
 
-Stopbar is a set of Claude Code hooks with a formally proven decision kernel. It stops a coding agent from:
+Stopbar is a formally proven execution gate for AI coding agents. It runs as the hooks of Claude Code, Cursor, Codex
+CLI, Gemini CLI and Antigravity CLI, and as git hooks for any other tool. It stops an agent from:
 
 - committing without a passing build and a passing **full** test suite at the current revision of the working tree;
 - weakening existing tests or test configuration without a human approval;
 - running risky or outbound commands after it read a secret, unless a human allows one call;
-- looping on failing builds or tests, or going past a budget of tool calls.
+- looping on failing builds or tests, or going past a budget of tool calls;
+- switching itself off by editing the agent's hook configuration, git hooks or its own state.
 
 The decisions come from one rule, `src/kernel.ts`. gdp-wired 0.60.0 proves its laws by induction, and 10 mutants of
-the rule each fall with a counterexample. The hooks run a step function generated from the same rule, without the prover.
-See [SECURITY.md](SECURITY.md) for what is proven, what the wrapper enforces and what needs an OS sandbox.
+the rule each fall with a counterexample. Every client goes through the same rule: an adapter translates the client's
+hook payload into one internal event and renders the decision in the client's own output format. See
+[SECURITY.md](SECURITY.md) for what is proven, what the wrapper enforces and what needs an OS sandbox.
+
+## Supported agents
+
+| Agent | Config written by `init --hooks` | Events | Block protocol | Status |
+|---|---|---|---|---|
+| Claude Code | `claude`: `.claude/settings.local.json` (`claude-project`: `.claude/settings.json`) | PreToolUse, PostToolUse, PostToolUseFailure, Stop | exit 2, reason on stderr | live-verified (Claude Code 2.1.326) |
+| Cursor | `cursor`: `.cursor/hooks.json` (`failClosed: true`) | preToolUse, postToolUse, postToolUseFailure, stop (also beforeShellExecution, beforeMCPExecution, beforeReadFile, afterFileEdit, afterShellExecution) | exit 2 and `{"permission": "deny"}`; stop: `followup_message` | spec-tested (Cursor hooks reference) |
+| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | spec-tested (command hook schemas of Codex CLI 0.172.0) |
+| Gemini CLI | `gemini`: `.gemini/settings.json` | BeforeTool, AfterTool, AfterAgent | exit 2, reason on stderr; AfterAgent: `decision: "block"` | spec-tested (Gemini CLI hooks reference) |
+| Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | spec-tested (hooks spec of Antigravity CLI 1.5.18) |
+| Any tool, via git | `git`: `.git/hooks/pre-commit`, `.git/hooks/pre-push` | commit, push | exit 1 aborts git | tested with real git (E2E) |
+
+`live-verified` means a live agent session passed through the hooks; `spec-tested` means the adapter follows the
+client's published hook schema and the E2E suite runs it with payloads in that schema. Combine targets in one call:
+`--hooks claude,cursor,codex,gemini,antigravity,git`.
+
+`stopbar hook --adapter auto` (the default) detects the client from the payload, so the v1.0 Claude Code settings keep
+working. An unknown or damaged payload fails closed (exit 2). The configs written by `init` pass `--adapter` explicitly.
+
+**Git fallback.** For a tool without hooks, run the gates through Stopbar so their real exit status counts:
+`npx stopbar run build` and `npx stopbar run test`. The git hooks then allow a commit only after both passed at the
+current tree, block it after an unapproved test change, and block a push after a secret read without approval.
 
 ## Four pillars
 
@@ -17,10 +42,10 @@ See [SECURITY.md](SECURITY.md) for what is proven, what the wrapper enforces and
 |---|---|---|
 | PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
 | PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel. v1.0 has one target, `wrapper` (Stopbar itself). |
-| GATE | `stopbar init`, `hook`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The Claude Code hooks and the human commands. |
+| GATE | `stopbar init`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
 | ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions and the sha256 of the event log. |
 
-## Set up with Claude Code in 3 steps
+## Set up in 3 steps
 
 Requirements: Node.js 22.18 or later, git, a git repository.
 
@@ -30,28 +55,29 @@ Requirements: Node.js 22.18 or later, git, a git repository.
    npm install --save-dev stopbar
    ```
 
-2. **Initialise** with your exact build and full-test commands, and write the hooks into the local Claude Code settings:
+2. **Initialise** with your exact build and full-test commands, and write the hooks of your agents:
 
    ```sh
-   npx stopbar init --build "npm run build" --test "npm test" --hooks local
+   npx stopbar init --build "npm run build" --test "npm test" --hooks claude,cursor,git
    ```
 
    Profiles for the path patterns: `--profile default|ts|python|strict`. `init` copies the runtime to
-   `.git/stopbar/runtime/` and points the 4 hooks (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`) to it
-   in `.claude/settings.local.json`. Without `--hooks`, it prints the JSON to paste. A template is in
-   [claude-hooks.example.json](claude-hooks.example.json).
+   `.git/stopbar/runtime/` and points every hook to it. Existing settings and hooks in those files stay; earlier
+   Stopbar entries are replaced. `init` does not overwrite a git hook it did not write, unless you pass
+   `--force-hooks` (the old hook is kept as `<name>.stopbar-backup`). Without `--hooks`, it prints the Claude Code JSON
+   to paste. A template is in [claude-hooks.example.json](claude-hooks.example.json).
 
-3. **Check** the setup, then restart Claude Code in the repository:
+3. **Check** the setup, then restart the agent in the repository:
 
    ```sh
    npx stopbar doctor
    ```
 
-   `doctor` checks Node, git, the kernel link, `config.json`, `state.json`, the event log and the hooks, and makes a dry
-   run of the real hook pipeline on a scratch repository.
+   `doctor` checks Node, git, the kernel link, `config.json`, `state.json`, the event log and the hooks of every client
+   it finds, and makes a dry run of the real hook pipeline on a scratch repository.
 
 The agent must run the gate commands exactly as configured and alone, for example `npm test` and not
-`npm test | tail`. Commits must be one command. The commit form that Claude Code uses is allowed:
+`npm test | tail`. Commits must be one command. The quoted heredoc form that agents use is allowed:
 
 ```sh
 git commit -m "$(cat <<'EOF'
@@ -66,8 +92,10 @@ EOF
 
 | Command | Who | What it does |
 |---|---|---|
-| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--max-retries 3] [--cap 500] [--cost 1] [--hooks local\|project] [--no-pin] [--force]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. |
-| `stopbar hook` | Claude Code | The hook. JSON on stdin. Exit 0 allows, exit 2 blocks (the reason goes to the agent). |
+| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. |
+| `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
+| `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
+| `stopbar run build\|test` | human, agent, CI | Runs the configured gate command and records its real exit status. |
 | `stopbar status [--json]` | human | Revision, gates, taint, budget, and why a commit is blocked. |
 | `stopbar approve-tests [--rev N]` | human | You reviewed the changed tests or test config up to revision N (default: the current one). |
 | `stopbar approve-shell` | human | Allows **one** risky or outbound call after a secret read. |
@@ -147,17 +175,21 @@ For headless agent runs in CI, initialise Stopbar in the job and keep the eviden
 
 Each hook is a separate Node process. The hooks never load the prover. `PreToolUse` makes no git call. `PostToolUse` and
 a commit check make one: `git add -A` on a private index, which the hook then reads itself. `Stop` makes two. On
-Windows 11 with a 330-file repository: p50 127 ms and p95 219 ms over all hook processes. An earlier prototype that
-loaded the prover in every hook measured p50 981 ms and p95 1613 ms. `npm run bench` repeats the measurement.
+Windows 11 with a 330-file repository, in one run with 1.0.0 as the baseline: 1.1.0 p50 94 ms and p95 234 ms over all
+hook processes, including Cursor and Antigravity payloads; 1.0.0 p95 247 ms. The adapter layer adds no measurable
+latency. An earlier prototype that loaded the prover in every hook measured p50 981 ms and p95 1613 ms.
+`npm run bench` repeats the measurement (`--baseline <cli>` compares with another build).
 
 ## Tested platforms
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 19/19 | 149/149 | 201/201 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 19/19 | 149/149 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 26/26 | 221/221 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 26/26 | 221/221 | 201/201 sequences | proven, 10/10 mutants | OK |
 
-The probe runs the same 200 seeds plus 1 regression on both platforms, with the same 5007 steps and 7085 hook calls.
+The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
+git commits and pushes. The probe runs the same 200 seeds plus 1 regression on both platforms, with the same 5007 steps
+and 7085 hook calls. `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry`.
 
 ## License

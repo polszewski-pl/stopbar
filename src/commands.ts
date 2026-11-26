@@ -1,13 +1,14 @@
 // Human commands: init, status, approve-tests, approve-shell, resume, reset. The agent cannot run them
 // through its shell (classify.ts protectedCommand) and cannot edit their files (protectedPath).
-import {cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
-import {dirname, join} from 'node:path'
+import {cpSync, existsSync, mkdirSync, rmSync} from 'node:fs'
+import {join} from 'node:path'
 import {hasChain} from './classify.ts'
+import {CLAUDE_POST_MATCHER, claudeHooks, hookCommand, installHooks, parseTargets} from './integrations.ts'
 import {type Config, ConfigError, makeConfig, PROFILES} from './config.ts'
 import {decode, initKernel, kstep, MACHINE, type Req} from './engine.ts'
 import {whyBlocked} from './hook.ts'
 import {PKG_ROOT} from './pkg.ts'
-import {FailClosed, findRepo, forgetSnapshots, markCounted, type Repo, snapshot} from './repo.ts'
+import {findRepo, forgetSnapshots, markCounted, type Repo, snapshot} from './repo.ts'
 import {appendEvent, paths, readConfig, readEvents, readState, type Saved, VERSION, withLock, writeConfig, writeState} from './store.ts'
 
 export type Out = {code: number; msg?: string}
@@ -29,43 +30,10 @@ function humanStep(r: Repo, s: Saved, req: Req, source: string) {
   return after
 }
 
-// ---------------------------------------------------------------- hooks config
-export const HOOK_MATCHERS = {post: 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell'}
-export function hookCommand(runtimeRoot: string): string {
-  return `node "${join(runtimeRoot, 'bin', 'stopbar.mjs').replace(/\\/g, '/')}" hook`
-}
-export function hooksConfig(command: string) {
-  const h = (timeout: number) => [{type: 'command', command, timeout}]
-  return {
-    hooks: {
-      PreToolUse: [{matcher: '*', hooks: h(30)}],
-      PostToolUse: [{matcher: HOOK_MATCHERS.post, hooks: h(60)}],
-      PostToolUseFailure: [{matcher: HOOK_MATCHERS.post, hooks: h(60)}],
-      Stop: [{hooks: h(30)}],
-    },
-  }
-}
-const isStopbarHook = (x: any) => Array.isArray(x?.hooks) && x.hooks.some((y: any) => typeof y?.command === 'string' && /stopbar(\.mjs)?"?\s+hook\b/.test(y.command))
-
-/** Merges the Stopbar hooks into .claude/settings(.local).json of the repository. Other keys and hooks stay. */
-export function writeHooks(root: string, which: 'local' | 'project', command: string): string {
-  const f = join(root, '.claude', which === 'local' ? 'settings.local.json' : 'settings.json')
-  let cur: any = {}
-  if (existsSync(f)) {
-    const raw = readFileSync(f, 'utf8')
-    try { cur = raw.trim() ? JSON.parse(raw) : {} } catch (e) { throw new FailClosed(`${f} is not valid JSON (${(e as Error).message}); not overwriting it`, 'fix the file by hand, then run init again') }
-  }
-  const want = hooksConfig(command).hooks as Record<string, any[]>
-  cur.hooks = cur.hooks && typeof cur.hooks === 'object' ? cur.hooks : {}
-  for (const [ev, entries] of Object.entries(want)) {
-    const kept = Array.isArray(cur.hooks[ev]) ? cur.hooks[ev].filter((x: any) => !isStopbarHook(x)) : []
-    cur.hooks[ev] = [...kept, ...entries]
-  }
-  mkdirSync(dirname(f), {recursive: true})
-  writeFileSync(f, JSON.stringify(cur, null, 2) + '\n')
-  return f
-}
-
+// ---------------------------------------------------------------- hooks config (Claude Code; other clients in integrations.ts)
+export const HOOK_MATCHERS = {post: CLAUDE_POST_MATCHER}
+export {hookCommand}
+export const hooksConfig = (command: string) => ({hooks: claudeHooks(command)})
 /** Frozen copy of the runtime (bin/, dist/, package.json) in <git-dir>/stopbar/runtime. The hooks run this copy, so an
  *  agent that edits or rebuilds a Stopbar checkout cannot change the code that judges it. No node_modules needed. */
 export function pinRuntime(r: Repo): string {
@@ -92,6 +60,8 @@ export function init(o: Opts): Out {
   try {
     cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1)})
   } catch (e) { if (e instanceof ConfigError) return {code: 1, msg: e.message}; throw e }
+  const hooksOpt = o.get('hooks')
+  const targets = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
   mkdirSync(repo.stateDir, {recursive: true})
   return withLock(repo, () => {
     writeConfig(repo, cfg)
@@ -102,10 +72,9 @@ export function init(o: Opts): Out {
     appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE})
     const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}`,
       `  hooks run: ${command}`]
-    const which = o.get('hooks')
-    if (which === 'local' || which === 'project') lines.push(`  hooks written to ${writeHooks(repo.root, which, command)}`)
-    else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks local):', JSON.stringify(hooksConfig(command), null, 2))
-    lines.push('Next: restart Claude Code in this repository and run `stopbar doctor`.')
+    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
+    else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
+    lines.push('Next: restart the agent in this repository and run `stopbar doctor`.')
     return {code: 0, msg: lines.join('\n')}
   })
 }

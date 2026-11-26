@@ -56,10 +56,15 @@ There is no proof for them.
   `git commit ... -m "$(cat <<'EOF'` … `EOF` `)"`. The delimiter is in single quotes, so bash expands nothing in the
   message. Nothing else may be in the command. Unquoted `<<EOF`, any other `$(...)`, backticks and chains are blocked.
 - **Self-protection, before the kernel, also when halted.** Edit and Write may not touch any `.git/` directory (Stopbar
-  state, git hooks, `.git/config`), `.claude/*settings*.json`, or the Stopbar code that runs the hooks. A shell command
-  may not name a `.git` or `.claude` directory, write git config (`git config` without `--get` or `--list`), name the
-  Stopbar code, use a `STOPBAR_*` variable, or run a human command (`approve-tests`, `approve-shell`, `stopbar
-  init/resume/reset`).
+  state, git hooks, `.git/config`), the hook configuration of a supported agent (`.claude/*settings*.json`,
+  `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`, `.gemini/**/hooks.json`,
+  `.agents/hooks.json`, at project and user level), or the Stopbar code that runs the hooks. A shell command may not
+  name a `.git`, `.claude`, `.cursor`, `.codex`, `.gemini` or `.agents` directory, write git config (`git config`
+  without `--get` or `--list`), name the Stopbar code, use a `STOPBAR_*` variable, or run a human command
+  (`approve-tests`, `approve-shell`, `stopbar init/resume/reset`).
+- **One kernel for every agent.** An adapter per client (Claude Code, Cursor, Codex CLI, Gemini CLI, Antigravity CLI)
+  translates the hook payload into one internal event and the decision into the client's output protocol. The
+  adapters are wrapper code: the E2E suite runs each with payloads in the client's published schema.
 - **Pinned runtime.** `stopbar init` copies the runtime to `.git/stopbar/runtime/` and points the hooks there. An agent
   that edits or rebuilds a Stopbar checkout cannot change the code that judges it.
 - **Fail closed.** Bad hook input, a missing or damaged `config.json` or `state.json`, a busy lock, or any internal
@@ -88,21 +93,36 @@ that tries to defeat it:
    catches uncommitted work only.
 7. **Concurrency and humans.** A change made between two hook calls (a background job, a human edit) is counted as the
    agent's change at the next hook. With parallel tool calls a change can be attributed to the wrong call.
-8. **Claude Code configuration.** Settings outside the repository (user settings, managed settings, `--settings`,
+8. **Agent configuration.** Settings outside the repository (user settings, managed settings, `--settings`,
    `disableAllHooks`) can remove the hooks. The hooks cover what Claude Code sends to them.
 9. **Human approvals.** `approve-tests` and `approve-shell` are only as good as the human review behind them.
+10. **Client-specific limits of the adapters.**
+    - Cursor: a hook exit other than 0 and 2 is fail-open unless the entry sets `failClosed: true`; `init --hooks
+      cursor` sets it. `afterShellExecution` carries no exit code, so a gate command seen only there never passes; the
+      config written by `init` uses `preToolUse` and `postToolUse`.
+    - Codex CLI: there is no failure event. A build or full test run passes only when an exit code 0 is found in the
+      tool result. Codex asks the user to review and trust project hooks; until then they do not run.
+    - Gemini CLI: an exit other than 0 and 2 is only a warning, and invalid JSON output counts as "allow". Stopbar exits
+      2 for every block and internal error, but a crash before Stopbar's own handler (for example a missing Node.js)
+      fails open. Gemini CLI warns when a project hook changes and treats it as untrusted.
+    - Antigravity CLI: hooks of a workspace load only after the folder is trusted. A message after a tool call
+      (PostToolUse) cannot reach the agent; it sees the reason at its next blocked call.
+    - Git fallback: git hooks see only commits and pushes, not reads or shell commands, so the secret gate needs an agent
+      hook to record the read. `git commit --no-verify` and `git push --no-verify` skip git hooks.
 
 For a hostile-agent threat model, run the agent in a container or VM: no network by default, the repository mounted
 read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
 the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
 
-## Known limits of 1.0.0
+## Known limits of 1.1.0
 
 - Lean: the check needs Docker and a one-time image build with network access. The base image is pinned by digest and
   the Lean archive by sha256, both recorded at the first build (trust on first use). The Lean export is not
   deterministic: each export is a different proof tree, and the gate checks the one it exports.
 - Platforms: the unit tests, E2E, `stopbar probe` and `stopbar prove` pass on Windows 11 with Git for Windows and on
   Linux (Debian 13, Node 24, git 2.47). A live Claude Code session ran on Windows. macOS is not tested.
+- Adapters: Cursor, Codex CLI, Gemini CLI and Antigravity CLI are spec-tested (see the README table); a client can
+  change its hook schema in a later version.
 - Hook latency: Windows starts a process in 50–70 ms, so a hook with one git process takes about 120–200 ms in all.
 
 ## Reporting a vulnerability

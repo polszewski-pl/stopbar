@@ -2,7 +2,7 @@
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
-import {join} from 'node:path'
+import {isAbsolute, join} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
 import {makeConfig} from './config.ts'
@@ -46,6 +46,56 @@ function checkHooks(root: string, add: (s: Check['status'], n: string, d: string
     if (script && !existsSync(script)) { add('FAIL', `hook ${ev}`, `script not found: ${script}`); continue }
     add('OK', `hook ${ev}`, `${hs[0].command} (${hs[0].file.replace(/\\/g, '/').split('/').slice(-2).join('/')})`)
   }
+}
+
+const STOPBAR = /stopbar(\.mjs)?"?\s+(hook|git-hook)\b/
+const scriptOf = (cmd: string) => /node\s+"?([^"]+?stopbar\.mjs)"?\s+(?:git-)?hook/.exec(cmd)?.[1]
+function readJsonOrInvalid(f: string): any | null | 'invalid' {
+  if (!existsSync(f)) return null
+  try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return 'invalid' }
+}
+/** Commands of Stopbar hooks per event, from any nesting of {command} objects under each event. */
+function stopbarCommands(events: Record<string, unknown> | undefined): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  const walk = (ev: string, x: unknown) => {
+    if (Array.isArray(x)) { for (const y of x) walk(ev, y); return }
+    if (!x || typeof x !== 'object') return
+    const o = x as Record<string, unknown>
+    if (typeof o.command === 'string' && STOPBAR.test(o.command)) (out[ev] ??= []).push(o.command)
+    if (o.hooks) walk(ev, o.hooks)
+  }
+  for (const [ev, v] of Object.entries(events ?? {})) walk(ev, v)
+  return out
+}
+
+/** Other clients and the git fallback. Returns how many have Stopbar hooks. */
+function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: string) => void): number {
+  let found = 0
+  const clients: [string, string, (j: any) => Record<string, unknown> | undefined, string[]][] = [
+    ['cursor', join(repo.root, '.cursor', 'hooks.json'), (j) => j.hooks, ['preToolUse', 'postToolUse', 'postToolUseFailure', 'stop']],
+    ['codex', join(repo.root, '.codex', 'hooks.json'), (j) => j.hooks, ['PreToolUse', 'PostToolUse', 'Stop']],
+    ['gemini', join(repo.root, '.gemini', 'settings.json'), (j) => j.hooks, ['BeforeTool', 'AfterTool', 'AfterAgent']],
+    ['antigravity', join(repo.root, '.agents', 'hooks.json'), (j) => Object.assign({}, ...Object.values(j).filter((v) => v && typeof v === 'object' && (v as any).enabled !== false)), ['PreToolUse', 'PostToolUse', 'Stop']],
+  ]
+  for (const [name, f, events, need] of clients) {
+    const j = readJsonOrInvalid(f)
+    if (j === null) continue
+    if (j === 'invalid') { add('FAIL', `hooks ${name}`, `${f} is not valid JSON`); found++; continue }
+    const cmds = stopbarCommands(events(j))
+    if (!Object.keys(cmds).length) continue
+    found++
+    const missing = need.filter((e) => !cmds[e]?.length)
+    const script = scriptOf(Object.values(cmds)[0][0])
+    if (missing.length) add('FAIL', `hooks ${name}`, `${f}: no Stopbar hook for ${missing.join(', ')}`)
+    else if (script && !existsSync(script)) add('FAIL', `hooks ${name}`, `script not found: ${script}`)
+    else if (name === 'cursor' && JSON.stringify(j.hooks).includes('"failClosed":false')) add('WARN', `hooks ${name}`, `${f}: failClosed is false, so a crash of the hook lets the action run`)
+    else add('OK', `hooks ${name}`, `${need.join(', ')} (${f.replace(/\\/g, '/').split('/').slice(-2).join('/')})`)
+  }
+  let dir = join(repo.gitDir, 'hooks')
+  try { const rel = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], {cwd: repo.root, encoding: 'utf8'}).trim(); dir = isAbsolute(rel) ? rel : join(repo.root, rel) } catch { /* default */ }
+  const gh = ['pre-commit', 'pre-push'].filter((n) => existsSync(join(dir, n)) && readFileSync(join(dir, n), 'utf8').includes('stopbar.mjs" git-hook'))
+  if (gh.length) { found++; add(gh.length === 2 ? 'OK' : 'WARN', 'hooks git', `${gh.join(', ')} in ${dir}${gh.length === 2 ? '' : ' (one of pre-commit, pre-push is missing)'}`) }
+  return found
 }
 
 /** The real hook pipeline (in process) on a scratch repository inside <git-dir>/stopbar/doctor-run. */
@@ -121,7 +171,9 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
       const same = existsSync(join(PKG_ROOT, 'dist', 'kernel.gen.js')) && sha(rt) === sha(join(PKG_ROOT, 'dist', 'kernel.gen.js'))
       add(same ? 'OK' : 'WARN', 'pinned runtime', `${join(repo.stateDir, 'runtime')}${same ? ' (same kernel as this package)' : ' differs from this package: a human runs `stopbar init --force ...` to re-pin'}`)
     } else if (cfgOk) add('WARN', 'pinned runtime', 'none: hooks run an unpinned copy (init --no-pin)')
-    checkHooks(repo.root, add)
+    const others = checkOtherClients(repo, add)
+    const claudeHas = ['settings.json', 'settings.local.json'].some((n) => { const h = hooksIn(join(repo!.root, '.claude', n)); return h !== null && Object.keys(stopbarCommands(h)).length > 0 })
+    if (claudeHas || others === 0) checkHooks(repo.root, add) // without any client hooks, report the Claude Code ones as missing (v1.0 output)
     try { dryRun(repo.stateDir, add) } catch (e) { add('FAIL', 'dry run', String(e)) }
   }
   const fails = checks.filter((c) => c.status === 'FAIL').length, warns = checks.filter((c) => c.status === 'WARN').length

@@ -153,19 +153,29 @@ export type Protect = {gitDir: string; stateDir: string; codeDirs: string[]}
 const lc = (p: string) => norm(p).toLowerCase().replace(/\/+$/, '')
 const under = (a: string, dir: string) => a === dir || a.startsWith(dir + '/')
 
+// the hook configuration of every supported client (project and user level)
+const AGENT_CONFIG: [RegExp, string][] = [
+  [/(^|\/)\.claude\/[^/]*settings[^/]*\.json$/, 'Claude Code settings (.claude/settings*.json)'],
+  [/(^|\/)\.cursor\/hooks\.json$/, 'Cursor hooks (.cursor/hooks.json)'],
+  [/(^|\/)\.codex\/(hooks\.json|config\.toml)$/, 'Codex CLI hooks (.codex/hooks.json, .codex/config.toml)'],
+  [/(^|\/)\.gemini\/([^/]*settings[^/]*\.json|(.*\/)?hooks\.json)$/, 'Gemini CLI and Antigravity settings (.gemini/settings*.json, .gemini/**/hooks.json)'],
+  [/(^|\/)\.agents\/hooks\.json$/, 'Antigravity CLI hooks (.agents/hooks.json)'],
+]
+
 /** File path written by an Edit/Write tool. Returns the reason for a block, or null. */
 export function protectedPath(abs: string, root: string, pr: Protect): string | null {
   const a = lc(abs), r = lc(root)
   // inside the repository the .git test runs on the relative path; outside it on the whole path (other repositories)
   const tail = under(a, r) ? a.slice(r.length) : a
   if (/(^|\/)\.git(\/|$)/.test(tail) || under(a, lc(pr.gitDir)) || under(a, lc(pr.stateDir))) return 'git metadata (.git/**, Stopbar state, git hooks, git config)'
-  if (/(^|\/)\.claude\/[^/]*settings[^/]*\.json$/.test(a)) return 'Claude Code settings (.claude/settings*.json) hold the Stopbar hooks'
+  for (const [re, what] of AGENT_CONFIG) if (re.test(a)) return `${what} hold the Stopbar hooks`
   for (const d of pr.codeDirs) if (under(a, lc(d))) return `Stopbar code (${d})`
   return null
 }
 
 const SEG = (name: string) => new RegExp(String.raw`(^|[^a-z0-9_.\-])${name.replace(/\./g, '\\.')}([^a-z0-9_\-]|$)`, 'i')
-const DOT_GIT = SEG('.git'), DOT_CLAUDE = SEG('.claude')
+const DOT_GIT = SEG('.git')
+const AGENT_DIRS: [RegExp, string][] = [[SEG('.claude'), '.claude'], [SEG('.cursor'), '.cursor'], [SEG('.codex'), '.codex'], [SEG('.gemini'), '.gemini'], [SEG('.agents'), '.agents']]
 const HUMAN_ONLY = /\b(approve-tests|approve-shell)\b|\bSTOPBAR_[A-Z_]+/i
 const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|doctor\s+--fix)\b/i
 
@@ -173,7 +183,7 @@ const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|doctor\s+--fix)\b/i
 export function protectedCommand(cmd: string, pr: Protect): string | null {
   const c = norm(cmd).toLowerCase()
   if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
-  if (DOT_CLAUDE.test(c)) return 'the command names a .claude directory (Claude Code settings hold the Stopbar hooks)'
+  for (const [re, d] of AGENT_DIRS) if (re.test(c)) return `the command names a ${d} directory (agent settings there hold the Stopbar hooks)`
   if (isGitConfigWrite(cmd)) return '`git config` writes .git/config; only reads (--get, --list) are allowed'
   if (c.includes(lc(pr.stateDir)) || c.includes(lc(pr.gitDir) + '/')) return 'the command names the git directory'
   for (const d of pr.codeDirs) if (c.includes(lc(d))) return `the command names Stopbar code (${d})`

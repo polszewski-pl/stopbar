@@ -57,6 +57,12 @@ function bench(impl: Impl) {
     rec('Post Bash (no change)', hook({hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: {command: 'ls -la'}, tool_response: {stdout: '', stderr: '', interrupted: false, isImage: false}}))
     rec('Pre Bash commit', hook({hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: {command: 'git commit -m x'}}))
     if (i % 3 === 0) rec('Stop', hook({hook_event_name: 'Stop'}))
+    if (impl.name === 'stopbar') {
+      // adapter path: the same decisions with Cursor and Antigravity payloads (auto detection)
+      rec('Pre Shell (cursor)', hook({conversation_id: 'c', generation_id: 'g', cursor_version: '2.1', workspace_roots: [repo], hook_event_name: 'preToolUse', tool_name: 'Shell', tool_input: {command: 'ls -la'}}))
+      rec('Post Shell (cursor)', hook({conversation_id: 'c', generation_id: 'g', cursor_version: '2.1', workspace_roots: [repo], hook_event_name: 'postToolUse', tool_name: 'Shell', tool_input: {command: 'ls -la'}, tool_output: '{"exitCode":0}'}))
+      rec('Pre run_command (antigravity)', hook({conversationId: 'c', workspacePaths: [repo], hookEventName: 'PreToolUse', toolCall: {id: '1', name: 'run_command', args: {CommandLine: 'ls -la'}}}))
+    }
   }
   const git = readFileSync(gitLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
   const perKind: Record<string, any> = {}

@@ -543,6 +543,184 @@ say('\nS20 stopbar attest: deterministic session attestation (json, md), torn ev
   keepEvents(repo, 's20-attest')
 }
 
+// ---------------------------------------------------------------- S21-S24 other clients through their adapters
+type Client = {
+  name: string
+  pre: (repo: string, tool: 'shell' | 'write' | 'read', arg: string) => object
+  post: (repo: string, tool: 'shell' | 'write', arg: string, exit: number) => object
+  stop: (repo: string) => object
+  denied: (r: {code: number; out: string; err: string}) => boolean
+  allowed: (r: {code: number; out: string; err: string}) => boolean
+  stopBlocked: (r: {code: number; out: string; err: string}) => boolean
+}
+const J = (s: string) => { try { return JSON.parse(s) } catch { return null } }
+const CLIENTS: Client[] = [
+  {
+    name: 'cursor',
+    pre: (repo, tool, arg) => ({conversation_id: 'c', generation_id: 'g', model: 'm', cursor_version: '2.1', workspace_roots: [repo], user_email: null, transcript_path: null,
+      hook_event_name: 'preToolUse', tool_use_id: 'u', cwd: repo, ...(tool === 'shell' ? {tool_name: 'Shell', tool_input: {command: arg, working_directory: repo}} : tool === 'write' ? {tool_name: 'Write', tool_input: {file_path: join(repo, arg)}} : {tool_name: 'Read', tool_input: {file_path: join(repo, arg)}})}),
+    post: (repo, tool, arg, exit) => exit === 0
+      ? {conversation_id: 'c', generation_id: 'g', cursor_version: '2.1', workspace_roots: [repo], hook_event_name: 'postToolUse', cwd: repo, tool_use_id: 'u', duration: 5,
+        ...(tool === 'shell' ? {tool_name: 'Shell', tool_input: {command: arg}, tool_output: JSON.stringify({exitCode: 0, stdout: ''})} : {tool_name: 'Write', tool_input: {file_path: join(repo, arg)}, tool_output: '{}'})}
+      : {conversation_id: 'c', generation_id: 'g', cursor_version: '2.1', workspace_roots: [repo], hook_event_name: 'postToolUseFailure', cwd: repo, tool_use_id: 'u', tool_name: 'Shell', tool_input: {command: arg}, error_message: `exit ${exit}`, failure_type: 'error', is_interrupt: false},
+    stop: (repo) => ({conversation_id: 'c', generation_id: 'g', cursor_version: '2.1', workspace_roots: [repo], hook_event_name: 'stop', status: 'completed', loop_count: 0}),
+    denied: (r) => r.code === 2 && J(r.out)?.permission === 'deny' && /stopbar/.test(J(r.out)?.agent_message ?? ''),
+    allowed: (r) => r.code === 0 && J(r.out)?.permission === 'allow',
+    stopBlocked: (r) => r.code === 0 && /Not done/.test(J(r.out)?.followup_message ?? ''),
+  },
+  {
+    name: 'codex',
+    pre: (repo, tool, arg) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'PreToolUse', model: 'm', permission_mode: 'default', turn_id: 't', tool_use_id: 'u',
+      ...(tool === 'shell' ? {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', arg]}} : tool === 'write' ? {tool_name: 'apply_patch', tool_input: {input: `*** Begin Patch\n*** Update File: ${arg}\n*** End Patch`}} : {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', `cat ${arg}`]}})}),
+    post: (repo, tool, arg, exit) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'PostToolUse', model: 'm', permission_mode: 'default', turn_id: 't', tool_use_id: 'u',
+      ...(tool === 'shell' ? {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', arg]}, tool_response: `Exit code: ${exit}\nWall time: 1s\nOutput:\n`} : {tool_name: 'apply_patch', tool_input: {input: `*** Begin Patch\n*** Update File: ${arg}\n*** End Patch`}, tool_response: 'Success'})}),
+    stop: (repo) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'Stop', model: 'm', permission_mode: 'default', turn_id: 't', stop_hook_active: false, last_assistant_message: 'done'}),
+    denied: (r) => r.code === 0 && J(r.out)?.hookSpecificOutput?.permissionDecision === 'deny',
+    allowed: (r) => r.code === 0 && r.out === '',
+    stopBlocked: (r) => r.code === 0 && J(r.out)?.decision === 'block' && /Not done/.test(J(r.out)?.reason ?? ''),
+  },
+  {
+    name: 'gemini',
+    pre: (repo, tool, arg) => ({session_id: 's', transcript_path: 't', cwd: repo, hook_event_name: 'BeforeTool', timestamp: '2026-11-26T00:00:00Z',
+      ...(tool === 'shell' ? {tool_name: 'run_shell_command', tool_input: {command: arg, description: '', dir_path: repo}} : tool === 'write' ? {tool_name: 'write_file', tool_input: {file_path: join(repo, arg), content: ''}} : {tool_name: 'read_file', tool_input: {file_path: join(repo, arg)}})}),
+    post: (repo, tool, arg, exit) => ({session_id: 's', transcript_path: 't', cwd: repo, hook_event_name: 'AfterTool', timestamp: '2026-11-26T00:00:01Z',
+      ...(tool === 'shell' ? {tool_name: 'run_shell_command', tool_input: {command: arg}, tool_response: {llmContent: `Command: ${arg}\nExit Code: ${exit}`, returnDisplay: '', ...(exit ? {error: `exit ${exit}`} : {})}}
+        : {tool_name: 'write_file', tool_input: {file_path: join(repo, arg)}, tool_response: {llmContent: 'ok', returnDisplay: ''}})}),
+    stop: (repo) => ({session_id: 's', transcript_path: 't', cwd: repo, hook_event_name: 'AfterAgent', timestamp: '2026-11-26T00:00:02Z', prompt: 'p', prompt_response: 'done', stop_hook_active: false}),
+    denied: (r) => r.code === 2 && /^(BLOCK|PAUSE) \(stopbar\)/.test(r.err),
+    allowed: (r) => r.code === 0 && J(r.out) !== null,
+    stopBlocked: (r) => r.code === 0 && J(r.out)?.decision === 'block' && /Not done/.test(J(r.out)?.reason ?? ''),
+  },
+  {
+    name: 'antigravity',
+    pre: (repo, tool, arg) => ({conversationId: 'c', workspacePaths: [repo], transcriptPath: 't', modelName: 'auto', hookEventName: 'PreToolUse', cwd: repo, stepIdx: 1,
+      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg, Cwd: repo}} : tool === 'write' ? {id: '1', name: 'write_to_file', args: {TargetFile: join(repo, arg), CodeContent: ''}} : {id: '1', name: 'view_file', args: {AbsolutePath: join(repo, arg)}}}),
+    post: (repo, tool, arg, exit) => ({conversationId: 'c', workspacePaths: [repo], hookEventName: 'PostToolUse', cwd: repo, stepIdx: 2,
+      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg}} : {id: '1', name: 'write_to_file', args: {TargetFile: join(repo, arg)}}, ...(exit ? {error: `exit status ${exit}`} : {})}),
+    stop: (repo) => ({conversationId: 'c', workspacePaths: [repo], hookEventName: 'Stop', cwd: repo, executionNum: 0, terminationReason: 'NO_TOOL_CALL', fullyIdle: true, continuationActive: false}),
+    denied: (r) => r.code === 0 && J(r.out)?.decision === 'deny',
+    allowed: (r) => r.code === 0 && r.out === '',
+    stopBlocked: (r) => r.code === 0 && J(r.out)?.decision === 'continue' && /Not done/.test(J(r.out)?.reason ?? ''),
+  },
+]
+function clientHook(c: Client, payload: object, explicit: boolean) {
+  const t = performance.now()
+  const r = spawnSync(process.execPath, [CLI, 'hook', ...(explicit ? ['--adapter', c.name] : [])], {input: JSON.stringify(payload), encoding: 'utf8'})
+  const res = {code: r.status ?? -1, out: (r.stdout ?? '').trim(), err: (r.stderr ?? '').trim()}
+  hookCalls.push({event: `${c.name}:${(payload as any).hook_event_name ?? (payload as any).hookEventName}`, code: res.code, stderr: res.err, stdout: res.out, ms: performance.now() - t})
+  say(`    ${c.name.padEnd(11)} ${JSON.stringify(payload).slice(0, 90)} -> exit ${res.code} ${(res.out || res.err).replace(/\s+/g, ' ').slice(0, 120)}`)
+  return res
+}
+let sn = 21
+for (const c of CLIENTS) {
+  say(`\nS${sn} ${c.name}: honest path, blocked early commit, failure signal, taint, self-protection, stop gate (auto detection and --adapter)`)
+  const repo = setupRepo(`s${sn++}-${c.name}`)
+  const shellStep = (cmd: string, explicit = false) => {
+    const pre = clientHook(c, c.pre(repo, 'shell', cmd), explicit)
+    if (!c.allowed(pre)) return {pre, ran: false, exit: -1}
+    const r = run(cmd, repo)
+    clientHook(c, c.post(repo, 'shell', cmd, r.code), explicit)
+    return {pre, ran: true, exit: r.code}
+  }
+  const writeStep = (rel: string, content: string) => {
+    const pre = clientHook(c, c.pre(repo, 'write', rel), false)
+    if (!c.allowed(pre)) return {pre, post: null as any}
+    writeFileSync(join(repo, rel), content)
+    return {pre, post: clientHook(c, c.post(repo, 'write', rel, 0), false)}
+  }
+  check(`${c.name}: auto detection writes the adapter into events.jsonl`, writeStep('src/sum.mjs', 'export const sum = (a, b) => a + b // ' + c.name + '\n').pre && events(repo).some((e) => e.source === 'hook-timing' && e.adapter === c.name))
+  const early = shellStep('git commit -q -m "too early"')
+  check(`${c.name}: commit before build and tests is denied in the client format`, !early.ran && c.denied(early.pre), early.pre.out || early.pre.err)
+  check(`${c.name}: failing full tests are counted as a failure`, (() => { writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => a - b\n'); const t = shellStep('node --test'); return t.exit !== 0 && status(repo).testFails === 1 })(), `testFails=${status(repo).testFails}`)
+  writeStep('src/sum.mjs', 'export const sum = (a, b) => a + b // fixed\n')
+  const b = shellStep('node build.mjs', true), t = shellStep('node --test', true)
+  const v = status(repo)
+  check(`${c.name}: passing build and full tests are recorded (--adapter ${c.name})`, b.exit === 0 && t.exit === 0 && v.buildOkRev === v.treeRev && v.testsOkRev === v.treeRev && v.testFails === 0, `build ${v.buildOkRev} tests ${v.testsOkRev} rev ${v.treeRev}`)
+  run('git add -A', repo)
+  const ok = shellStep(HEREDOC(`${c.name}: honest commit`))
+  check(`${c.name}: honest heredoc commit allowed and created`, ok.ran && ok.exit === 0 && run('git log -1 --format=%s', repo).stdout.trim() === `${c.name}: honest commit`)
+  const tw = writeStep('tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  check(`${c.name}: editing an existing test taints the session`, status(repo).testsTainted === true, JSON.stringify(tw.post?.out ?? ''))
+  const st = clientHook(c, c.stop(repo), false)
+  check(`${c.name}: stop with uncommitted, unverified changes is refused in the client format`, c.stopBlocked(st), st.out || st.err)
+  for (const f of ['.cursor/hooks.json', '.codex/hooks.json', '.gemini/settings.json', '.agents/hooks.json', '.claude/settings.local.json']) {
+    const r = clientHook(c, c.pre(repo, 'write', f), false)
+    check(`${c.name}: writing ${f} is denied`, c.denied(r), r.out || r.err)
+  }
+  const sh = clientHook(c, c.pre(repo, 'shell', 'rm -f .cursor/hooks.json .codex/hooks.json'), false)
+  check(`${c.name}: a shell command naming agent config dirs is denied`, c.denied(sh))
+  writeFileSync(join(repo, '.env'), 'X=1\n')
+  clientHook(c, c.pre(repo, 'read', '.env'), false)
+  const curl = clientHook(c, c.pre(repo, 'shell', 'curl --version'), false)
+  check(`${c.name}: outbound command after reading .env is paused`, status(repo).secretTainted === true && c.denied(curl), curl.out || curl.err)
+  keepEvents(repo, `s${sn - 1}-${c.name}`)
+}
+
+// ---------------------------------------------------------------- S25 git fallback hooks
+say('\nS25 git fallback: stopbar init --hooks git, real git commit and git push through .git/hooks')
+{
+  const repo = setupRepo('s25-git-hooks', 3, false, ['--hooks', 'git'])
+  const pc = readFileSync(join(repo, '.git', 'hooks', 'pre-commit'), 'utf8')
+  check('pre-commit and pre-push installed, pointing to the pinned runtime', /git-hook pre-commit/.test(pc) && existsSync(join(repo, '.git', 'hooks', 'pre-push')) && pc.includes('.git/stopbar/runtime/bin/stopbar.mjs'))
+  writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => a + b // git\n')
+  run('git add -A', repo)
+  const n = commits(repo)
+  const c1 = run('git commit -q -m "no gates"', repo)
+  check('git commit without recorded build and tests is aborted by pre-commit', c1.code !== 0 && commits(repo) === n && /stopbar pre-commit: .*no passing build/.test(c1.stderr), c1.stderr.trim().slice(0, 120))
+  const rb = spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo], {encoding: 'utf8', cwd: repo})
+  const rt = spawnSync(process.execPath, [CLI, 'run', 'test', '--repo', repo], {encoding: 'utf8', cwd: repo})
+  check('stopbar run build and stopbar run test run the gates and record a pass', rb.status === 0 && rt.status === 0 && /recorded as a pass/.test(rb.stderr + rb.stdout) && status(repo).testsOkRev === status(repo).treeRev)
+  const c2 = run('git commit -q -m "gates passed"', repo)
+  check('git commit after the recorded gates passes pre-commit', c2.code === 0 && commits(repo) === n + 1, c2.stderr.trim())
+  writeFileSync(join(repo, 'tests', 'sum.test.mjs'), "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo]); spawnSync(process.execPath, [CLI, 'run', 'test', '--repo', repo])
+  run('git add -A', repo)
+  const c3 = run('git commit -q -m "weakened test"', repo)
+  check('a weakened existing test blocks the commit even with green gates', c3.code !== 0 && /approve-tests/.test(c3.stderr), c3.stderr.trim().slice(0, 120))
+  run('git checkout -q -- tests/sum.test.mjs', repo); run('git reset -q', repo)
+  const remote = join(TMP, 's25-remote.git'); run(`git init -q --bare "${remote.replace(/\\/g, '/')}"`, TMP); run(`git remote add origin "${remote.replace(/\\/g, '/')}"`, repo)
+  human(repo, 'approve-tests')
+  writeFileSync(join(repo, '.env'), 'X=1\n')
+  hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, '.env')})
+  const p1 = run('git push -q origin HEAD:refs/heads/main', repo)
+  check('git push after a secret read is aborted by pre-push', p1.code !== 0 && /stopbar pre-push: .*secret/.test(p1.stderr), p1.stderr.trim().slice(0, 120))
+  human(repo, 'approve-shell')
+  spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo]); spawnSync(process.execPath, [CLI, 'run', 'test', '--repo', repo])
+  const p2 = run('git push -q origin HEAD:refs/heads/main', repo)
+  check('git push after approve-shell and green gates goes through', p2.code === 0 && run('git rev-parse refs/heads/main', remote).stdout.trim() === run('git rev-parse HEAD', repo).stdout.trim(), p2.stderr.trim())
+  writeFileSync(join(repo, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\necho user hook\n')
+  const again = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'git')
+  check('init does not overwrite a user pre-commit hook (exit 2 with a fix)', again.code === 2 && /not a Stopbar hook/.test(again.out) && readFileSync(join(repo, '.git', 'hooks', 'pre-commit'), 'utf8').includes('user hook'), again.out.slice(0, 120))
+  keepEvents(repo, 's25-git-hooks')
+}
+
+// ---------------------------------------------------------------- S26 multi-agent init and doctor
+say('\nS26 init --hooks claude,cursor,codex,gemini,antigravity,git: merged configs and doctor')
+{
+  const repo = setupRepo('s26-multi')
+  mkdirSync(join(repo, '.cursor'), {recursive: true})
+  writeFileSync(join(repo, '.cursor', 'hooks.json'), JSON.stringify({version: 1, hooks: {afterFileEdit: [{command: './format.sh'}]}}))
+  const r = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude,cursor,codex,gemini,antigravity,git')
+  check('init writes all six targets', r.code === 0 && ['claude:', 'cursor:', 'codex:', 'gemini:', 'antigravity:', 'git:'].every((k) => r.out.includes(k)), r.out.slice(0, 200))
+  const cur = JSON.parse(readFileSync(join(repo, '.cursor', 'hooks.json'), 'utf8'))
+  check('cursor: user hook kept, failClosed true, --adapter cursor', cur.hooks.afterFileEdit?.[0]?.command === './format.sh' && cur.hooks.preToolUse?.[0]?.failClosed === true && /--adapter cursor/.test(cur.hooks.preToolUse[0].command))
+  const gem = JSON.parse(readFileSync(join(repo, '.gemini', 'settings.json'), 'utf8')), agy = JSON.parse(readFileSync(join(repo, '.agents', 'hooks.json'), 'utf8')), cdx = JSON.parse(readFileSync(join(repo, '.codex', 'hooks.json'), 'utf8'))
+  check('gemini, antigravity and codex configs have the expected events', !!gem.hooks.BeforeTool && !!gem.hooks.AfterTool && !!gem.hooks.AfterAgent && !!agy.stopbar.PreToolUse && !!agy.stopbar.Stop && !!cdx.hooks.PreToolUse && !!cdx.hooks.Stop)
+  human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'cursor,claude')
+  const cur2 = JSON.parse(readFileSync(join(repo, '.cursor', 'hooks.json'), 'utf8'))
+  check('init again replaces Stopbar entries instead of adding duplicates', cur2.hooks.preToolUse.length === 1 && cur2.hooks.afterFileEdit.length === 1 && JSON.parse(readFileSync(join(repo, '.claude', 'settings.local.json'), 'utf8')).hooks.PreToolUse.length === 1)
+  const d = human(repo, 'doctor')
+  check('doctor reports every client and the git hooks as OK', d.code === 0 && ['hooks cursor', 'hooks codex', 'hooks gemini', 'hooks antigravity', 'hooks git', 'hook PreToolUse'].every((k) => new RegExp(`\\[OK  \\] ${k}`).test(d.out)), d.out.split('\n').filter((l) => /hook/.test(l)).join(' | ').slice(0, 300))
+  rmSync(join(repo, '.claude'), {recursive: true, force: true})
+  const d2 = human(repo, 'doctor')
+  check('doctor without Claude Code settings but with other clients: no Claude FAIL', d2.code === 0 && !/\[FAIL\] hook PreToolUse/.test(d2.out))
+  writeFileSync(join(repo, '.codex', 'hooks.json'), JSON.stringify({hooks: {PreToolUse: JSON.parse(readFileSync(join(repo, '.codex', 'hooks.json'), 'utf8')).hooks.PreToolUse}}))
+  const d3 = human(repo, 'doctor')
+  check('doctor names a client config with missing events', d3.code === 1 && /\[FAIL\] hooks codex .*PostToolUse, Stop/.test(d3.out))
+  check('unknown --hooks target fails before writing anything', human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude,vim').code === 2)
+  keepEvents(repo, 's26-multi')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

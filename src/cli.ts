@@ -9,8 +9,11 @@ const cmd = argv[0] ?? 'help'
 const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code hooks)
 
   stopbar init --build "<cmd>" --test "<cmd>" [--profile default|ts|python|strict] [--max-retries 3] [--cap 500]
-               [--cost 1] [--hooks local|project] [--no-pin] [--force] [--repo <dir>]
-  stopbar hook                     Claude Code hook (JSON on stdin): PreToolUse, PostToolUse, PostToolUseFailure, Stop
+               [--cost 1] [--hooks claude,claude-project,cursor,codex,gemini,antigravity,git] [--no-pin] [--force] [--force-hooks] [--repo <dir>]
+  stopbar hook [--adapter auto|claude|cursor|codex|gemini|antigravity]
+                                   the agent hook (JSON on stdin); auto detects the client from the payload
+  stopbar git-hook pre-commit|pre-push   fallback gate run by git (installed by init --hooks git)
+  stopbar run build|test           runs the configured gate command and records its exit status
   stopbar status [--json]          gates, taint, budget, why a commit is blocked
   stopbar approve-tests [--rev N]  a human reviewed the changed tests/config up to revision N (default: current)
   stopbar approve-shell            a human allows ONE risky or outbound call after a secret was read
@@ -41,11 +44,18 @@ function opts(a: string[]) {
 
 async function main(): Promise<{code: number; msg?: string}> {
   if (cmd === 'hook') {
-    const {runHook} = await import('./hook.ts')
+    const {handle} = await import('./adapters/index.ts')
+    const i = argv.indexOf('--adapter')
+    const which = i >= 0 ? argv[i + 1] ?? '' : 'auto'
     let raw: string
     try { raw = readFileSync(0, 'utf8') } catch (e) { return {code: 2, msg: `STOPBAR FAIL-CLOSED: cannot read stdin (${(e as Error).message})`} }
-    return runHook(raw, t0)
+    const r = handle(raw, which, t0)
+    if (r.stdout) process.stdout.write(r.stdout)
+    if (r.stderr) process.stderr.write(r.stderr)
+    return {code: r.code}
   }
+  if (cmd === 'git-hook') return (await import('./githook.ts')).gitHook(argv[1] ?? '', opts(argv.slice(2)))
+  if (cmd === 'run') return (await import('./run.ts')).runGate(argv[1] ?? '', opts(argv.slice(2)))
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') return {code: 0, msg: HELP}
   if (cmd === '--version' || cmd === 'version') return {code: 0, msg: VERSION}
   const o = opts(argv.slice(1))
