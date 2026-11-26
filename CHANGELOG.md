@@ -46,6 +46,8 @@ Launch hardening:
   `node scripts/verify-lean.ts --local` (no Docker). The Docker mode is unchanged.
 - README and SECURITY.md say in their first lines what is proven (the kernel) and what is tested (the wrapper), and
   that without an OS sandbox Stopbar is no security boundary against a hostile agent.
+- **Agent skill.** `skills/stopbar/SKILL.md` (Agent Skills format) tells an agent how to work under the gate and how to
+  write Zero-FP probes. It is in the npm package (`files`) and linked from the README.
 - Tests: unit tests for the kill fallback (a stuck target with no `taskkill` on `PATH`), `git -c alias.*`, quote
   splicing, the stdin heredoc and the documented limits; E2E scenarios S38 (`safeTools` in `HALT`), S39
   (`--require-run`, `.e""nv`, `.g""it`, `git -c alias.*`, a heredoc prompt) and S40 (git hooks by default, foreign hooks,

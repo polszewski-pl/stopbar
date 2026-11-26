@@ -30,6 +30,7 @@
     "src/kernel.ts",
     "src/probe/sdk.ts",
     "claude-hooks.example.json",
+    "skills/",
     "README.md",
     "SECURITY.md",
     "CHANGELOG.md",

@@ -219,6 +219,14 @@ them as written. The command prints the line that runs the file. `--name` takes 
 `--out` (default `probes`) is relative to `--repo`, else to the current directory; an existing file stays unless you
 pass `--force`.
 
+## Agent skill
+
+[`skills/stopbar/SKILL.md`](skills/stopbar/SKILL.md) tells an agent how to work under the gate (exact gate commands,
+one-command commits, the human-only commands and when to stop and ask) and how to write a probe with zero false
+positives. It uses the Agent Skills format (`SKILL.md` with `name` and `description`), so Claude Code, Codex CLI,
+Cursor, Gemini CLI and Antigravity CLI can load it; copy the `skills/stopbar/` directory into the skills directory of
+your agent. The npm package includes it.
+
 ## Configuration
 
 `config.json` keeps the gate commands, the limits and three lists of glob patterns:
