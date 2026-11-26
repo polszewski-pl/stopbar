@@ -1,0 +1,24 @@
+# Changelog
+
+## 1.0.0 (2026-11-26)
+
+First public release.
+
+- Four pillars in one CLI:
+  - PROVE: `stopbar prove` (alias `verify`) runs the inductive proof of the kernel and refutes 10 mutants with
+    concrete counterexample runs. `npm run verify:lean` checks the Lean export with `lake build` in a pinned
+    Lean 4.34.0 container without network.
+  - PROBE: `stopbar probe --target wrapper` runs stateful sequences of hook events, human commands and damaged files on
+    real git repositories and compares every step with the proven kernel.
+  - GATE: `init`, `hook`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor`.
+  - ATTEST: `stopbar attest --format json|md` gives a deterministic attestation of the session with the sha256 of the
+    event log.
+- The hooks run a step function generated from the proven kernel with gdp-wired `compileJs`; they never load the prover.
+- Self-protection: no edits of `.git/**`, `.claude/*settings*.json` or the Stopbar code; the runtime is pinned in
+  `.git/stopbar/runtime`.
+- The quoted heredoc commit `git commit -m "$(cat <<'EOF' ... EOF)"` is allowed; every other command substitution and
+  chain in a commit is blocked.
+- Fail closed on a damaged `config.json` or `state.json`. A torn last line of `events.jsonl` never swallows the next
+  entry.
+- Path patterns for tests, test config and secrets in `config.json`; profiles `default`, `ts`, `python`, `strict`.
+- Hook latency: no git process in `PreToolUse`, one in `PostToolUse`.

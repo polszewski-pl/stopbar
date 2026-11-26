@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.e2e-tmp/
+.fuzz-tmp/
+.bench-tmp/
+results/
+RELEASE-REPORT.md
+*.tmp.mjs
+.test-out/
+.claude/settings.local.json

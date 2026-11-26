@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.git/stopbar/runtime/bin/stopbar.mjs\" hook", "timeout": 30}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [{"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.git/stopbar/runtime/bin/stopbar.mjs\" hook", "timeout": 60}]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [{"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.git/stopbar/runtime/bin/stopbar.mjs\" hook", "timeout": 60}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.git/stopbar/runtime/bin/stopbar.mjs\" hook", "timeout": 30}]
+      }
+    ]
+  }
+}

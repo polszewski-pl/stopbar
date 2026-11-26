@@ -1,0 +1,47 @@
+{
+  "name": "stopbar",
+  "version": "1.0.0",
+  "description": "Proven gates for coding agents: no commit without a passing build and a full passing test suite, no silent test weakening, no exfiltration after a secret read. Claude Code hooks backed by a formally proven kernel.",
+  "author": "Paweł Olszewski <kontakt@polszewski.com>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "stopbar": "bin/stopbar.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/",
+    "src/kernel.ts",
+    "claude-hooks.example.json",
+    "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "node scripts/build.ts",
+    "test": "node scripts/build.ts && node tests/run-all.ts",
+    "test:fuzz": "node tests/stateful-wrapper.ts",
+    "test:e2e": "node tests/e2e.ts",
+    "prove": "node scripts/build.ts && node bin/stopbar.mjs prove",
+    "verify": "node scripts/build.ts && node bin/stopbar.mjs prove",
+    "verify:lean": "node scripts/build.ts && node scripts/verify-lean.ts",
+    "probe": "node scripts/build.ts && node bin/stopbar.mjs probe",
+    "bench": "node bench/hook-latency.ts",
+    "prepack": "node scripts/build.ts"
+  },
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "coding-agent",
+    "guardrails",
+    "formal-verification",
+    "git"
+  ],
+  "dependencies": {
+    "gdp-wired": "0.60.0"
+  }
+}
