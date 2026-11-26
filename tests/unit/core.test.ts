@@ -7,7 +7,7 @@ import {test} from 'node:test'
 import {fileURLToPath} from 'node:url'
 import {decode, encodeInput, initKernel, kstep, MACHINE} from '../../dist/engine.js'
 import * as G from '../../dist/kernel.gen.js'
-import {digest, diffEntries, findRepo, parseIndex} from '../../dist/repo.js'
+import {changesSinceHead, changesSinceRef, digest, diffEntries, FailClosed, findRepo, inRef, oidOf, parseIndex, refEntries} from '../../dist/repo.js'
 import {appendEvent, readEvents, validateState} from '../../dist/store.js'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -50,6 +50,39 @@ test('parseIndex rejects a damaged index (checksum)', () => {
   const b = readFileSync(index); b[40] ^= 0xff
   assert.throws(() => parseIndex(b), /checksum/)
   assert.throws(() => parseIndex(b.subarray(0, b.length - 30)), /checksum|truncated/)
+})
+
+test('refEntries and changesSinceRef: blob ids from git ls-tree, fail closed for a ref that does not resolve', () => {
+  const d = repo('ref-entries')
+  mkdirSync(join(d, 'tests'), {recursive: true})
+  writeFileSync(join(d, 'tests', 'a.test.mjs'), 'a\n'); writeFileSync(join(d, 'tests', 'b c ü.test.mjs'), 'b\n'); writeFileSync(join(d, 'pytest.ini'), '[pytest]\n')
+  // before the first commit: HEAD is an empty tree, any other ref fails closed
+  assert.equal(refEntries(d, 'HEAD', ['tests/a.test.mjs']).size, 0)
+  assert.throws(() => refEntries(d, 'main-not-yet', ['tests/a.test.mjs']), FailClosed)
+  g(d, 'add', '-A'); g(d, 'commit', '-q', '-m', 'base')
+  const blob = (p: string) => g(d, 'rev-parse', `HEAD:${p}`).trim()
+  const e = refEntries(d, 'HEAD', ['tests/a.test.mjs', 'tests/b c ü.test.mjs', 'pytest.ini', 'tests/missing.test.mjs', 'src/*.txt'])
+  assert.deepEqual([...e.keys()].sort(), ['pytest.ini', 'tests/a.test.mjs', 'tests/b c ü.test.mjs']) // literal pathspecs: no glob
+  assert.equal(e.get('tests/a.test.mjs'), `100644 ${blob('tests/a.test.mjs')}`)
+  assert.equal(oidOf(e.get('tests/b c ü.test.mjs')), blob('tests/b c ü.test.mjs'))
+  assert.equal(oidOf(undefined), undefined)
+  assert.equal(refEntries(d, 'HEAD', []).size, 0)
+  g(d, 'branch', 'base')
+  assert.deepEqual(refEntries(d, 'base', ['tests/a.test.mjs']), new Map([['tests/a.test.mjs', `100644 ${blob('tests/a.test.mjs')}`]]))
+  assert.throws(() => refEntries(d, 'no-such-ref', ['tests/a.test.mjs']), (x: unknown) => x instanceof FailClosed && /baseRef "no-such-ref" could not be resolved/.test((x as Error).message))
+  assert.throws(() => inRef(d, 'no-such-ref', ['tests/a.test.mjs']), FailClosed) // the 1.1.2 export keeps its contract
+  assert.deepEqual([...inRef(d, 'base', ['tests/a.test.mjs', 'tests/x.test.mjs'])], ['tests/a.test.mjs'])
+  // changesSinceRef: entries against the whole tree of a ref (M, A, D)
+  const r = findRepo(d)
+  const files = g(d, 'ls-files', '-z').split('\0').filter(Boolean)
+  const cur = new Map(refEntries(d, 'HEAD', files))
+  assert.equal(cur.size, files.length)
+  cur.set('tests/a.test.mjs', '100644 ' + '0'.repeat(40)); cur.set('tests/new.test.mjs', '100644 ' + '1'.repeat(40)); cur.delete('pytest.ini')
+  const want = [{status: 'D', path: 'pytest.ini'}, {status: 'M', path: 'tests/a.test.mjs'}, {status: 'A', path: 'tests/new.test.mjs'}]
+  assert.deepEqual(changesSinceRef(r, 'base', cur), want)
+  assert.deepEqual(changesSinceRef(r, 'HEAD', cur), want)
+  assert.deepEqual(changesSinceHead(r, cur), want)
+  assert.throws(() => changesSinceRef(r, 'no-such-ref', cur), FailClosed)
 })
 
 test('digest and diffEntries', () => {

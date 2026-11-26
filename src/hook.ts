@@ -6,7 +6,7 @@ import * as K from './classify.ts'
 import {cliOf, type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
 import {matchAny} from './glob.ts'
 import {decode, kstep, type Req, type View} from './engine.ts'
-import {changesSinceHead, countedEntries, diffEntries, differsFromHead, FailClosed, findRepo, gitCalls, inRef, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
+import {changesSinceHead, countedEntries, diffEntries, differsFromHead, type Entries, FailClosed, findRepo, gitCalls, markCounted, oidOf, refEntries, type Repo, type Snap, snapshot} from './repo.ts'
 import {appendEvent, readConfig, readState, type Saved, withLock, writeState} from './store.ts'
 import {codeDirs} from './pkg.ts'
 
@@ -41,6 +41,18 @@ export function whyBlocked(v: View, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd'
   return r.join('; ') || 'kernel decision'
 }
 
+/** Classifies changed paths against the reference tree (baseRef, else HEAD). One git process, and only when a test or
+ *  (with baseRef) a test-config file changed: a code-only change costs no git process here. With baseRef, a test or
+ *  test-config file whose blob id equals baseRef's is not suspicious (taken over from baseRef by checkout, rebase or
+ *  cherry-pick, or put back to it). Shared by the hooks and by `init --force` / `reset` on a dirty tree. */
+export function classifyChanges(repo: Repo, cfg: Config, changes: {status: string; path: string}[], now: Entries) {
+  const ref = cfg.baseRef ?? 'HEAD'
+  const watched = changes.map((c) => c.path).filter((p) => K.isTestConfigPath(p, cfg.paths) ? !!cfg.baseRef : K.isTestPath(p, cfg.paths))
+  const inRef = refEntries(repo.root, ref, watched)
+  const same = cfg.baseRef ? (p: string) => oidOf(now.get(p)) === oidOf(inRef.get(p)) : undefined
+  return K.classifyTreeChange(changes, (p) => inRef.has(p), cfg.paths, same)
+}
+
 /** Counts a working-tree change the kernel has not seen yet. */
 function syncTree(ctx: Ctx, cost: number, source: string) {
   const {repo, s, cfg} = ctx
@@ -55,9 +67,7 @@ function syncTree(ctx: Ctx, cost: number, source: string) {
     changes = changesSinceHead(repo, snap.entries)
     appendEvent(repo, {source: `${source}:fallback-diff`, note: 'counted snapshot copy missing; diff against HEAD'})
   }
-  const testPaths = changes.map((c) => c.path).filter((p) => K.isTestPath(p, cfg.paths) && !K.isTestConfigPath(p, cfg.paths))
-  const existing = testPaths.length ? inRef(repo.root, cfg.baseRef ?? 'HEAD', testPaths) : new Set<string>()
-  const cls = K.classifyTreeChange(changes, (p) => existing.has(p), cfg.paths)
+  const cls = classifyChanges(repo, cfg, changes, snap.entries)
   const {before, after} = step(ctx, {op: cls.op, suspicious: cls.suspicious, cost}, `${source}:tree ${cls.why.join(', ') || `${changes.length} file(s)`}`)
   // not executed (halted or over budget): the change stays pending and is counted later
   if (after.treeRev > before.treeRev) { s.snapshot = snap.id; markCounted(repo); ctx.dirty = true }

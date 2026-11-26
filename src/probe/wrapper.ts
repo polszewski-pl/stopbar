@@ -17,6 +17,7 @@ type Action =
   | {t: 'edit'; tool: 'Write' | 'Edit'; file: string; content: string}
   | {t: 'shellEdit'; file: string; content: string}
   | {t: 'shellDelete'; file: string}
+  | {t: 'restore'; file: string} // `git checkout <base> -- file`: the file gets its base-commit content back (or is deleted)
   | {t: 'humanEdit'; file: string; content: string}
   | {t: 'build'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted' | 'bgPre' | 'bgPost'}
   | {t: 'fulltest'; outcome: 'pass' | 'fail' | 'interrupt' | 'interrupted' | 'bgPre' | 'bgPost'}
@@ -35,7 +36,9 @@ type Action =
   | {t: 'loseCounted'}
   | {t: 'corruptState'; how: 'empty' | 'truncated' | 'garbage'}
 
-export type Run = {seed: number; params: {maxRetries: number; cap: number; cost: number}; actions: Action[]}
+// baseRef: init --base-ref on a branch at the base commit that never moves (HEAD moves with every commit); saved runs
+// without the field run without a base ref, as before 1.1.3
+export type Run = {seed: number; params: {maxRetries: number; cap: number; cost: number; baseRef?: boolean}; actions: Action[]}
 
 function rng(seed: number) { let x = (seed * 2654435761) >>> 0 || 7; return () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x / 2 ** 32 } }
 
@@ -55,6 +58,7 @@ function genRun(seed: number): Run {
     [6, () => ({t: 'edit', tool: pick(['Write', 'Edit'] as const), file: pick([...TESTS, `tests/n${Math.floor(r() * 3)}.test.mjs`, CONFIG]), content: content()})],
     [4, () => ({t: 'shellEdit', file: anyFile(), content: content()})],
     [2, () => ({t: 'shellDelete', file: anyFile()})],
+    [3, () => ({t: 'restore', file: r() < 0.7 ? pick([...TESTS, CONFIG]) : anyFile()})],
     [2, () => ({t: 'humanEdit', file: anyFile(), content: content()})],
     [10, () => ({t: 'build', outcome: pick(['pass', 'pass', 'pass', 'fail', 'interrupt', 'interrupted', 'bgPre', 'bgPost'] as const)})],
     [10, () => ({t: 'fulltest', outcome: pick(['pass', 'pass', 'pass', 'fail', 'fail', 'interrupt', 'interrupted', 'bgPre', 'bgPost'] as const)})],
@@ -91,7 +95,8 @@ function genRun(seed: number): Run {
     let x = r() * total
     for (const [w, f] of W) { if ((x -= w) < 0) { actions.push(f()); break } }
   }
-  return {seed, params: {maxRetries: 1 + Math.floor(r() * 3), cap: 10 + Math.floor(r() * 60), cost: Math.floor(r() * 3)}, actions: actions.slice(0, 30)}
+  // baseRef from the seed's parity, not from r(): the action sequence of a seed stays what it was before 1.1.3
+  return {seed, params: {maxRetries: 1 + Math.floor(r() * 3), cap: 10 + Math.floor(r() * 60), cost: Math.floor(r() * 3), baseRef: seed % 2 === 1}, actions: actions.slice(0, 30)}
 }
 
 // ---------------------------------------------------------------- execution against the real wrapper + the model
@@ -100,7 +105,7 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
   // the model needs the prover package (gdp-wired); the hooks under test never load it
   const {kernel} = await import('../kernel.ts')
   const R = kernel('none'), IT = R.interpreter()
-  const {maxRetries, cap, cost} = run.params
+  const {maxRetries, cap, cost} = run.params, useBase = run.params.baseRef === true
   const P = R.encodeParams({maxRetries, cap})
 
   rmSync(dir, {recursive: true, force: true, maxRetries: 5})
@@ -113,9 +118,13 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
   writeFileSync(join(dir, '.gitignore'), '.env\nsecrets/\n'); work.set('.gitignore', '.env\nsecrets/\n')
   writeFileSync(join(dir, '.env'), 'X=1\n')
   g('init', '-q'); g('config', 'core.autocrlf', 'false'); g('add', '-A'); g('commit', '-qm', 'base')
+  g('branch', 'probe-base') // the base commit; the base ref of runs with params.baseRef
   const opts = (o: Record<string, string>) => ({get: (k: string) => o[k], has: (k: string) => k in o, int: (k: string, d: number) => (k in o ? Number(o[k]) : d)})
-  const ini = C.init(opts({repo: dir, build: 'node build.mjs', test: 'node --test', 'max-retries': String(maxRetries), cap: String(cap), cost: String(cost), 'no-pin': ''}))
+  const ini = C.init(opts({repo: dir, build: 'node build.mjs', test: 'node --test', 'max-retries': String(maxRetries), cap: String(cap), cost: String(cost), 'no-pin': '', ...(useBase ? {'base-ref': 'probe-base'} : {})}))
   if (ini.code !== 0) throw new Error(`init failed: ${ini.msg}`)
+
+  const cov: Cov = {}
+  const inc = (k: string) => { cov[k] = (cov[k] ?? 0) + 1 }
 
   // ---- model
   let st = IT.init(P)
@@ -129,6 +138,11 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
   }
   const same = (a: Map<string, string>, b: Map<string, string>) => a.size === b.size && [...a].every(([k, v]) => b.get(k) === v)
   const isTest = (f: string) => f.startsWith('tests/')
+  const isCfg = (f: string) => f === CONFIG || f === '.gitignore'
+  const baseTree = new Map(work) // the tree of the base ref (it never moves in a run)
+  // with a base ref: suspicious = test config whose content differs from the base ref, or a test of the base ref whose
+  // content differs from it (changed or deleted); a file equal to the base ref is not (checkout, rebase, cherry-pick)
+  const differsFromRef = (f: string, ref: Map<string, string>) => (isCfg(f) || (isTest(f) && ref.has(f))) && work.get(f) !== ref.get(f)
   const mSync = (c: number) => {
     if (same(work, counted)) return null
     const base = countedCopy ? counted : head
@@ -137,7 +151,8 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
       // the counted copy was lost and the tree equals HEAD: the wrapper still sees a new snapshot id with no changes
     }
     const anyTest = changed.some((f) => isTest(f) || f === CONFIG || f === '.gitignore')
-    const suspicious = changed.some((f) => f === CONFIG || f === '.gitignore' || (isTest(f) && head.has(f)))
+    const suspicious = useBase ? changed.some((f) => differsFromRef(f, baseTree)) : changed.some((f) => isCfg(f) || (isTest(f) && head.has(f)))
+    if (useBase && changed.some((f) => (isCfg(f) || (isTest(f) && baseTree.has(f))) && !differsFromRef(f, baseTree))) inc('sameAsBaseRef')
     const before = view().treeRev
     const after = kstep({op: anyTest ? 'EDIT_TEST' : 'EDIT_CODE', suspicious, cost: c})
     if (after.treeRev > before) { counted = new Map(work); countedCopy = true }
@@ -153,8 +168,6 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
   const loggedSteps = () => readFileSync(join(sd, 'events.jsonl'), 'utf8').split('\n').filter((l) => { try { return !!JSON.parse(l).req } catch { return false } }).length
   const initSteps = loggedSteps()
 
-  const cov: Cov = {}
-  const inc = (k: string) => { cov[k] = (cov[k] ?? 0) + 1 }
   for (let i = 0; i < run.actions.length; i++) {
     const a = run.actions[i]
     const v0 = view()
@@ -180,6 +193,19 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
         gotCode = hook('PreToolUse', 'Bash', {command})
         if (gotCode !== 0 || expCode !== 0) break
         if (a.t === 'shellEdit') put(a.file, a.content)
+        else { rmSync(join(dir, a.file), {force: true}); work.delete(a.file) }
+        expCode = postCode(mSync(0))
+        gotCode = hook('PostToolUse', 'Bash', {command}, okResp)
+        break
+      }
+      case 'restore': {
+        const command = `git checkout -q probe-base -- ${a.file}`
+        expCode = expectPre()
+        if (!halted()) { const v = kstep({op: 'SHELL', risky: false, cost}); if (v.decision === 'PAUSE') expCode = 2 }
+        gotCode = hook('PreToolUse', 'Bash', {command})
+        if (gotCode !== 0 || expCode !== 0) break
+        const was = baseTree.get(a.file)
+        if (was !== undefined) put(a.file, was)
         else { rmSync(join(dir, a.file), {force: true}); work.delete(a.file) }
         expCode = postCode(mSync(0))
         gotCode = hook('PostToolUse', 'Bash', {command}, okResp)
@@ -288,6 +314,9 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
         if (gotCode !== 2) break
         if (readFileSync(join(sd, 'events.jsonl'), 'utf8') !== logBefore) { gotCode = -1; break } // fail closed writes nothing
         st = IT.init(P); counted = new Map(work); countedCopy = true
+        // reset on a dirty tree: test or test-config changes against the base ref (else HEAD) keep the session tainted
+        const ref = useBase ? baseTree : head
+        if ([...new Set([...ref.keys(), ...work.keys()])].some((f) => differsFromRef(f, ref))) { kstep({op: 'EDIT_TEST', suspicious: true, cost: 0}); inc('resetDirtyTests') }
         expCode = 0; gotCode = C.human('reset', opts({repo: dir})).code
         break
       }

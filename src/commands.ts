@@ -1,24 +1,50 @@
-// Human commands: init, status, approve-tests, approve-shell, resume, reset. The agent cannot run them
+// Human commands: init, upgrade, status, approve-tests, approve-shell, resume, reset. The agent cannot run them
 // through its shell (classify.ts protectedCommand) and cannot edit their files (protectedPath).
 import {cpSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {hasChain, protectedCommand} from './classify.ts'
 import {CLAUDE_POST_MATCHER, claudeHooks, hookCommand, installHooks, parseTargets} from './integrations.ts'
-import {cliOf, type Config, ConfigError, makeConfig, PROFILES} from './config.ts'
+import {cliOf, type Config, ConfigError, DEFAULT_SAFE_TOOLS, makeConfig, PROFILES} from './config.ts'
 import {decode, initKernel, kstep, MACHINE, type Req} from './engine.ts'
-import {whyBlocked} from './hook.ts'
+import {classifyChanges, whyBlocked} from './hook.ts'
 import {CODE_PARTS, PKG_ROOT} from './pkg.ts'
-import {findRepo, forgetSnapshots, hasRefTree, markCounted, type Repo, snapshot} from './repo.ts'
+import {changesSinceRef, findRepo, forgetSnapshots, hasRefTree, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
 import {appendEvent, paths, readConfig, readEvents, readState, type Saved, VERSION, withLock, writeConfig, writeState} from './store.ts'
 
 export type Out = {code: number; msg?: string}
 
-export function fresh(r: Repo, c: Config): Saved {
+function freshWithSnap(r: Repo, c: Config): {s: Saved; snap: Snap} {
   forgetSnapshots(r)
   const params = {maxRetries: c.maxRetries, cap: c.cap}
   const snap = snapshot(r)
   markCounted(r)
-  return {version: 2, kernel: initKernel(params), snapshot: snap.id, params}
+  return {s: {version: 2, kernel: initKernel(params), snapshot: snap.id, params}, snap}
+}
+export const fresh = (r: Repo, c: Config): Saved => freshWithSnap(r, c).s
+
+/** `init --force` and `reset` start a fresh kernel on the current working tree. Uncommitted changes of existing tests or
+ *  of test config (against baseRef, else HEAD) must not vanish with the old state: they are counted as one suspicious
+ *  EDIT_TEST step of the kernel (testsTainted until `stopbar approve-tests`), written to state.json and to events.jsonl
+ *  with every kernel field, so `stopbar attest` stays consistent.
+ *  `dirtyTests` only reads (it fails closed on a broken baseRef before anything is written); `countDirtyTests` runs under
+ *  the lock, after the human:init / human:reset entry. */
+type Dirty = {ref: string; suspicious: boolean; files: string[]}
+function dirtyTests(r: Repo, cfg: Config, snap: Snap): Dirty {
+  const ref = cfg.baseRef ?? 'HEAD'
+  const cls = classifyChanges(r, cfg, changesSinceRef(r, ref, snap.entries), snap.entries)
+  return {ref, suspicious: cls.suspicious, files: cls.why.filter((w) => !w.startsWith('new test') && !w.endsWith('(same as base ref)'))}
+}
+function countDirtyTests(r: Repo, s: Saved, d: Dirty, source: string): string[] {
+  if (!d.suspicious) return []
+  const req: Req = {op: 'EDIT_TEST', suspicious: true, cost: 0}
+  s.kernel = kstep(s.params, s.kernel, req)
+  writeState(r, s)
+  const a = decode(s.kernel)
+  appendEvent(r, {source, req, decision: a.decision, halted: a.halted, testsTainted: a.testsTainted,
+    secretTainted: a.secretTainted, shellToken: a.shellToken, treeRev: a.treeRev, buildOkRev: a.buildOkRev, testsOkRev: a.testsOkRev,
+    spent: a.spent, capNow: a.capNow, testFails: a.testFails, buildFails: a.buildFails, commitExecuted: a.commitExecuted, ref: d.ref, changes: d.files})
+  return [`WARN: uncommitted test or test-config changes against ${d.ref}: ${d.files.join(', ')}`,
+    `  the session starts with testsTainted = true (revision ${a.treeRev}); a commit stays blocked until a human reviews them and runs \`stopbar approve-tests\``]
 }
 
 function humanStep(r: Repo, s: Saved, req: Req, source: string) {
@@ -77,17 +103,44 @@ export function init(o: Opts): Out {
   const targets = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
   mkdirSync(repo.stateDir, {recursive: true})
   return withLock(repo, () => {
+    const {s, snap} = freshWithSnap(repo, cfg)
+    const dirty = dirtyTests(repo, cfg, snap)
     writeConfig(repo, cfg)
-    writeState(repo, fresh(repo, cfg))
+    writeState(repo, s)
     const runtime = pin ? pinRuntime(repo) : PKG_ROOT
     const command = hookCommand(runtime)
     appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE})
+    const warn = countDirtyTests(repo, s, dirty, 'init:dirty-tests')
     const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}${cfg.baseRef ? `; base ref: ${cfg.baseRef}` : ''}`,
       `  stop gate: ${cfg.stopGate ?? 'block'}; gate hints use: ${cliOf(cfg)} run build|test`,
       `  hooks run: ${command}`]
     if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
     else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
-    lines.push('Next: restart the agent in this repository and run `stopbar doctor`.')
+    lines.push(...warn, 'Next: restart the agent in this repository and run `stopbar doctor`.')
+    return {code: 0, msg: lines.join('\n')}
+  })
+}
+
+/** `stopbar upgrade`: re-pins the hook runtime (<git-dir>/stopbar/runtime) from this package and, with --hooks, rewrites
+ *  the hook configuration. state.json, config.json and the snapshots stay as they are (revision, gates, taint, budget), so
+ *  active sessions keep their green gates. The log entry has no `req`: it is no kernel step and attest stays consistent. */
+export function upgrade(o: Opts): Out {
+  const repo = findRepo(o.get('repo') ?? process.cwd())
+  const hooksOpt = o.get('hooks')
+  if (o.has('hooks') && hooksOpt === undefined) return {code: 1, msg: '--hooks needs a value'}
+  const targets = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
+  return withLock(repo, () => {
+    const cfg = readConfig(repo)
+    readState(repo) // a missing or damaged state fails closed here, with the fix
+    const had = existsSync(join(repo.stateDir, 'runtime'))
+    const runtime = pinRuntime(repo)
+    appendEvent(repo, {source: 'human:upgrade', version: VERSION, runtime, kernel: MACHINE, ...(targets.length ? {hooks: targets} : {})})
+    const lines = [`Stopbar ${VERSION}: hook runtime re-pinned in ${runtime}`, '  state.json, config.json and the snapshots are unchanged (revision, gates, taint, budget)']
+    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
+    else if (!had) lines.push(`  there was no pinned runtime (init --no-pin): the hooks still run what they ran; add --hooks <targets> to point them at ${hookCommand(runtime)}`)
+    const missing = DEFAULT_SAFE_TOOLS.filter((t) => !(cfg.safeTools ?? DEFAULT_SAFE_TOOLS).includes(t))
+    if (missing.length) lines.push(`  hint: config.safeTools lacks the default ${missing.join(', ')}; a human adds them to config.json (stopbar doctor shows it)`)
+    lines.push('Next: run `stopbar doctor`.')
     return {code: 0, msg: lines.join('\n')}
   })
 }
@@ -128,9 +181,12 @@ export function human(cmd: string, o: Opts): Out {
   const cfg = readConfig(repo)
   return withLock(repo, () => {
     if (cmd === 'reset') {
-      writeState(repo, fresh(repo, cfg))
+      const {s, snap} = freshWithSnap(repo, cfg)
+      const dirty = dirtyTests(repo, cfg, snap)
+      writeState(repo, s)
       appendEvent(repo, {source: 'human:reset'})
-      return {code: 0, msg: 'Stopbar state reset: run the build and the full test suite again before a commit'}
+      const warn = countDirtyTests(repo, s, dirty, 'reset:dirty-tests')
+      return {code: 0, msg: ['Stopbar state reset: run the build and the full test suite again before a commit', ...warn].join('\n')}
     }
     const s = readState(repo)
     if (cmd === 'status') {

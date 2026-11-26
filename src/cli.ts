@@ -13,6 +13,9 @@ const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code ho
                [--cli "<cmd>"] [--stop-gate block|warn]
                                    --cli: command that starts Stopbar in hints (default: npx --no-install stopbar)
                                    --stop-gate warn: Stop only warns; git commit and git push stay blocked until the gates pass
+  stopbar upgrade [--hooks <targets>] [--force-hooks] [--repo <dir>]
+                                   a human re-pins the hook runtime from this package (and rewrites hooks with --hooks);
+                                   state, gates, taint and budget stay as they are
   stopbar hook [--adapter auto|claude|cursor|codex|gemini|antigravity]
                                    the agent hook (JSON on stdin); auto detects the client from the payload
   stopbar git-hook pre-commit|pre-push   fallback gate run by git (installed by init --hooks git)
@@ -29,7 +32,7 @@ Four pillars:
           (npm run verify:lean checks the Lean export with lake build in Docker)
   PROBE   stopbar probe [--target wrapper] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir]
           stateful probing of the hooks against the proven kernel on real git repositories
-  GATE    init, hook, status, approve-tests, approve-shell, resume, reset, doctor (above)
+  GATE    init, upgrade, hook, status, approve-tests, approve-shell, resume, reset, doctor (above)
   ATTEST  stopbar attest [--format json|md]   deterministic attestation: HEAD, tree, gates, human actions, log sha256
 All commands take --repo <dir> (default: the current directory). 'verify' is an alias of 'prove'.`
 
@@ -63,6 +66,7 @@ async function main(): Promise<{code: number; msg?: string}> {
   if (cmd === '--version' || cmd === 'version') return {code: 0, msg: VERSION}
   const o = opts(argv.slice(1))
   if (cmd === 'init') return (await import('./commands.ts')).init(o)
+  if (cmd === 'upgrade') return (await import('./commands.ts')).upgrade(o)
   if (['status', 'approve-tests', 'approve-shell', 'resume', 'reset'].includes(cmd)) return (await import('./commands.ts')).human(cmd, o)
   if (cmd === 'doctor') return (await import('./doctor.ts')).doctor({repo: o.get('repo'), json: o.has('json')})
   if (cmd === 'prove' || cmd === 'verify') {

@@ -42,7 +42,7 @@ current tree, block it after an unapproved test change, and block a push after a
 |---|---|---|
 | PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
 | PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel. v1.0 has one target, `wrapper` (Stopbar itself). |
-| GATE | `stopbar init`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
+| GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
 | ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions and the sha256 of the event log. |
 
 ## Set up in 3 steps
@@ -100,6 +100,7 @@ EOF
 | Command | Who | What it does |
 |---|---|---|
 | `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. |
+| `stopbar upgrade [--hooks <targets>] [--force-hooks]` | human | After you update the Stopbar package: re-pins the hook runtime in `.git/stopbar/runtime` and, with `--hooks`, rewrites the hooks. `state.json`, `config.json` and the snapshots stay as they are (revision, gates, taint, budget), so an active session keeps its green gates. Use it instead of `init --force`. |
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
 | `stopbar run build\|test` | human, agent, CI | Runs the configured gate command and records its real exit status. |
@@ -107,7 +108,7 @@ EOF
 | `stopbar approve-tests [--rev N]` | human | You reviewed the changed tests or test config up to revision N (default: the current one). |
 | `stopbar approve-shell` | human | Allows **one** risky or outbound call after a secret read. |
 | `stopbar resume --extra N` | human | Lifts a halt (retry limit or budget) and adds N to the budget. |
-| `stopbar reset` | human | Fresh kernel state. Config and event log stay. Also repairs a damaged `state.json`. |
+| `stopbar reset` | human | Fresh kernel state. Config and event log stay. Also repairs a damaged `state.json`. Uncommitted changes of existing tests or test config (against `baseRef`, else `HEAD`) are not forgotten: the session starts tainted, with a `WARN`, until `approve-tests`. `init --force` does the same. |
 | `stopbar doctor [--json]` | human | Environment, config, state, hooks and a dry run. Exit 1 on a problem. |
 | `stopbar prove [--out f.json] [--lean f.lean]` | human, CI | PROVE: the inductive proof of the kernel and the 10 mutants. Exit 0 only if everything holds. `verify` is an alias. |
 | `stopbar probe [--target wrapper] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir]` | human, CI | PROBE: stateful probing against the proven kernel. A failure is shrunk to a minimal JSON reproduction. Needs the full package (gdp-wired). |
@@ -154,7 +155,11 @@ profile by editing the lists: no code change is necessary.
   file (default: `HEAD`). On a multi-commit feature branch, `--base-ref main` (or a base commit SHA) lets the agent
   refine new test files it added on that branch across commits without triggering `testsTainted`, while existing tests
   from `baseRef` and all test-config files remain protected. A configured non-`HEAD` ref that cannot be resolved fails
-  closed.
+  closed. With `baseRef`, Stopbar compares the content (blob id) of a changed test or test-config file with `baseRef`:
+  after `git checkout -b x main`, `git rebase main` or `git cherry-pick`, files that equal `main` do not taint, but the
+  tree revision grows and the gates must run again. Any other change of a test from `baseRef` or of test config taints,
+  and putting the file back later does not clear the taint. Without `baseRef`, every change of an existing test or of
+  test config taints, also when the file equals `HEAD`, because the agent's own git commands can move `HEAD`.
 - **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default
   (`DEFAULT_SAFE_TOOLS`) is `["mcp__ccd_turn__*", "mcp__ccd_session_mgmt__*"]`: the task-list and turn-summary tools of
   Claude Desktop and its tools for messages between local sessions. It only exempts tools from the outbound gate
@@ -227,12 +232,12 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 38/38 | 305/305 | 202/202 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 38/38 | 305/305 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 40/40 | 365/365 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 40/40 | 365/365 | 202/202 sequences | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
-git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5007 steps
-and 7176 hook calls. `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
+git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5020 steps
+and 7152 hook calls (half of the seeds with a base ref). `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry`.
 
 ## License

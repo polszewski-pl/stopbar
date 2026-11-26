@@ -84,6 +84,32 @@ test('classifyTreeChange: new tests are trusted, existing tests and config are s
   assert.deepEqual(classifyTreeChange([{status: 'M', path: 'src/x.ts'}], () => false, P), {op: 'EDIT_CODE', suspicious: false, why: []})
 })
 
+test('classifyTreeChange with a base ref: only content that differs from baseRef (blob id) is suspicious', () => {
+  // baseRef holds tests/a.test.mjs (oid aaaa) and pytest.ini (oid cccc); tests/b.test.mjs and package.json are not in it
+  const ref = new Map([['tests/a.test.mjs', '100644 aaaa'], ['pytest.ini', '100644 cccc']])
+  const same = (now: Map<string, string>) => (p: string) => now.get(p)?.split(' ')[1] === ref.get(p)?.split(' ')[1]
+  const cls = (status: string, path: string, now: Map<string, string>) => classifyTreeChange([{status, path}], (p: string) => ref.has(p), P, same(now))
+  // an existing test or test config with the same content as baseRef (taken over by checkout/rebase/cherry-pick): not suspicious
+  assert.deepEqual(cls('M', 'tests/a.test.mjs', new Map([['tests/a.test.mjs', '100644 aaaa']])), {op: 'EDIT_TEST', suspicious: false, why: ['existing test M tests/a.test.mjs (same as base ref)']})
+  assert.equal(cls('M', 'pytest.ini', new Map([['pytest.ini', '100644 cccc']])).suspicious, false)
+  // the file mode alone does not count (Windows): same blob id, other mode
+  assert.equal(cls('M', 'tests/a.test.mjs', new Map([['tests/a.test.mjs', '100755 aaaa']])).suspicious, false)
+  // other content, or deleted: suspicious
+  assert.equal(cls('M', 'tests/a.test.mjs', new Map([['tests/a.test.mjs', '100644 bbbb']])).suspicious, true)
+  assert.equal(cls('D', 'tests/a.test.mjs', new Map()).suspicious, true)
+  assert.equal(cls('M', 'pytest.ini', new Map([['pytest.ini', '100644 dddd']])).suspicious, true)
+  assert.equal(cls('D', 'pytest.ini', new Map()).suspicious, true)
+  // new test config (not in baseRef): suspicious; new test (not in baseRef): not suspicious
+  assert.equal(cls('A', 'package.json', new Map([['package.json', '100644 eeee']])).suspicious, true)
+  assert.deepEqual(cls('A', 'tests/b.test.mjs', new Map([['tests/b.test.mjs', '100644 ffff']])), {op: 'EDIT_TEST', suspicious: false, why: ['new test A tests/b.test.mjs']})
+  // one suspicious file among taken-over ones taints the whole change
+  const now = new Map([['tests/a.test.mjs', '100644 aaaa'], ['pytest.ini', '100644 dddd']])
+  assert.equal(classifyTreeChange([{status: 'M', path: 'tests/a.test.mjs'}, {status: 'M', path: 'pytest.ini'}], (p: string) => ref.has(p), P, same(now)).suspicious, true)
+  // without a base ref (HEAD): every change of an existing test or of test config stays suspicious, as in 1.1.2
+  assert.equal(classifyTreeChange([{status: 'M', path: 'tests/a.test.mjs'}], (p: string) => ref.has(p), P).suspicious, true)
+  assert.equal(classifyTreeChange([{status: 'M', path: 'pytest.ini'}], (p: string) => ref.has(p), P).suspicious, true)
+})
+
 test('self-protection: paths and command text', () => {
   const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
   const root = 'C:/r'
@@ -95,6 +121,8 @@ test('self-protection: paths and command text', () => {
   for (const c of ['rm -rf .git/stopbar', 'cat .git/config', 'cd .git && rm config', 'echo x > .claude/settings.json', 'rm -r .claude', 'git config core.hooksPath x',
     'git config --unset user.name', 'git -C . config alias.c "!sh"', 'stopbar approve-tests', 'npx stopbar resume --extra 9', 'node C:/tools/stopbar/dist/cli.js status',
     'STOPBAR_X=1 npm test', 'Remove-Item .git\\hooks\\*']) assert.ok(protectedCommand(c, pr), c)
+  for (const c of ['stopbar upgrade', 'npx stopbar upgrade', 'npx --no-install stopbar upgrade --hooks claude', 'node node_modules/stopbar/bin/stopbar.mjs upgrade',
+    'node "C:/x/node_modules/stopbar/bin/stopbar.mjs" upgrade --force-hooks', 'STOPBAR upgrade']) assert.equal(protectedCommand(c, pr), 'human-only Stopbar command or setting', c)
   for (const c of ['git status', 'git config --get user.name', 'git config --list', 'npm test', 'git add .gitignore .github/x', 'git push -q origin HEAD', 'ls remote.git']) assert.equal(protectedCommand(c, pr), null, c)
 })
 

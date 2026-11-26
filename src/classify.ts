@@ -162,15 +162,28 @@ export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTe
   return {kind: 'shell', risky: isRiskyShell(c), partialTests: looksLikeTests(c), secret: secretInCommand(c, cfg.paths, exists)}
 }
 
-/** Kind of a tree change from a list of (status, path) and a test for "the path exists in HEAD". */
-export function classifyTreeChange(changes: {status: string; path: string}[], inHead: (p: string) => boolean, paths: Paths) {
+/** Kind of a tree change from a list of (status, path) and a test for "the path exists in the reference tree"
+ *  (baseRef, else HEAD).
+ *  `sameAsRef` (given with an explicit baseRef): "the file now has the same blob id as in baseRef, or is absent from
+ *  both". Then a test-config file is suspicious only when its content differs from baseRef, and an existing test only
+ *  when it differs from baseRef (changed or deleted), so tests taken over unchanged from baseRef (checkout, rebase,
+ *  cherry-pick) do not taint. Without `sameAsRef` (no baseRef: HEAD, which the agent's own git commands can move),
+ *  every change of test config and of an existing test is suspicious. */
+export function classifyTreeChange(changes: {status: string; path: string}[], inHead: (p: string) => boolean, paths: Paths, sameAsRef?: (p: string) => boolean) {
   let anyTest = false, suspicious = false
   const why: string[] = []
   for (const {status, path} of changes) {
-    if (isTestConfigPath(path, paths)) { anyTest = true; suspicious = true; why.push(`config ${status} ${path}`); continue }
+    if (isTestConfigPath(path, paths)) {
+      anyTest = true
+      if (sameAsRef?.(path)) why.push(`config ${status} ${path} (same as base ref)`)
+      else { suspicious = true; why.push(`config ${status} ${path}`) }
+      continue
+    }
     if (isTestPath(path, paths)) {
       anyTest = true
-      if (inHead(path)) { suspicious = true; why.push(`existing test ${status} ${path}`) } else why.push(`new test ${status} ${path}`)
+      if (!inHead(path)) why.push(`new test ${status} ${path}`)
+      else if (sameAsRef?.(path)) why.push(`existing test ${status} ${path} (same as base ref)`)
+      else { suspicious = true; why.push(`existing test ${status} ${path}`) }
     }
   }
   return {op: anyTest ? 'EDIT_TEST' as const : 'EDIT_CODE' as const, suspicious, why}
@@ -207,7 +220,7 @@ const SEG = (name: string) => new RegExp(String.raw`(^|[^a-z0-9_.\-])${name.repl
 const DOT_GIT = SEG('.git')
 const AGENT_DIRS: [RegExp, string][] = [[SEG('.claude'), '.claude'], [SEG('.cursor'), '.cursor'], [SEG('.codex'), '.codex'], [SEG('.gemini'), '.gemini'], [SEG('.agents'), '.agents']]
 const HUMAN_ONLY = /\b(approve-tests|approve-shell)\b|\bSTOPBAR_[A-Z_]+/i
-const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|doctor\s+--fix)\b/i
+const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|upgrade|doctor\s+--fix)\b/i
 
 /** Command text inspected by self-protection. For a plain single-command `git commit` (chain-free, no substitution),
  *  strips the commit message (safe heredoc body or quoted `-m` / `--message` string) because git treats it as data. */

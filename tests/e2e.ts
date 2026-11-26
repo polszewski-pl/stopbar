@@ -1018,6 +1018,186 @@ say('\nS32 --stop-gate warn: Stop warns and logs stop:warn; git commit (hook and
   keepEvents(repo, 's32-stop-warn-halted')
 }
 
+// ---------------------------------------------------------------- S33 init --force / reset on a dirty tree
+say('\nS33 init --force and reset on a dirty tree: uncommitted test or test-config changes keep the session tainted')
+{
+  const INIT = ['init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--max-retries', '3', '--cap', '100', '--cost', '1', '--no-pin']
+  const attestOf = (repo: string) => JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  {
+    const repo = setupRepo('s33-clean')
+    const rev0 = status(repo).treeRev
+    for (const args of [['reset'], INIT]) {
+      const r = human(repo, ...args)
+      const v = status(repo)
+      check(`${args[0]} on a clean tree: fresh state (treeRev ${rev0}, not tainted), no WARN, no dirty-tests step`,
+        r.code === 0 && v.treeRev === rev0 && v.testsTainted === false && !/WARN/.test(r.out) && !events(repo).some((e) => /:dirty-tests$/.test(e.source ?? '')), `${JSON.stringify({treeRev: v.treeRev, tainted: v.testsTainted})} ${r.out.slice(0, 100)}`)
+    }
+    // a code-only change is no test change: still a fresh, untainted state
+    writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => b + a\n')
+    const r = human(repo, 'reset')
+    check('reset with an uncommitted code change only: not tainted, no WARN', r.code === 0 && status(repo).testsTainted === false && status(repo).treeRev === rev0 && !/WARN/.test(r.out))
+    keepEvents(repo, 's33-clean')
+  }
+  const CASES: [string, string, string, string][] = [
+    ['reset', 'existing test', 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n"],
+    ['reset', 'test config', '.gitignore', '.env\n*.log\n'],
+    ['init --force', 'existing test', 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n"],
+    ['init --force', 'test config', 'package.json', '{"name": "s33", "private": true}\n'],
+  ]
+  for (const [cmd, what, file, content] of CASES) {
+    const name = `s33-${cmd.split(' ')[0]}-${what.replace(' ', '-')}`
+    const repo = setupRepo(name)
+    const rev0 = status(repo).treeRev
+    writeFileSync(join(repo, file), content) // uncommitted, before the human command (a crashed session, a stash pop, another tool)
+    const r = cmd === 'reset' ? human(repo, 'reset') : human(repo, ...INIT)
+    const v = status(repo)
+    check(`${cmd} with a dirty ${what} (${file}): exit 0 and a WARN naming the file and approve-tests`,
+      r.code === 0 && /WARN: uncommitted test or test-config changes against HEAD: .*/.test(r.out) && r.out.includes(file) && /approve-tests/.test(r.out), r.out.split('\n').filter((l) => /WARN|approve/.test(l)).join(' | ').slice(0, 220))
+    check(`${cmd} with a dirty ${what}: session starts tainted at revision ${rev0 + 1}`, v.testsTainted === true && v.treeRev === rev0 + 1 && v.buildOkRev === 0 && v.testsOkRev === 0, JSON.stringify(v))
+    const step = events(repo).filter((e) => e.source === `${cmd.split(' ')[0]}:dirty-tests`).at(-1)
+    check(`${cmd}: events.jsonl has the ${cmd.split(' ')[0]}:dirty-tests kernel step with every kernel field`,
+      !!step && step.req?.op === 'EDIT_TEST' && step.req?.suspicious === true && step.req?.cost === 0 && step.testsTainted === true && step.treeRev === rev0 + 1 &&
+      ['buildOkRev', 'testsOkRev', 'secretTainted', 'shellToken', 'spent', 'capNow', 'testFails', 'buildFails', 'halted'].every((k) => k in step), JSON.stringify(step).slice(0, 200))
+    agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test'); agentBashCC(repo, 'git add -A')
+    const g = status(repo)
+    const cm = hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q -m "after reset"'})
+    check(`${cmd}: green build and full suite, git commit still BLOCK until approve-tests`,
+      g.buildOkRev === g.treeRev && g.testsOkRev === g.treeRev && cm.code === 2 && /approve-tests/.test(cm.msg), cm.msg.slice(0, 160))
+    const a = attestOf(repo)
+    check(`${cmd}: attest consistent: true and tainted: true`, a.consistent === true && a.gates.tainted === true && a.checks.find((c: any) => c.name === 'log matches state')?.ok === true, JSON.stringify(a.checks))
+    human(repo, 'approve-tests')
+    const ok = agentBashCC(repo, 'git commit -q -m "reviewed"')
+    check(`${cmd}: after approve-tests the commit goes through`, ok.pre.code === 0 && ok.exit === 0, ok.out.slice(0, 120))
+    keepEvents(repo, name)
+  }
+  // with --base-ref: the changes count against baseRef, not HEAD (a test changed in a branch commit, never approved here)
+  const repo = setupRepo('s33-base-ref')
+  const main = run('git rev-parse --abbrev-ref HEAD', repo).stdout.trim()
+  run('git checkout -q -b feat', repo)
+  writeFileSync(join(repo, 'tests', 'sum.test.mjs'), "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  run('git commit -q -am "weaken in a branch commit"', repo)
+  const r = human(repo, ...INIT, '--base-ref', main)
+  check(`init --force --base-ref ${main} on a branch whose commit changed an existing test: WARN against ${main}, tainted`,
+    r.code === 0 && r.out.includes(`against ${main}: existing test M tests/sum.test.mjs`) && status(repo).testsTainted === true && attestOf(repo).consistent === true, r.out.split('\n').find((l) => /WARN/.test(l)))
+  keepEvents(repo, 's33-base-ref')
+}
+
+// ---------------------------------------------------------------- S34 stopbar upgrade
+say('\nS34 stopbar upgrade: re-pins the hook runtime, keeps state.json, config.json and the snapshots byte for byte')
+{
+  const repo = setupRepo('s34-upgrade', 3, false, [])
+  const sd = stateDir(repo), rtKernel = join(sd, 'runtime', 'dist', 'kernel.gen.js'), pinned = join(sd, 'runtime', 'bin', 'stopbar.mjs')
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // v2\n')
+  agentWrite(repo, 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  const v0 = status(repo)
+  check('session state before upgrade: revision > 1, green build and tests, tainted', v0.treeRev > 1 && v0.buildOkRev === v0.treeRev && v0.testsOkRev === v0.treeRev && v0.testsTainted === true, JSON.stringify(v0))
+  const files = ['state.json', 'config.json', 'snapshot.counted.index', 'snapshot.index'].map((f) => join(sd, f))
+  const before = files.map((f) => readFileSync(f).toString('base64'))
+  writeFileSync(rtKernel, '// replaced by a stray write\n')
+  const d0 = human(repo, 'doctor')
+  check('doctor: a changed pinned runtime is [WARN] and names `stopbar upgrade`', /\[WARN\] pinned runtime .*stopbar upgrade/.test(d0.out), d0.out.split('\n').find((l) => l.includes('pinned runtime')))
+  check('unknown --hooks target: refused before anything is written', human(repo, 'upgrade', '--hooks', 'claude,vim').code !== 0 && readFileSync(rtKernel, 'utf8').startsWith('// replaced'))
+  const up = human(repo, 'upgrade')
+  check('stopbar upgrade: exit 0, says the state is unchanged', up.code === 0 && /re-pinned/.test(up.out) && /unchanged/.test(up.out), up.out.slice(0, 200))
+  check('the runtime is restored (kernel.gen.js equals the package copy)', sha(rtKernel) === sha(join(ROOT, 'dist', 'kernel.gen.js')))
+  const d1 = human(repo, 'doctor')
+  check('doctor after upgrade: [OK] pinned runtime', /\[OK  \] pinned runtime/.test(d1.out), d1.out.split('\n').find((l) => l.includes('pinned runtime')))
+  check('state.json, config.json and both snapshot indexes are byte-identical', files.every((f, i) => readFileSync(f).toString('base64') === before[i]))
+  check('kernel fields unchanged (revision, gates, taint, budget)', JSON.stringify(status(repo)) === JSON.stringify(v0))
+  const up2 = human(repo, 'upgrade', '--hooks', 'claude')
+  check('stopbar upgrade --hooks claude rewrites the hooks with the pinned runtime', up2.code === 0 && readFileSync(join(repo, '.claude', 'settings.local.json'), 'utf8').includes(pinned.replace(/\\/g, '/')), up2.out.slice(0, 200))
+  check('hooks keep working after upgrade', hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, 'src', 'sum.mjs')}, undefined, {}, pinned).code === 0)
+  const a = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  check('attest: consistent, upgrade listed in humanActions', a.consistent === true && a.humanActions.filter((h: any) => h.action === 'upgrade').length === 2, JSON.stringify(a.humanActions.map((h: any) => h.action)))
+  const ev = events(repo).filter((e) => e.source === 'human:upgrade')
+  check('events.jsonl: human:upgrade with version, runtime and kernel, no req', ev.length === 2 && ev.every((e) => e.version && e.runtime && e.kernel?.kernelSha256 && !('req' in e)))
+  for (const c of ['stopbar upgrade', 'npx stopbar upgrade', `node "${CLI.replace(/\\/g, '/')}" upgrade`]) {
+    const b = hook(repo, 'PreToolUse', 'Bash', {command: c}, undefined, {}, pinned)
+    check(`agent \`${c.replace(ROOT.replace(/\\/g, '/'), '<pkg>')}\` is BLOCK (human-only)`, b.code === 2 && /^BLOCK/.test(b.msg) && /human-only/.test(b.msg), b.msg.slice(0, 120))
+  }
+  const noInit = join(TMP, 's34-no-init'); mkdirSync(noInit, {recursive: true}); run('git init -q', noInit)
+  const ni = human(noInit, 'upgrade')
+  check('upgrade without init fails closed with the init command, writes no runtime', ni.code === 2 && /not initialised[\s\S]*stopbar init/.test(ni.out) && !existsSync(join(stateDir(noInit), 'runtime')), ni.out.slice(0, 140))
+  writeFileSync(join(sd, 'state.json'), '{"version": 2, "kern')
+  const bad = human(repo, 'upgrade')
+  check('upgrade with a damaged state.json fails closed with the reset fix', bad.code === 2 && /state\.json is not valid JSON[\s\S]*stopbar reset/.test(bad.out), bad.out.slice(0, 160))
+  keepEvents(repo, 's34-upgrade')
+}
+
+// ---------------------------------------------------------------- S35 checkout / cherry-pick / rebase with --base-ref
+say('\nS35 --base-ref main: tests taken over unchanged from a newer main do not taint; any other change of them does')
+{
+  const repo = setupRepo('s35-base-ref')
+  writeFileSync(join(repo, 'package.json'), '{"name": "s35", "private": true, "version": "1.0.0"}\n')
+  run('git add -A', repo); run('git commit -q -m "package.json"', repo); run('git branch -M main', repo); run('git checkout -q -b feat', repo)
+  const ini = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--base-ref', 'main', '--no-pin')
+  check('init --force --base-ref main on a clean feat branch: not tainted', ini.code === 0 && status(repo).testsTainted === false && !/WARN/.test(ini.out))
+  // the agent's code commit on feat
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b\nexport const mul = (a, b) => a * b\n')
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test'); agentBashCC(repo, 'git add -A')
+  const c = agentBashCC(repo, 'git commit -q -m "feat: mul"')
+  const codeCommit = run('git rev-parse HEAD', repo).stdout.trim()
+  check('code commit on feat allowed', c.pre.code === 0 && c.exit === 0)
+  // meanwhile main moves on (a human, in another worktree): a stronger existing test and a changed package.json
+  const wt = join(TMP, 's35-main-wt').replace(/\\/g, '/')
+  run(`git worktree add -q "${wt}" main`, repo)
+  writeFileSync(join(wt, 'tests', 'sum.test.mjs'), "import {test} from 'node:test'\nimport assert from 'node:assert/strict'\nimport {sum} from '../src/sum.mjs'\n\ntest('sum', () => {\n  assert.equal(sum(2, 3), 5)\n  assert.equal(sum(-1, 1), 0)\n})\n")
+  writeFileSync(join(wt, 'package.json'), '{"name": "s35", "private": true, "version": "1.0.1"}\n')
+  run('git commit -q -am "main: stronger test, package.json 1.0.1"', wt)
+  // and a branch with a weakened test, made from the new main
+  run('git checkout -q -b weak', wt)
+  writeFileSync(join(wt, 'tests', 'sum.test.mjs'), "import {test} from 'node:test'\ntest('sum', () => {})\n")
+  run('git commit -q -am "weaken"', wt)
+  const r0 = status(repo).treeRev
+  const co = agentBashCC(repo, 'git checkout -q -b feat-2 main')
+  const v1 = status(repo)
+  check('checkout -b feat-2 main: the tree revision grows (gates invalidated) but no taint: test and package.json equal main',
+    co.exit === 0 && co.post?.code === 0 && v1.treeRev > r0 && v1.buildOkRev !== v1.treeRev && v1.testsTainted === false, `${co.post?.msg ?? ''} ${JSON.stringify({treeRev: v1.treeRev, tainted: v1.testsTainted})}`)
+  check('the change was classified as taken over from the base ref', events(repo).some((e) => /existing test M tests\/sum\.test\.mjs \(same as base ref\)/.test(e.source ?? '') && /config M package\.json \(same as base ref\)/.test(e.source ?? '')))
+  const cp = agentBashCC(repo, `git cherry-pick ${codeCommit}`)
+  const v2 = status(repo)
+  check('cherry-pick of the code commit onto feat-2: revision grows, no taint', cp.exit === 0 && cp.post?.code === 0 && v2.treeRev > v1.treeRev && v2.testsTainted === false, cp.out.slice(0, 120))
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  const v3 = status(repo)
+  check('green gates after the move: git commit and git push are not blocked', v3.buildOkRev === v3.treeRev && v3.testsOkRev === v3.treeRev &&
+    hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q --allow-empty -m "rebased"'}).code === 0 && hook(repo, 'PreToolUse', 'Bash', {command: 'git push -q origin feat-2'}).code === 0)
+  // a real rebase in one call: feat (code commit on the old main) onto the new main; the tree goes from feat-2 to rebased feat
+  const r1 = status(repo).treeRev
+  const rb = agentBashCC(repo, 'git rebase -q main feat')
+  check('git rebase main feat (feat was cut from the old main): revision grows, no taint', rb.exit === 0 && run('git rev-parse --abbrev-ref HEAD', repo).stdout.trim() === 'feat' &&
+    run('git merge-base --is-ancestor main HEAD', repo).code === 0 && status(repo).testsTainted === false && status(repo).treeRev >= r1, rb.out.slice(0, 120))
+  const wk = agentBashCC(repo, 'git cherry-pick weak')
+  check('cherry-pick of a commit that weakens tests/sum.test.mjs against main: PAUSE and tainted', wk.exit === 0 && wk.post?.code === 2 && /approve-tests/.test(wk.post?.msg ?? '') && status(repo).testsTainted === true, wk.post?.msg)
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  const cm = hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q --allow-empty -m "weak"'}), ps = hook(repo, 'PreToolUse', 'Bash', {command: 'git push -q origin feat-2'})
+  check('green gates, but git commit and git push stay BLOCK until approve-tests', cm.code === 2 && ps.code === 2 && /approve-tests/.test(cm.msg) && /approve-tests/.test(ps.msg), `${cm.msg.slice(0, 80)} | ${ps.msg.slice(0, 80)}`)
+  // weaken, then put it back: L2.2, the taint stays
+  run('git checkout -q -B feat-3 main', repo)
+  human(repo, 'reset')
+  check('a human moves to feat-3 = main and resets: clean, not tainted', status(repo).testsTainted === false)
+  const w = agentWrite(repo, 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('sum', () => {})\n")
+  check('agent weakens tests/sum.test.mjs: tainted', w.post?.code === 2 && status(repo).testsTainted === true)
+  const back = agentBashCC(repo, 'git checkout -- tests/sum.test.mjs')
+  const v4 = status(repo)
+  check('git checkout -- tests/sum.test.mjs (back to main): revision grows, the taint stays (L2.2)', back.exit === 0 && v4.testsTainted === true && v4.treeRev > 1, JSON.stringify({treeRev: v4.treeRev, tainted: v4.testsTainted}))
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  check('after the revert and green gates, git commit still needs approve-tests', /approve-tests/.test(hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q --allow-empty -m x'}).msg))
+  const a = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  check('attest consistent and tainted', a.consistent === true && a.gates.tainted === true)
+  run(`git worktree remove --force "${wt}"`, repo)
+  keepEvents(repo, 's35-base-ref')
+}
+{
+  // without --base-ref the reference is HEAD, which the agent's own git commands move: 1.1.2 rule, every change of an
+  // existing test taints, even when the test equals the new HEAD (e.g. `git stash && git checkout stash@{0}` in one call)
+  const repo = setupRepo('s35-head')
+  const w = agentBashCC(repo, `node -e "require('fs').writeFileSync('tests/sum.test.mjs', 'export {}\\n')" && git stash -q && git checkout -q stash@{0}`)
+  const v = status(repo)
+  check('no base ref: a weakened test that equals the new HEAD (stash + checkout in one call) still taints', w.exit === 0 && w.post?.code === 2 && v.testsTainted === true, `${w.out.slice(0, 80)} ${JSON.stringify({tainted: v.testsTainted})}`)
+  keepEvents(repo, 's35-head')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

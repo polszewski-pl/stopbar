@@ -175,7 +175,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     const rt = join(repo.stateDir, 'runtime', 'dist', 'kernel.gen.js')
     if (existsSync(rt)) {
       const same = existsSync(join(PKG_ROOT, 'dist', 'kernel.gen.js')) && sha(rt) === sha(join(PKG_ROOT, 'dist', 'kernel.gen.js'))
-      add(same ? 'OK' : 'WARN', 'pinned runtime', `${join(repo.stateDir, 'runtime')}${same ? ' (same kernel as this package)' : ' differs from this package: a human runs `stopbar init --force ...` to re-pin'}`)
+      add(same ? 'OK' : 'WARN', 'pinned runtime', `${join(repo.stateDir, 'runtime')}${same ? ' (same kernel as this package)' : ' differs from this package: a human runs `stopbar upgrade` to re-pin (state and gates are kept)'}`)
     } else if (cfgOk) add('WARN', 'pinned runtime', 'none: hooks run an unpinned copy (init --no-pin)')
     const others = checkOtherClients(repo, add)
     const claudeHas = ['settings.json', 'settings.local.json'].some((n) => { const h = hooksIn(join(repo!.root, '.claude', n)); return h !== null && Object.keys(stopbarCommands(h)).length > 0 })

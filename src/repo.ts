@@ -142,18 +142,44 @@ export function diffEntries(a: Entries, b: Entries): {status: string; path: stri
   return out.sort((x, y) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0))
 }
 
-/** Fallback diff when the counted copy is gone: the current snapshot against HEAD (one git process). */
-export function changesSinceHead(r: Repo, now: Entries): {status: string; path: string}[] {
+const refFailed = (ref: string) => new FailClosed(`baseRef ${JSON.stringify(ref)} could not be resolved in git`,
+  'a human restores the ref or runs `stopbar init --force ... --base-ref <ref>`')
+
+/** `git ls-tree -r` of `ref` as entries (path -> "<mode> <oid>", leading zeros of the mode dropped as in the index).
+ *  `paths` limits the listing (literal pathspecs); null lists the whole tree. One git process.
+ *  A ref that does not resolve: HEAD (no commit yet) = empty tree; any other ref fails closed. */
+function lsTree(root: string, ref: string, paths: string[] | null): Entries {
+  const out: Entries = new Map()
+  let raw: string
   try {
-    const out = git(r.root, ['-c', 'core.quotepath=false', 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'])
-    const head: Entries = new Map()
-    for (const rec of out.split('\0')) {
-      const m = /^(\d+) \w+ ([0-9a-f]+)\t(.*)$/s.exec(rec)
-      if (m) head.set(m[3], `${m[1].replace(/^0+/, '')} ${m[2]}`)
-    }
-    return diffEntries(head, now)
-  } catch { return diffEntries(new Map(), now) }
+    raw = git(root, ['--literal-pathspecs', '-c', 'core.quotepath=false', 'ls-tree', '-r', '-z', '--full-tree', ref, ...(paths ? ['--', ...paths] : [])])
+  } catch {
+    if (ref === 'HEAD') return out
+    throw refFailed(ref)
+  }
+  for (const rec of raw.split('\0')) {
+    const m = /^(\d+) \w+ ([0-9a-f]+)\t(.*)$/s.exec(rec)
+    if (m) out.set(m[3], `${m[1].replace(/^0+/, '')} ${m[2]}`)
+  }
+  return out
 }
+
+/** The entries of `paths` in `ref` (path -> "<mode> <oid>"; a path missing from the map is not in `ref`).
+ *  One git process, called only when test files or test config changed. Non-HEAD ref that does not resolve: FailClosed. */
+export function refEntries(root: string, ref: string, paths: string[]): Entries {
+  return paths.length ? lsTree(root, ref, paths) : new Map()
+}
+
+/** The blob id of an entry "<mode> <oid>" (the mode is ignored: on Windows the file mode is not reliable). */
+export const oidOf = (v: string | undefined) => v?.split(' ')[1]
+
+/** The current snapshot against `ref` (one git process). Non-HEAD ref that does not resolve: FailClosed. */
+export function changesSinceRef(r: Repo, ref: string, now: Entries): {status: string; path: string}[] {
+  return diffEntries(lsTree(r.root, ref, null), now)
+}
+
+/** Fallback diff when the counted copy is gone: the current snapshot against HEAD (one git process). */
+export const changesSinceHead = (r: Repo, now: Entries) => changesSinceRef(r, 'HEAD', now)
 
 /** Does the current private index differ from HEAD? (one git process; no HEAD = differs unless empty) */
 export function differsFromHead(r: Repo, now: Entries): boolean {
@@ -180,7 +206,7 @@ export function inRef(root: string, ref: string, paths: string[]): Set<string> {
     return new Set(out.split('\0').filter(Boolean))
   } catch {
     if (ref === 'HEAD') return new Set()
-    throw new FailClosed(`baseRef ${JSON.stringify(ref)} could not be resolved in git`, 'a human restores the ref or runs `stopbar init --force ... --base-ref <ref>`')
+    throw refFailed(ref)
   }
 }
 

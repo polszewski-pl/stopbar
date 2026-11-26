@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.1.3 (2026-11-26)
+
+`src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.2. A `config.json` and a
+`state.json` from 1.0.0–1.1.2 work without migration.
+
+- **Security fix (`init --force` and `reset` on a dirty tree):** both start a fresh kernel on the current working tree.
+  Before 1.1.3, uncommitted changes of existing tests or of test config vanished with the old state, so a commit after
+  green gates needed no `approve-tests`. Now both commands compare the working tree with `baseRef` (else `HEAD`) by the
+  same rule as the hooks. When a change is suspicious, they take one kernel step `EDIT_TEST` (`suspicious: true`,
+  `cost: 0`), save it in `state.json` and log it in `events.jsonl` (`init:dirty-tests` / `reset:dirty-tests`, with
+  `req` and every kernel field, so `stopbar attest` stays consistent). The output starts a `WARN:` line with the files.
+  The session then starts with `testsTainted = true` at the next revision (the kernel's first revision is 1, so 2)
+  until a human runs `stopbar approve-tests`. On a clean tree nothing changes.
+- **`stopbar upgrade [--hooks <targets>] [--force-hooks]`:** re-pins the hook runtime (`.git/stopbar/runtime`) from the
+  installed package and, with `--hooks`, rewrites the hook configuration. It does not touch `state.json`,
+  `config.json` or the snapshot indexes: revision, gates, taint and budget stay. It needs a valid `config.json` and
+  `state.json` (else it fails closed with the fix), validates `--hooks` before it writes, and logs `human:upgrade`
+  (version, runtime, kernel; no `req`, so `attest` stays consistent and lists `upgrade` in `humanActions`). The agent
+  cannot run it (self-protection). `stopbar doctor` now names `stopbar upgrade` in `[WARN] pinned runtime`.
+- **No false taint after `checkout` / `rebase` / `cherry-pick` from `baseRef`:** with `--base-ref`, the hooks compare
+  the blob id of each changed test and test-config file with `baseRef` (`refEntries`, one `git ls-tree` call, only when
+  such a file changed). A file with the same content as in `baseRef` is not suspicious, so tests and `package.json`
+  taken over from a newer `main` no longer taint. A test of `baseRef` with other content, or deleted, and a test-config
+  file that differs from `baseRef` (also a new one) are suspicious. The file mode is ignored (Windows). The tree
+  revision still grows with every change (the gates must run again), and a taint is never cleared by putting a file
+  back (law L2.2).
+- **Without `--base-ref` the rule of 1.1.2 stays:** every change of an existing test (in `HEAD`) and of test config is
+  suspicious, also when the file equals `HEAD`. The agent's own git commands move `HEAD` (for example
+  `git stash && git checkout stash@{0}` in one call), so a content match with `HEAD` is no evidence.
+- `repo.ts`: `changesSinceRef(r, ref, now)` (a non-`HEAD` ref that does not resolve fails closed), `refEntries`,
+  `oidOf`; `changesSinceHead`, `inRef` and `inHead` stay as before.
+- Tests: unit tests for the blob-id rule, for `refEntries` / `changesSinceRef` and for blocking `stopbar upgrade`;
+  E2E scenarios S33 (`init --force` / `reset` on a dirty tree), S34 (`stopbar upgrade`) and S35 (`checkout`,
+  `cherry-pick` and `rebase` with `--base-ref main`, and the `HEAD` rule). The probe model follows both changes; half
+  of the seeds now run with a base ref, and a new action puts a file back to its base content.
+
 ## 1.1.2 (2026-11-26)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.1. A `config.json` from

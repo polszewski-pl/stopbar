@@ -53,9 +53,24 @@ There is no proof for them.
 - **Results from the event type.** Claude Code sends `PostToolUseFailure` for a failed command and `PostToolUse`
   without an exit code for a successful one. A user interrupt (`is_interrupt`) does not count as a failure.
 - **Tree changes from content.** A private git index in `.git/stopbar/` gives a content snapshot after every edit and
-  every shell call: edits, deletions and new files that are not ignored. A change to a test file that exists in
-  `config.baseRef` (default `HEAD`), or to any test-config file, is suspicious. A configured non-`HEAD` `baseRef` that
-  cannot be resolved fails closed. The path patterns are in `config.json`.
+  every shell call: edits, deletions and new files that are not ignored. Without `config.baseRef`, a change to a test
+  file that exists in `HEAD`, or to any test-config file, is suspicious. With `config.baseRef`, the wrapper compares the
+  blob id of each changed test and test-config file with `baseRef` (one `git ls-tree`, only when such a file changed):
+  a test of `baseRef` with other content or deleted, and a test-config file whose content differs from `baseRef` (also
+  a new one), are suspicious; a file equal to `baseRef` is not. The file mode is ignored. A configured non-`HEAD`
+  `baseRef` that cannot be resolved fails closed. Every change still raises the tree revision, so the gates must run
+  again. The path patterns are in `config.json`.
+- **Fresh state on a dirty tree.** `stopbar init --force` and `stopbar reset` classify the uncommitted changes against
+  `baseRef` (else `HEAD`) by the same rule. A suspicious change is one kernel step `EDIT_TEST` (`suspicious: true`,
+  `cost: 0`), logged with every kernel field: the session starts tainted until `approve-tests`.
+- **`git cherry-pick` and `git rebase`.** They are ordinary shell commands: Stopbar does not block them before the gates
+  and does not treat them as a commit, although they write commits. They change the working tree, so the next hook
+  counts a new revision and the build and full test gates must pass again. With `--base-ref`, the blob-id comparison
+  finds every change of an existing test of `baseRef` and of test config against `baseRef`, whichever command made it;
+  tests taken over unchanged from `baseRef` do not taint. Without `--base-ref`, every change of an existing test taints.
+  `git commit`, `git push` (agent hooks and git hooks) and a green `stopbar attest` still need green gates and no
+  unapproved taint. A commit that `cherry-pick` or `rebase` writes itself does not pass through the commit gate (see
+  "Other commit paths" below); a later `git push` does.
 - **Commits.** `git commit` and `git push` must be one command without operators, also with git global options before
   the subcommand. The one allowed form of command substitution is the quoted heredoc that Claude Code writes:
   `git commit ... -m "$(cat <<'EOF'` … `EOF` `)"`. The delimiter is in single quotes, so bash expands nothing in the
@@ -102,10 +117,14 @@ that tries to defeat it:
 4. **Weak new tests and mutable `baseRef`.** A new test file is not suspicious. A mock of the system under test or an
    empty assertion in a new file passes. Hard-coded answers in production code are an ordinary code edit. When
    `config.baseRef` is a mutable local branch name (such as `main`) rather than a commit SHA, an agent with shell access
-   can move that branch ref; pass a commit hash (`--base-ref <sha>`) if you want an immutable baseline.
+   can move that branch ref; pass a commit hash (`--base-ref <sha>`) if you want an immutable baseline. Since 1.1.3 this
+   matters more: a test that equals `baseRef` does not taint, so an agent that moves the `baseRef` branch to a commit
+   with weakened tests (for example `git branch -f main <commit>` or `git update-ref`) and then checks it out is not
+   flagged. Stopbar does not watch the ref itself.
 5. **Ignored files.** Files ignored by `.gitignore` are invisible to the snapshot (for example patches in
    `node_modules`). A change to `.gitignore` itself is suspicious.
-6. **Other commit paths.** Git aliases, `git commit-tree`, `gh pr create` and similar are not detected. The Stop hook
+6. **Other commit paths.** Git aliases, `git commit-tree`, `git stash`, `git cherry-pick`, `git rebase`, `gh pr create`
+   and similar are not detected as commits. The Stop hook
    catches uncommitted work only. With `config.stopGate: "warn"` it does not even block that: the turn ends with a
    `WARN (stopbar)` answer and a `stop:warn` entry in `events.jsonl`. This mode takes no kernel step at Stop and does not
    weaken the commit gate: `git commit` and `git push` in the agent hooks and in the git hooks are judged by the kernel
@@ -137,6 +156,16 @@ that tries to defeat it:
 For a hostile-agent threat model, run the agent in a container or VM: no network by default, the repository mounted
 read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
 the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
+
+## Known limits of 1.1.3
+
+- The blob-id comparison trusts `baseRef`: see point 4 of section 3 (a mutable branch name can be moved by the agent).
+  Use a commit SHA as `--base-ref` when the agent must not be able to move the baseline.
+- `init --force` and `reset` count all suspicious uncommitted changes as one kernel step. A test file that changed in
+  a branch commit against `baseRef` counts too, even if a human approved it in an earlier session: after `reset` such
+  a branch starts tainted until `approve-tests`.
+- `stopbar upgrade` re-pins the runtime from the package that runs the command. It does not check that the package is
+  newer, and it does not change `config.json`; new defaults (for example `safeTools`) are only named as a hint.
 
 ## Known limits of 1.1.2
 
