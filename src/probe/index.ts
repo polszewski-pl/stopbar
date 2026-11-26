@@ -1,8 +1,9 @@
 // PROBE: stateful probing with a reference model. A target generates runs (a seed and a list of actions, pure data),
 // executes them against the real thing and compares every step with its model. The runner spreads seeds over worker
 // processes, replays saved regressions, shrinks a failing run to a minimal one and writes it as JSON.
-// Targets: "wrapper" (the Stopbar hooks themselves, in TARGETS) or a file of any TS/JS project
-// (`stopbar probe --target path/to/x.probe.ts`, usually written with defineModel from `stopbar/probe`).
+// Targets: "wrapper" (the Stopbar hooks themselves, in TARGETS), a file of any TS/JS project
+// (`stopbar probe --target path/to/x.probe.ts`, usually written with defineModel from `stopbar/probe`) or a program in
+// any language that speaks NDJSON on stdin/stdout (`stopbar probe --cmd "python x_probe.py"`, see stdio.ts).
 // With --check-mutants every mutant the target declares must be caught; a result is recorded in events.jsonl.
 import {spawn} from 'node:child_process'
 import {createHash} from 'node:crypto'
@@ -14,15 +15,14 @@ import {PKG_ROOT} from '../pkg.ts'
 import {findRepo, snapshot} from '../repo.ts'
 import {appendEvent, paths, readConfig, readState, withLock} from '../store.ts'
 import type {Outcome, ProbeRun, ProbeTarget} from './sdk.ts'
+import {CmdClient, commandFile, ProbeError} from './stdio.ts'
 
 export type {Mismatch, Outcome, ProbeRun, ProbeTarget} from './sdk.ts'
+export {ProbeError} from './stdio.ts'
 
 export const TARGETS: Record<string, () => Promise<ProbeTarget<any>>> = {
   wrapper: async () => (await import('./wrapper.ts')).wrapperTarget,
 }
-
-/** A refusal of the user's input (unknown file, bad export, no mutants): the CLI exits 1 with the message. */
-export class ProbeError extends Error {}
 
 const sha = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
 
@@ -32,7 +32,9 @@ function isTarget(x: any): x is ProbeTarget<any> {
     (x.mutants === undefined || (Array.isArray(x.mutants) && x.mutants.every((m: unknown) => typeof m === 'string')))
 }
 
-export type Resolved = {t: ProbeTarget<any>; spec: string; file: string | null; sha256: string | null}
+/** What the runner drives: a ProbeTarget, or a --cmd target whose generate answers asynchronously and that must be closed. */
+export type Runnable = Omit<ProbeTarget<any>, 'generate'> & {generate(seed: number): ProbeRun | Promise<ProbeRun>; close?(): Promise<void>}
+export type Resolved = {t: Runnable; spec: string; file: string | null; sha256: string | null; cmd?: string}
 
 /** A name in TARGETS, else a .ts/.mts/.js/.mjs file (absolute, or relative to `cwd`, then to `repo`) that exports a
  *  ProbeTarget as `default` or as `target`. */
@@ -51,8 +53,30 @@ export async function loadTarget(spec: string, cwd = process.cwd(), repo?: strin
   return {t, spec: file, file, sha256: sha(readFileSync(file))}
 }
 
+/** A --cmd target: asks the program for info (it is started now and again on demand after `close`). `targetFile`
+ *  (absolute, or relative to `cwd`, then to `repo`) is hashed; else the first existing file in the command, else none. */
+export async function loadCmd(cmd: string, o: {cwd?: string; repo?: string; targetFile?: string; timeoutMs?: number} = {}): Promise<Resolved> {
+  const cwd = o.cwd ?? process.cwd()
+  let file: string | null = null
+  if (o.targetFile !== undefined) {
+    const cands = isAbsolute(o.targetFile) ? [o.targetFile] : [resolve(cwd, o.targetFile), ...(o.repo ? [resolve(o.repo, o.targetFile)] : [])]
+    file = cands.find((f) => existsSync(f)) ?? null
+    if (!file) throw new ProbeError(`--target-file ${JSON.stringify(o.targetFile)} does not exist`)
+  } else file = commandFile(cmd, cwd)
+  const c = new CmdClient(cmd, {cwd, timeoutMs: o.timeoutMs})
+  let info
+  try { info = await c.info() } catch (e) { await c.close(); throw e }
+  const t: Runnable = {
+    name: info.name, description: info.description, ...(info.mutants ? {mutants: info.mutants} : {}),
+    generate: (seed) => c.generate(seed),
+    execute: (run, dir, mutant) => c.execute(run, dir, mutant),
+    close: () => c.close(),
+  }
+  return {t, spec: info.name, file, sha256: file ? sha(readFileSync(file)) : null, cmd}
+}
+
 /** Every execute starts in an empty scratch directory. */
-async function exec<R extends ProbeRun>(t: ProbeTarget<R>, run: R, dir: string, mutant?: string): Promise<Outcome> {
+async function exec(t: Runnable, run: ProbeRun, dir: string, mutant?: string): Promise<Outcome> {
   rmSync(dir, {recursive: true, force: true, maxRetries: 5}); mkdirSync(dir, {recursive: true})
   return mutant === undefined ? t.execute(run, dir) : t.execute(run, dir, mutant)
 }
@@ -60,7 +84,7 @@ async function exec<R extends ProbeRun>(t: ProbeTarget<R>, run: R, dir: string, 
 /** Delta debugging: the shortest sequence that still fails the same way (same `what`). Deterministic order.
  *  0: cut after the failing step; 1: remove blocks of len/2, len/4, ... (>= 2), from the largest again after every
  *  success; 2: single deletions from the end, to a fixed point. */
-export async function shrink<R extends ProbeRun>(t: ProbeTarget<R>, run: R, dir: string, what: string): Promise<R> {
+export async function shrink<R extends ProbeRun>(t: Runnable, run: R, dir: string, what: string): Promise<R> {
   let cur = run
   const fails = async (r: R) => { const x = await exec(t, r, dir); return !x.ok && x.mismatch.what === what }
   const end = await exec(t, cur, dir)
@@ -84,25 +108,35 @@ export async function shrink<R extends ProbeRun>(t: ProbeTarget<R>, run: R, dir:
   return cur
 }
 
-type Part = {target: string; seeds: number[]; regs: string[]; work: string; mutant?: string}
+type Part = {target: string; cmd?: string; timeoutMs?: number; seeds: number[]; regs: string[]; work: string; mutant?: string}
 
-/** Worker process: runs its share and prints one JSON line with the results. With `mutant` it runs the seeds in order
- *  against that mutant and stops at the first one that fails (no shrinking). */
+/** Worker process: runs its share and prints one JSON line with the results (or {error} for a ProbeError). With
+ *  `mutant` it runs the seeds in order against that mutant and stops at the first one that fails (no shrinking).
+ *  A --cmd target is one process for the whole share, closed at the end. */
 export async function worker(p: Part) {
-  const {t} = await loadTarget(p.target)
+  let t: Runnable | null = null
+  try {
+    t = (p.cmd !== undefined ? await loadCmd(p.cmd, {timeoutMs: p.timeoutMs}) : await loadTarget(p.target)).t
+    process.stdout.write(JSON.stringify(await share(t, p)) + '\n')
+  } catch (e) {
+    if (!(e instanceof ProbeError)) throw e
+    process.stdout.write(JSON.stringify({error: e.message}) + '\n')
+  } finally { await t?.close?.() }
+}
+
+async function share(t: Runnable, p: Part): Promise<unknown[]> {
   const res: unknown[] = []
   if (p.mutant !== undefined) {
     let tried = 0
     for (const seed of p.seeds) {
       tried++
       const dir = join(p.work, `mut-${process.pid}-${seed}`)
-      const x = await exec(t, t.generate(seed), dir, p.mutant)
+      const x = await exec(t, await t.generate(seed), dir, p.mutant)
       rmSync(dir, {recursive: true, force: true, maxRetries: 5})
       if (!x.ok) { res.push({mutant: p.mutant, killed: true, seed, tried, mismatch: x.mismatch}); break }
     }
     if (!res.length) res.push({mutant: p.mutant, killed: false, tried})
-    process.stdout.write(JSON.stringify(res) + '\n')
-    return
+    return res
   }
   for (const f of p.regs) {
     const run = JSON.parse(readFileSync(f, 'utf8')).run
@@ -112,7 +146,7 @@ export async function worker(p: Part) {
     rmSync(dir, {recursive: true, force: true, maxRetries: 5})
   }
   for (const seed of p.seeds) {
-    const run = t.generate(seed)
+    const run = await t.generate(seed)
     const dir = join(p.work, `run-${seed}`)
     const x = await exec(t, run, dir)
     if (!x.ok) {
@@ -122,10 +156,10 @@ export async function worker(p: Part) {
     } else res.push({seed, ...x})
     rmSync(dir, {recursive: true, force: true, maxRetries: 5})
   }
-  process.stdout.write(JSON.stringify(res) + '\n')
+  return res
 }
 
-export type ProbeOptions = {target?: string; runs?: number; seed?: number; jobs?: number; work?: string; out?: string; regressions?: string; regressionsOnly?: boolean
+export type ProbeOptions = {target?: string; cmd?: string; targetFile?: string; cmdTimeoutMs?: number; runs?: number; seed?: number; jobs?: number; work?: string; out?: string; regressions?: string; regressionsOnly?: boolean
   checkMutants?: boolean; mutantRuns?: number; repo?: string; record?: boolean; log?: (s: string) => void}
 
 /** <git-dir>/stopbar/probe in a repository with Stopbar, else a temporary directory (a project without Stopbar gets
@@ -140,7 +174,11 @@ function spawnWorker(p: Part): Promise<any[]> {
     const ch = spawn(process.execPath, [join(PKG_ROOT, 'bin', 'stopbar.mjs'), 'probe', '--worker', JSON.stringify(p)], {stdio: ['ignore', 'pipe', 'inherit']})
     let s = ''
     ch.stdout.on('data', (d) => { s += d })
-    ch.on('exit', (code) => { try { ok(JSON.parse(s.trim().split('\n').pop()!)) } catch { bad(new Error(`probe worker exit ${code}: ${s.slice(0, 500)}`)) } })
+    ch.on('exit', (code) => {
+      let v: any
+      try { v = JSON.parse(s.trim().split('\n').pop()!) } catch { return bad(new Error(`probe worker exit ${code}: ${s.slice(0, 500)}`)) }
+      if (v && !Array.isArray(v) && typeof v.error === 'string') bad(new ProbeError(v.error)); else ok(v)
+    })
   })
 }
 
@@ -160,7 +198,15 @@ function isRegression(f: string): boolean {
 export async function probe(o: ProbeOptions = {}) {
   const log = o.log ?? ((s: string) => process.stdout.write(s + '\n'))
   const repoDir = o.repo ?? process.cwd()
-  const R = await loadTarget(o.target ?? 'wrapper', process.cwd(), o.repo)
+  if (o.cmd !== undefined && o.target !== undefined) throw new ProbeError('--target and --cmd exclude each other: give a file or name with --target, or a command with --cmd')
+  if (o.targetFile !== undefined && o.cmd === undefined) throw new ProbeError('--target-file needs --cmd (a --target file is hashed anyway)')
+  const R = o.cmd !== undefined ? await loadCmd(o.cmd, {repo: o.repo, targetFile: o.targetFile, timeoutMs: o.cmdTimeoutMs}) : await loadTarget(o.target ?? 'wrapper', process.cwd(), o.repo)
+  // the main process needs only info from a --cmd target: its process is not kept while the workers run
+  await R.t.close?.()
+  try { return await probeWith(R, o, log, repoDir) } finally { await R.t.close?.() }
+}
+
+async function probeWith(R: Resolved, o: ProbeOptions, log: (s: string) => void, repoDir: string) {
   const t = R.t
   const mutantNames = t.mutants ?? []
   if (o.checkMutants && !mutantNames.length) throw new ProbeError(`--check-mutants: target ${t.name} declares no mutants (add mutants: {...} to defineModel, or drop --check-mutants)`)
@@ -169,7 +215,7 @@ export async function probe(o: ProbeOptions = {}) {
   const jobs = Math.max(1, o.jobs ?? Math.min(16, Math.max(1, availableParallelism() - 2)))
   const work = o.work ?? defaultWork(repoDir), out = o.out ?? join(work, 'out')
   // a file target replays only the regressions the user names; the wrapper also has Stopbar's own
-  const regDir = o.regressions ?? (R.file ? null : join(PKG_ROOT, 'tests', 'regressions'))
+  const regDir = o.regressions ?? (R.file || R.cmd !== undefined ? null : join(PKG_ROOT, 'tests', 'regressions'))
   const regs = regDir && existsSync(regDir) ? readdirSync(regDir).filter((f) => f.endsWith('.json')).sort().map((f) => join(regDir, f)).filter(isRegression) : []
   const seeds = o.regressionsOnly ? [] : Array.from({length: runs}, (_, i) => seed0 + i)
   mkdirSync(work, {recursive: true}); mkdirSync(out, {recursive: true})
@@ -177,9 +223,12 @@ export async function probe(o: ProbeOptions = {}) {
   // old reproductions go, unless they are the regressions of this run
   if (!regDir || resolve(regDir) !== resolve(out)) for (const f of readdirSync(out)) if (/^repro-\d+\.json$/.test(f)) rmSync(join(out, f))
   const targetPath = R.file ? relPath(repoDir, R.file) : t.name
-  log(`probe ${t.name}: ${t.description}; ${seeds.length} random runs + ${regs.length} regression(s), ${jobs} jobs${R.sha256 ? `\n  target ${R.file} sha256 ${R.sha256}` : ''}`)
+  const cmdField = R.cmd !== undefined ? {targetCmd: R.cmd} : {}
+  const cmdPart = R.cmd !== undefined ? {cmd: R.cmd, ...(o.cmdTimeoutMs !== undefined ? {timeoutMs: o.cmdTimeoutMs} : {})} : {}
+  log(`probe ${t.name}: ${t.description}; ${seeds.length} random runs + ${regs.length} regression(s), ${jobs} jobs${R.cmd !== undefined ? `\n  command ${R.cmd}` : ''}` +
+    `${R.sha256 ? `\n  target ${R.file} sha256 ${R.sha256}` : R.cmd !== undefined ? '\n  target sha256 none (no file found in the command; name one with --target-file)' : ''}`)
   const t0 = Date.now()
-  const parts: Part[] = Array.from({length: jobs}, () => ({target: R.spec, seeds: [], regs: [], work}))
+  const parts: Part[] = Array.from({length: jobs}, () => ({target: R.spec, ...cmdPart, seeds: [], regs: [], work}))
   seeds.forEach((s, i) => parts[i % jobs].seeds.push(s))
   regs.forEach((f, i) => parts[i % jobs].regs.push(f))
   const results = (await Promise.all(parts.filter((p) => p.seeds.length || p.regs.length).map(spawnWorker))).flat()
@@ -187,8 +236,8 @@ export async function probe(o: ProbeOptions = {}) {
   const failed = results.filter((r) => !r.ok)
   for (const f of failed) {
     const file = join(out, `repro-${f.seed}.json`)
-    const run = f.minimal ?? f.run ?? t.generate(f.seed)
-    writeFileSync(file, JSON.stringify({target: t.name, ...(R.file ? {targetPath} : {}), found: new Date().toISOString(), mismatch: f.minimalMismatch ?? f.mismatch, run}, null, 1) + '\n')
+    const run = f.minimal ?? f.run ?? await t.generate(f.seed)
+    writeFileSync(file, JSON.stringify({target: t.name, ...(R.file ? {targetPath} : {}), ...cmdField, found: new Date().toISOString(), mismatch: f.minimalMismatch ?? f.mismatch, run}, null, 1) + '\n')
     log(`FAIL seed ${f.seed}${f.regression ? ' (regression ' + f.regression + ')' : ''}: ${f.mismatch.what} at step ${f.mismatch.step} ${JSON.stringify(f.mismatch.action)}\n  expected ${JSON.stringify(f.mismatch.expected)}\n  actual   ${JSON.stringify(f.mismatch.actual)}\n  ${f.minimal ? 'minimal ' : ''}reproduction (${run.actions.length} steps): ${file}`)
   }
   const ok = results.filter((r) => r.ok && !r.regression)
@@ -200,7 +249,7 @@ export async function probe(o: ProbeOptions = {}) {
   if (o.checkMutants && failed.length) log(`mutants: not checked, the original fails`)
   else if (o.checkMutants) {
     const mseeds = Array.from({length: mutantRuns}, (_, i) => seed0 + i)
-    const res = (await pool(mutantNames, jobs, (m) => spawnWorker({target: R.spec, seeds: mseeds, regs: [], work, mutant: m}))).flat()
+    const res = (await pool(mutantNames, jobs, (m) => spawnWorker({target: R.spec, ...cmdPart, seeds: mseeds, regs: [], work, mutant: m}))).flat()
     const details = res.map((r) => r.killed
       ? {name: r.mutant, status: 'KILLED', seed: r.seed, step: r.mismatch.step, what: r.mismatch.what, action: r.mismatch.action, runs: r.tried}
       : {name: r.mutant, status: 'SURVIVED', runs: r.tried})
@@ -211,7 +260,7 @@ export async function probe(o: ProbeOptions = {}) {
   }
 
   const passOk = failed.length === 0 && (!mutants || mutants.survived.length === 0)
-  const summary = {target: t.name, ...(R.file ? {targetPath} : {}), targetSha256: R.sha256, ok: passOk, runs: seeds.length, regressions: regs.length,
+  const summary = {target: t.name, ...(R.file ? {targetPath} : {}), ...cmdField, targetSha256: R.sha256, ok: passOk, runs: seeds.length, regressions: regs.length,
     passed: results.filter((r) => r.ok).length, failed: failed.length,
     steps: ok.reduce((s, r) => s + r.steps, 0), hookCalls: ok.reduce((s, r) => s + (r.hooks ?? 0), 0), seeds: seeds.length ? `${seed0}..${seed0 + seeds.length - 1}` : '-',
     jobs, seconds: Math.round((Date.now() - t0) / 1000), coverage, ...(mutants ? {mutants} : {})}
@@ -221,7 +270,7 @@ export async function probe(o: ProbeOptions = {}) {
     `${summary.steps} steps${summary.hookCalls ? `, ${summary.hookCalls} hook calls` : ''}, ${summary.seconds} s, ${jobs} jobs\n  coverage ${JSON.stringify(coverage)}\n  summary ${summaryFile}`)
   for (const f of readdirSync(work)) if (/^(run|reg|mut)-/.test(f)) rmSync(join(work, f), {recursive: true, force: true, maxRetries: 5})
 
-  const recorded = o.record === false ? null : record(repoDir, {target: t.name, targetPath, targetSha256: R.sha256, runs: summary.runs, regressions: summary.regressions,
+  const recorded = o.record === false ? null : record(repoDir, {target: t.name, targetPath, ...cmdField, targetSha256: R.sha256, runs: summary.runs, regressions: summary.regressions,
     passed: summary.passed, failed: summary.failed, steps: summary.steps, ok: passOk, mutants: mutants ? {killed: mutants.killed, total: mutants.total, survived: mutants.survived} : null,
     summarySha256: sha(summaryText)})
   if (recorded) log(`recorded probe:result in ${recorded}`)

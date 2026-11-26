@@ -1293,6 +1293,87 @@ export default defineModel({
   keepEvents(repo, 's36-probe')
 }
 
+// ---------------------------------------------------------------- S37 --cmd (NDJSON over stdio), probe init
+say('\nS37 PROBE --cmd "<command>": NDJSON target in any language, mutants, probe:result and attest, repro and replay, probe init --lang ts|py')
+{
+  function probeCli(cwd: string, ...args: string[]) {
+    const r = spawnSync(process.execPath, [CLI, 'probe', '--jobs', '4', ...args], {cwd, encoding: 'utf8'})
+    const res = {code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()}
+    say(`    PROBE       ${args.join(' ').replaceAll(TMP, '<tmp>').replaceAll(ROOT, '<root>').replaceAll(process.execPath, '<node>').slice(0, 150)} -> exit ${res.code} | ${res.out.replace(/\s+/g, ' ').slice(0, 170)}`)
+    return res
+  }
+  const initCli = (...args: string[]) => {
+    const r = spawnSync(process.execPath, [CLI, 'probe', 'init', ...args], {cwd: ROOT, encoding: 'utf8'})
+    return {code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()}
+  }
+  const probeEvents = (repo: string) => events(repo).filter((e) => e.source === 'probe:result')
+  const stub = join(ROOT, 'tests', 'fixtures', 'ndjson-stack.mjs')
+  const nodeCmd = (...flags: string[]) => [`"${process.execPath}"`, `"${stub}"`, ...flags].join(' ')
+  const stubSha = createHash('sha256').update(readFileSync(stub)).digest('hex')
+  const repo = setupRepo('s37-cmd')
+  const work = join(TMP, 's37-work')
+  const stateBefore = readFileSync(join(stateDir(repo), 'state.json'), 'utf8')
+  const p = probeCli(ROOT, '--cmd', nodeCmd(), '--runs', '30', '--check-mutants', '--repo', repo, '--work', work)
+  const sum = JSON.parse(readFileSync(join(work, 'out', 'summary.json'), 'utf8'))
+  check('--cmd (a Node process speaking NDJSON) --runs 30 --check-mutants: exit 0, 30/30, 2/2 mutants killed', p.code === 0 && sum.ok === true && sum.passed === 30 &&
+    sum.target === 'ndjson-stack' && sum.mutants?.killed === 2 && sum.mutants?.total === 2 && /MUTANTS PASS: 2\/2 killed/.test(p.out), JSON.stringify(sum.mutants?.details?.map((d: any) => `${d.name}:${d.status}`)))
+  check('summary.json: targetSha256 of the script found in the command, targetCmd is the command', sum.targetSha256 === stubSha && sum.targetCmd === nodeCmd() && p.out.includes(stubSha), sum.targetSha256)
+  const ev = probeEvents(repo)
+  check('probe:result in events.jsonl with targetSha256 and targetCmd (no req), state.json unchanged', ev.length === 1 && !('req' in ev[0]) && ev[0].target === 'ndjson-stack' &&
+    ev[0].ok === true && ev[0].mutants?.killed === 2 && ev[0].targetSha256 === stubSha && ev[0].targetCmd === nodeCmd() &&
+    readFileSync(join(stateDir(repo), 'state.json'), 'utf8') === stateBefore, JSON.stringify(ev[0] ?? null).slice(0, 160))
+  const a = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  const md = spawnSync(process.execPath, [CLI, 'attest', '--repo', repo, '--format', 'md'], {encoding: 'utf8'}).stdout
+  const pq = a.probes?.find((x: any) => x.target === 'ndjson-stack')
+  check('attest json: consistent, ndjson-stack ok, 2/2 killed, atCurrentSnapshot true, targetCmd', a.consistent === true && pq?.ok === true && pq?.mutants?.killed === 2 &&
+    pq?.atCurrentSnapshot === true && pq?.targetSha256 === stubSha && pq?.targetCmd === nodeCmd(), JSON.stringify(pq ?? null).slice(0, 160))
+  check('attest md: Probe evidence line for ndjson-stack with PASS, 2/2, at current snapshot: yes', /- ndjson-stack: PASS, 30 runs, \d+ steps, mutants 2\/2 killed, at current snapshot: yes, target sha256 `[0-9a-f]{16}`/.test(md),
+    md.split('## Probe evidence')[1]?.split('\n')[2])
+
+  // a failing --cmd target: minimal reproduction, then the replay of it
+  const bout = join(TMP, 's37-bug-out')
+  const b = probeCli(ROOT, '--cmd', nodeCmd('--bug'), '--runs', '10', '--repo', repo, '--work', work, '--out', bout, '--no-record')
+  const repros = existsSync(bout) ? readdirSync(bout).filter((f) => /^repro-\d+\.json$/.test(f)) : []
+  const r0 = repros.length ? JSON.parse(readFileSync(join(bout, repros[0]), 'utf8')) : null
+  check('--cmd with a bug: exit 1, repro-<seed>.json shrunk to <= 3 steps, target = the name from info, targetCmd', b.code === 1 && repros.length > 0 && r0?.run.actions.length <= 3 &&
+    r0?.mismatch.what === 'pop result' && r0?.target === 'ndjson-stack' && r0?.targetCmd === nodeCmd('--bug'), `${repros.length} repro(s), first ${JSON.stringify(r0?.run.actions)}`)
+  const rout = join(TMP, 's37-replay-out')
+  const rr = probeCli(ROOT, '--cmd', nodeCmd('--bug'), '--regressions', bout, '--regressions-only', '--repo', repo, '--work', work, '--out', rout, '--no-record')
+  const rsum = JSON.parse(readFileSync(join(rout, 'summary.json'), 'utf8'))
+  const replayed = repros.length && existsSync(join(rout, repros[0])) ? JSON.parse(readFileSync(join(rout, repros[0]), 'utf8')) : null
+  check('--regressions <outDir> --regressions-only with --cmd replays the same failure', rr.code === 1 && rsum.runs === 0 && rsum.regressions === repros.length && rsum.failed === repros.length &&
+    JSON.stringify(replayed?.mismatch) === JSON.stringify(r0?.mismatch), JSON.stringify({regressions: rsum.regressions, failed: rsum.failed}))
+  const both = probeCli(ROOT, '--target', 'examples/bounded-queue.probe.ts', '--cmd', nodeCmd(), '--repo', repo, '--work', work, '--no-record')
+  check('--target and --cmd together: exit 1 with a clear message', both.code === 1 && /--target and --cmd exclude each other/.test(both.out), both.out.slice(0, 120))
+  const crash = probeCli(ROOT, '--cmd', nodeCmd('--crash', 'execute'), '--runs', '4', '--repo', repo, '--work', work, '--no-record')
+  check('a --cmd process that crashes: exit 1, the error names the exit code and quotes its stderr', crash.code === 1 && /exited with code 3[\s\S]*boom: crash on execute/.test(crash.out), crash.out.slice(0, 160))
+  check('failed and --no-record runs left events.jsonl as it was', probeEvents(repo).length === 1)
+
+  // probe init: TS (runnable at once inside this package, where 'stopbar/probe' resolves) and Python
+  const idir = join(TMP, 's37-init')
+  const ts = initCli('--lang', 'ts', '--out', idir), tsFile = join(idir, 'sample.probe.ts')
+  const py = initCli('--lang', 'py', '--name', 'sample', '--out', idir), pyFile = join(idir, 'sample_probe.py')
+  check('probe init --lang ts and --lang py: exit 0, files written, the run command printed', ts.code === 0 && existsSync(tsFile) && /stopbar probe --target .*sample\.probe\.ts --check-mutants/.test(ts.out) &&
+    py.code === 0 && existsSync(pyFile) && /stopbar probe --cmd "python3? .*sample_probe\.py" --check-mutants/.test(py.out), `${ts.out.split('\n')[0]} | ${py.out.split('\n')[0]}`)
+  const again = initCli('--lang', 'ts', '--out', idir), forced = initCli('--lang', 'ts', '--out', idir, '--force'), evil = initCli('--name', '../evil', '--out', idir)
+  check('probe init: no overwrite without --force (exit 1), --force overwrites, ../ in --name refused', again.code === 1 && /--force/.test(again.out) && forced.code === 0 && evil.code === 1 &&
+    !existsSync(join(TMP, 'evil.probe.ts')), `${again.code}/${forced.code}/${evil.code}`)
+  const tsRun = probeCli(ROOT, '--target', tsFile, '--runs', '20', '--check-mutants', '--no-record', '--work', work)
+  check('the generated TS template: --runs 20 --check-mutants exit 0, 2/2 mutants killed', tsRun.code === 0 && /PROBE PASS: 20\/20/.test(tsRun.out) && /MUTANTS PASS: 2\/2 killed/.test(tsRun.out), tsRun.out.split('\n').find((l) => l.startsWith('MUTANTS')))
+
+  // Python, when the machine has it (the Linux container may not)
+  const python = ['python3', 'python'].find((c) => spawnSync(c, ['-c', 'import json, random, sys; print("ok")'], {encoding: 'utf8'}).stdout?.trim() === 'ok')
+  if (!python) say('  [SKIP] no python3 or python on this machine: the Python example and the --lang py template were not run')
+  else {
+    const ex = probeCli(ROOT, '--cmd', `${python} examples/bounded_queue_probe.py`, '--runs', '30', '--check-mutants', '--no-record', '--work', work)
+    check(`${python} examples/bounded_queue_probe.py --runs 30 --check-mutants --jobs 4: exit 0, 2/2 mutants killed, sha256 of the script`, ex.code === 0 && /PROBE PASS: 30\/30/.test(ex.out) &&
+      /MUTANTS PASS: 2\/2 killed/.test(ex.out) && ex.out.includes(createHash('sha256').update(readFileSync(join(ROOT, 'examples', 'bounded_queue_probe.py'))).digest('hex')), ex.out.split('\n').find((l) => l.startsWith('MUTANTS')))
+    const pyRun = probeCli(ROOT, '--cmd', `${python} "${pyFile}"`, '--runs', '30', '--check-mutants', '--no-record', '--work', work)
+    check(`the generated --lang py template under ${python}: exit 0, 2/2 mutants killed`, pyRun.code === 0 && /PROBE PASS: 30\/30/.test(pyRun.out) && /MUTANTS PASS: 2\/2 killed/.test(pyRun.out), pyRun.out.split('\n').find((l) => l.startsWith('MUTANTS')))
+  }
+  keepEvents(repo, 's37-cmd')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

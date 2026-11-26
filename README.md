@@ -41,7 +41,7 @@ current tree, block it after an unapproved test change, and block a push after a
 | Pillar | Command | What it gives you |
 |---|---|---|
 | PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
-| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also any TS/JS project: a model written with `defineModel` from `stopbar/probe`, with mutants that must be caught. |
+| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also your own project: a TS/JS model written with `defineModel` from `stopbar/probe`, or a program in any language (Python, Go, Rust, ...) that speaks NDJSON on stdin/stdout (`--cmd`), with mutants that must be caught. |
 | GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
 | ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions, probe evidence and the sha256 of the event log. |
 
@@ -111,7 +111,8 @@ EOF
 | `stopbar reset` | human | Fresh kernel state. Config and event log stay. Also repairs a damaged `state.json`. Uncommitted changes of existing tests or test config (against `baseRef`, else `HEAD`) are not forgotten: the session starts tainted, with a `WARN`, until `approve-tests`. `init --force` does the same. |
 | `stopbar doctor [--json]` | human | Environment, config, state, hooks and a dry run. Exit 1 on a problem. |
 | `stopbar prove [--out f.json] [--lean f.lean]` | human, CI | PROVE: the inductive proof of the kernel and the 10 mutants. Exit 0 only if everything holds. `verify` is an alias. |
-| `stopbar probe [--target wrapper\|<file>] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), or of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file (see [PROBE for your project](#probe-for-your-project)). A failure is shrunk to a minimal JSON reproduction. |
+| `stopbar probe [--target wrapper\|<file> \| --cmd "<command>" [--target-file <path>] [--cmd-timeout 300000]] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file, or of a program in any language over NDJSON (`--cmd`, see [PROBE for your project](#probe-for-your-project)). `--target` and `--cmd` exclude each other. A failure is shrunk to a minimal JSON reproduction. |
+| `stopbar probe init [--lang ts\|py] [--name sample] [--out probes] [--force] [--repo <dir>]` | human | Writes a starter target with 2 actions, 1 invariant and 2 mutants (`<name>.probe.ts` or `<name>_probe.py`) and prints the command that runs it. It does not overwrite a file without `--force`. |
 | `stopbar attest [--format json\|md]` | human, CI | ATTEST: the session attestation. The same state and log give the same output. Exit 1 if the state and the log disagree, exit 2 if a file is damaged. `probes` (Markdown: `## Probe evidence`) lists the latest `probe:result` per target since the last `init` or `reset`, with `atCurrentSnapshot`. |
 
 All commands take `--repo <dir>`. The agent cannot run the human commands: the hooks block them.
@@ -164,6 +165,47 @@ export default defineModel<{q: BoundedQueue<number>; model: number[]}>({
 A complete example with two mutants: [`examples/bounded-queue.probe.ts`](examples/bounded-queue.probe.ts)
 (`stopbar probe --target examples/bounded-queue.probe.ts --check-mutants`). TypeScript files need Node's type
 stripping (Node 22.18 or later): only erasable syntax, no `enum` and no constructor parameter properties.
+
+### Any language: `--cmd`
+
+`stopbar probe --cmd "<command>"` probes a program in any language (Python, Go, Rust, ...). Each worker (`--jobs`)
+starts the command once, in a shell, in the current directory, and keeps it for all its runs, so the start-up cost
+is paid once per worker and not once per seed. Stopbar sends one JSON object per line on stdin and reads one answer
+per line on stdout (NDJSON):
+
+| Request | Answer |
+|---|---|
+| `{"op":"info"}` | `{"name":"<string>","description":"<string>","mutants":["M1",...]}` (`mutants` is optional) |
+| `{"op":"generate","seed":123}` | `{"seed":123,"actions":[...]}`: pure JSON data, the same for the same seed |
+| `{"op":"execute","run":{"seed":123,"actions":[...]},"dir":"<scratch dir>","mutant":"M1"}` | `{"ok":true,"steps":N,"cov":{"push":3}}` or `{"ok":false,"mismatch":{"step":2,"action":{...},"what":"...","expected":...,"actual":...}}` |
+
+- `mutant` is sent only with `--check-mutants`. `dir` is an empty scratch directory for each execution.
+- Any answer can be `{"error":"<text>"}`. stdout is for the protocol only: print logs to stderr.
+- An exception of the code under test is a finding: catch it in `execute` and answer with a mismatch (the
+  templates do this). A process that exits, closes stdout, prints a line that is not JSON or gives no answer within
+  `--cmd-timeout` ms (default 300000) stops the probe with exit 1 and the end of its stderr. When the probe ends,
+  Stopbar closes stdin; a process that does not exit within 2 s is killed.
+- Shrinking, `--regressions` / `--regressions-only`, `--check-mutants`, `summary.json`, `repro-<seed>.json`,
+  `probe:result` and `attest` work as for `--target <file>`. `target` in a reproduction is the `name` from `info`;
+  `targetCmd` is the command. A `--cmd` target replays only the regressions in `--regressions <dir>`.
+- `targetSha256` is the sha256 of `--target-file <path>`, else of the first word after the interpreter that is an
+  existing file (`python examples/bounded_queue_probe.py` hashes that file), else `null`.
+
+[`examples/bounded_queue_probe.py`](examples/bounded_queue_probe.py) is the same queue model in Python, with the
+standard library only:
+
+```sh
+stopbar probe --cmd "python examples/bounded_queue_probe.py" --runs 200 --check-mutants
+```
+
+### A starter target: `stopbar probe init`
+
+`stopbar probe init --lang ts` writes `probes/sample.probe.ts` (`defineModel`), and `--lang py` writes
+`probes/sample_probe.py` (the NDJSON protocol, standard library only: `json`, `random`, `sys`). Both hold the same
+model with 2 actions, 1 invariant, 2 mutants and the rules for zero false positives, and `--check-mutants` passes on
+them as written. The command prints the line that runs the file. `--name` takes letters, digits, `-` and `_` only;
+`--out` (default `probes`) is relative to `--repo`, else to the current directory; an existing file stays unless you
+pass `--force`.
 
 ## Configuration
 
@@ -276,15 +318,19 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 ## Tested platforms
 
-| Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
-|---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 40/40 | 365/365 | 202/202 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 40/40 | 365/365 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Platform | Node | git | Python | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
+|---|---|---|---|---|---|---|---|---|---|
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 56/56 | 394/394 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 56/56 | 394/394 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5020 steps
 and 7152 hook calls (half of the seeds with a base ref). `stopbar doctor` passes on a fresh repository with all six `--hooks` targets.
-`npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry`.
+The `--cmd` column is `stopbar probe --cmd "<python> examples/bounded_queue_probe.py" --runs 200 --check-mutants`
+(3970 steps on both platforms). E2E scenario S37 runs `--cmd` with a Node target everywhere, and the Python example
+and the `--lang py` template only where `python3` or `python` is found.
+`npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry` (run on the same
+`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 does not change).
 
 ## License
 

@@ -157,6 +157,37 @@ For a hostile-agent threat model, run the agent in a container or VM: no network
 read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
 the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
 
+## 4. PROBE, `--cmd` and probe evidence
+
+`stopbar probe` is a test tool run by a human or by CI. It is not a hook and it is not part of the proof.
+
+- A probe target is code you trust. `--target <file>` imports the file into the worker processes, and
+  `--cmd "<command>"` runs the command in a shell, with the rights of the user who starts the probe. Do not probe
+  a file or a command that the agent wrote and that no human has read.
+- `probe:result` in `events.jsonl` is evidence, not a gate. It has no `req`, it is not a kernel step and it does not
+  change `state.json`, so it can never allow a commit. It is appended under Stopbar's lock, like every other entry.
+- `stopbar attest` shows the latest `probe:result` per target since the last `init` or `reset`, with the sha256 of the
+  target file (`targetSha256`), the command (`targetCmd`), the tree snapshot and `atCurrentSnapshot`. The entry says
+  what the prober saw on that tree. It does not prove the target file: an agent that can write to `events.jsonl` can
+  also write a false entry, as for every other log line (see section 3). Compare `targetSha256` with the file you
+  reviewed.
+- For `--cmd`, `targetSha256` covers one file only: `--target-file`, else the first existing file after the
+  interpreter, else nothing (`null`). Imports, libraries and the interpreter are not hashed.
+
+## Known limits of 1.2.0
+
+- `--cmd`: the command runs through the system shell (`cmd.exe` on Windows, `/bin/sh` elsewhere), so quoting follows
+  that shell. A shell can hold stdout open after the program closed it; then only `--cmd-timeout` (default 300000 ms)
+  ends the wait.
+- `--cmd`: answers are checked for their shape (`name`, `seed`, `actions`, `ok`, `steps`, `cov`, `mismatch.step`,
+  `mismatch.what`), not for meaning. A program that answers `ok: true` without running anything passes. Mutants
+  (`--check-mutants`) are the check that the model can fail.
+- `--cmd`: Stopbar does not check that `generate` is deterministic. A reproduction replays the saved actions, so it
+  stays valid, but a new run of the same seed can differ if the program uses another source of randomness.
+- `probe init --lang py` prints `python` on Windows and `python3` elsewhere; use the name your system has.
+- `probe init --lang ts` writes a file that imports `stopbar/probe`: it runs only where that import resolves (Stopbar
+  installed in the project).
+
 ## Known limits of 1.1.3
 
 - The blob-id comparison trusts `baseRef`: see point 4 of section 3 (a mutable branch name can be moved by the agent).

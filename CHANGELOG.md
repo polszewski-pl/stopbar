@@ -1,9 +1,39 @@
 # Changelog
 
-## 1.2.0-rc.1 (2026-11-26)
+## 1.2.0 (2026-11-26)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.3. A `config.json` and a
 `state.json` from 1.0.0–1.1.3 work without migration. `stopbar probe --target wrapper` (the default) runs as before.
+This release joins 1.2.0-rc.1 (PROBE for TS/JS) with PROBE for any language and `stopbar probe init`. No new runtime
+dependency: `gdp-wired` 0.60.0 is still the only one.
+
+- **PROBE for any language: `stopbar probe --cmd "<command>"`.** Each worker starts the command once (in a shell) and
+  speaks NDJSON with it on stdin/stdout: `{"op":"info"}` (name, description, optional mutants),
+  `{"op":"generate","seed":N}` (a run of pure JSON actions) and `{"op":"execute","run":...,"dir":...,"mutant"?}` (an
+  `Outcome`). Shrinking, `--regressions` / `--regressions-only`, `--check-mutants` / `--mutant-runs`, `summary.json`,
+  `repro-<seed>.json`, `probe:result` and the probe evidence of `attest` work as with `--target <file>`. A reproduction
+  names the target by the `name` from `info`; `summary.json`, `repro-<seed>.json`, `probe:result` and `attest` also
+  have `targetCmd`. A `--cmd` target replays only the regressions in `--regressions <dir>`.
+- `--target` and `--cmd` together exit 1 with the reason. `--target-file <path>` names the file for `targetSha256`;
+  without it, the first word after the interpreter that is an existing file is hashed, else `targetSha256` is `null`.
+- Errors of the external process do not hang a worker: a process that exits, closes stdout, prints a line that is not
+  JSON, answers `{"error": ...}` or an answer of the wrong shape, or gives no answer within `--cmd-timeout` ms (default
+  300000) stops the probe with exit 1 and the end of its stderr. At the end Stopbar closes stdin and kills the process
+  tree after 2 s.
+- **`stopbar probe init [--lang ts|py] [--name sample] [--out probes] [--force] [--repo <dir>]`:** writes
+  `<name>.probe.ts` (`defineModel` from `stopbar/probe`) or `<name>_probe.py` (the NDJSON protocol, Python standard
+  library only) with 2 actions, 1 invariant, 2 mutants and the rules for zero false positives, and prints the command
+  that runs it. An existing file stays without `--force`; an unknown `--lang` and a `--name` with anything other than
+  letters, digits, `-` and `_` (for example `../`) exit 1.
+- Example: `examples/bounded_queue_probe.py`, the Python counterpart of `examples/bounded-queue.probe.ts` (the same
+  queue model, invariants and mutants `M1_dropCap` and `M2_lifoInsteadOfFifo`).
+- Tests: unit tests `tests/unit/probe-stdio.test.ts` (the NDJSON client, mutants, chunked shrinking over stdio, a
+  process that crashes, closes stdout, prints garbage, hangs or answers with an error, `probe init`); E2E scenario S37
+  (`--cmd` with a Node NDJSON target, so it runs without Python: mutants, `probe:result`, `attest` json and md, minimal
+  reproduction and replay, `--target` with `--cmd`, a crashing process, `probe init --lang ts|py`; with `python3` or
+  `python` on the machine also `examples/bounded_queue_probe.py` and the `--lang py` template).
+
+From 1.2.0-rc.1:
 
 - **PROBE for any TS/JS project.** `stopbar probe --target <file>` loads a `.ts`, `.mts`, `.js` or `.mjs` file and
   runs its `default` export (or the export `target`) as a probe target. A missing file or an export that is not a

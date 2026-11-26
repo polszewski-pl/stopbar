@@ -57,7 +57,7 @@ export function attestation(repoDir: string) {
     const probes = [...latest.keys()].sort().map((k) => {
       const {line, e} = latest.get(k)!
       const m = e.mutants && typeof e.mutants === 'object' ? e.mutants : null
-      return {target: k, targetPath: e.targetPath ?? null, targetSha256: e.targetSha256 ?? null, ok: e.ok === true, runs: e.runs ?? 0, regressions: e.regressions ?? 0,
+      return {target: k, targetPath: e.targetPath ?? null, ...(typeof e.targetCmd === 'string' ? {targetCmd: e.targetCmd} : {}), targetSha256: e.targetSha256 ?? null, ok: e.ok === true, runs: e.runs ?? 0, regressions: e.regressions ?? 0,
         passed: e.passed ?? 0, failed: e.failed ?? 0, steps: e.steps ?? 0,
         mutants: m ? {killed: m.killed ?? 0, total: m.total ?? 0, survived: Array.isArray(m.survived) ? m.survived : []} : null,
         treeSnapshot: e.treeSnapshot ?? null, atCurrentSnapshot: e.treeSnapshot === now.id, summarySha256: e.summarySha256 ?? null, line, ts: e.ts ?? null}
