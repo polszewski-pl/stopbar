@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.0-rc.1 (2026-11-26)
+
+`src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.3. A `config.json` and a
+`state.json` from 1.0.0–1.1.3 work without migration. `stopbar probe --target wrapper` (the default) runs as before.
+
+- **PROBE for any TS/JS project.** `stopbar probe --target <file>` loads a `.ts`, `.mts`, `.js` or `.mjs` file and
+  runs its `default` export (or the export `target`) as a probe target. A missing file or an export that is not a
+  target exits 1 with the reason. The sha256 of the file goes into the log and into `summary.json` (`targetSha256`).
+  A file target replays regressions only from `--regressions <dir>`, never Stopbar's own.
+- **SDK `stopbar/probe`** (`exports["./probe"]`, types from `src/probe/sdk.ts`): `defineModel` (actions with
+  `gen(r)` and `run(state, args, check)`, invariants, `setup` / `teardown`, mutants), `createRng` (xorshift32, the
+  same numbers on every platform), `MismatchError` and the types `ModelSpec`, `Rng`, `Check`, `ActionSpec`,
+  `ProbeTarget`, `ProbeRun`, `Outcome`, `Mismatch`. A failed check or an exception of the code under test is a
+  mismatch with the step and the action. The worker does not crash.
+- **`--check-mutants [--mutant-runs 50]`:** the original runs first. If it passes, each mutant runs seeds from
+  `--seed` in order until the first failure (`KILLED`, with seed, step, check and action) or `--mutant-runs` seeds
+  (`SURVIVED`). Exit 0 only if the original passes and no mutant survives. `summary.json` has
+  `mutants: {total, killed, survived, details}`. A target without mutants is refused (exit 1).
+- **Faster shrinking:** after the cut at the failing step, blocks of half, a quarter, ... of the run (at least 2
+  steps) go first, then single steps to a fixed point. On a 200-step run with two relevant steps: 25 executions
+  instead of 147 (measured by the unit test). The order is fixed, so the minimal run is the same on every platform.
+- **`probe:result` in `events.jsonl`:** in a repository with a valid Stopbar `config.json` and `state.json`, every
+  probe run appends one entry under the lock (target, target path and sha256, tree snapshot, runs, regressions,
+  passed, failed, steps, ok, mutants, sha256 of `summary.json`). It has no `req`: it is not a kernel step,
+  `state.json` is not touched and `attest` stays consistent. `--no-record` skips it. Without Stopbar nothing is
+  recorded and the prober works on its own. The test suite's own probe run passes `record: false`.
+- **`stopbar attest`: probe evidence.** JSON `probes: [...]` (the latest `probe:result` per target since the last
+  `init` / `reset`, with `atCurrentSnapshot`); Markdown `## Probe evidence` (or `- none`).
+- Smaller fixes in the runner: `summary.json` and other files without a run in a regression directory are skipped;
+  when `--regressions` and `--out` are the same directory, the reproductions in it are kept for the replay; a failing
+  regression writes its own run as the reproduction; results are sorted by seed; every execution starts in an empty
+  directory; the default work directory follows `--repo` (in a repository without Stopbar it is a temporary
+  directory, so the prober creates no `.git/stopbar`); the last line of the output names `summary.json`.
+- Example: `examples/bounded-queue.probe.ts` (a FIFO queue with a fixed capacity, mutants `M1_dropCap` and
+  `M2_lifoInsteadOfFifo`).
+- Tests: unit tests `tests/unit/probe-sdk.test.ts` (`createRng`, `defineModel`, checks, teardown, mutants, chunked
+  `shrink`, `loadTarget`); E2E scenario S36 (file target with mutants, `probe:result`, `attest` before and after an
+  edit, minimal reproduction and replay, a surviving mutant, a target without mutants, `--no-record`, a repository
+  without Stopbar).
+
 ## 1.1.3 (2026-11-26)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.2. A `config.json` and a

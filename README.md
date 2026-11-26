@@ -41,9 +41,9 @@ current tree, block it after an unapproved test change, and block a push after a
 | Pillar | Command | What it gives you |
 |---|---|---|
 | PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
-| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel. v1.0 has one target, `wrapper` (Stopbar itself). |
+| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also any TS/JS project: a model written with `defineModel` from `stopbar/probe`, with mutants that must be caught. |
 | GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
-| ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions and the sha256 of the event log. |
+| ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions, probe evidence and the sha256 of the event log. |
 
 ## Set up in 3 steps
 
@@ -111,13 +111,59 @@ EOF
 | `stopbar reset` | human | Fresh kernel state. Config and event log stay. Also repairs a damaged `state.json`. Uncommitted changes of existing tests or test config (against `baseRef`, else `HEAD`) are not forgotten: the session starts tainted, with a `WARN`, until `approve-tests`. `init --force` does the same. |
 | `stopbar doctor [--json]` | human | Environment, config, state, hooks and a dry run. Exit 1 on a problem. |
 | `stopbar prove [--out f.json] [--lean f.lean]` | human, CI | PROVE: the inductive proof of the kernel and the 10 mutants. Exit 0 only if everything holds. `verify` is an alias. |
-| `stopbar probe [--target wrapper] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir]` | human, CI | PROBE: stateful probing against the proven kernel. A failure is shrunk to a minimal JSON reproduction. Needs the full package (gdp-wired). |
-| `stopbar attest [--format json\|md]` | human, CI | ATTEST: the session attestation. The same state and log give the same output. Exit 1 if the state and the log disagree, exit 2 if a file is damaged. |
+| `stopbar probe [--target wrapper\|<file>] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), or of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file (see [PROBE for your project](#probe-for-your-project)). A failure is shrunk to a minimal JSON reproduction. |
+| `stopbar attest [--format json\|md]` | human, CI | ATTEST: the session attestation. The same state and log give the same output. Exit 1 if the state and the log disagree, exit 2 if a file is damaged. `probes` (Markdown: `## Probe evidence`) lists the latest `probe:result` per target since the last `init` or `reset`, with `atCurrentSnapshot`. |
 
 All commands take `--repo <dir>`. The agent cannot run the human commands: the hooks block them.
 
 State, configuration and the event log are in `<repo>/.git/stopbar/`: `config.json`, `state.json`, `events.jsonl`, the
 private snapshot index and the pinned runtime. They are outside the working tree, so they never change the tree hash.
+
+## PROBE for your project
+
+`stopbar probe --target <file>` runs a model of any TS/JS code. The file exports (as `default` or as `target`) a
+target; `defineModel` from `stopbar/probe` builds one from a list of actions:
+
+```ts
+import {defineModel} from 'stopbar/probe'
+
+export default defineModel<{q: BoundedQueue<number>; model: number[]}>({
+  name: 'bounded-queue', description: 'FIFO queue with capacity 4 vs an array model',
+  setup: () => ({q: new BoundedQueue<number>(4), model: []}),
+  actions: [
+    {name: 'push', weight: 3, gen: (r) => ({x: r.int(0, 99)}), run: (s, {x}, check) => {
+      const accepted = s.model.length < 4
+      check.eq('push result', s.q.push(x), accepted)
+      if (accepted) s.model.push(x)
+    }},
+    {name: 'shift', gen: () => null, run: (s, _a, check) => check.eq('shift result', s.q.shift(), s.model.shift())},
+  ],
+  invariants: [{name: 'size', check: (s, check) => check.eq('size', s.q.size, s.model.length)}],
+  mutants: {M1_dropCap: () => ({q: new BoundedQueue<number>(4, {checkCap: false}), model: []})},
+})
+```
+
+- `gen(r)` returns pure JSON data for one step. `r` is a deterministic generator (`createRng`: xorshift32, the same
+  numbers on Windows and Linux). A run is `{seed, actions: [{t: name, args}]}` with `minSteps`..`maxSteps` steps
+  (default 15..40).
+- `run(state, args, check)` drives the real code and compares it with the model: `check.eq` (deep strict equality),
+  `check.ok`, `check.fail`. A failed check, and any exception from the code under test, is a mismatch with the step and
+  the action, not a crash. Invariants run after `setup` (step -1) and after every step. `teardown` runs after every run
+  whose `setup` returned, also after a failure.
+- A failure is shrunk (cut after the failing step, then removal of blocks of half, a quarter, ... of the run, then of
+  single steps) and written to `repro-<seed>.json` in `--out`. `--regressions <dir>` replays such files on every run.
+  A file target replays only the regressions you name.
+- `--check-mutants`: each mutant replaces `setup` with a damaged system under test. The original must pass, and every
+  mutant must fail within `--mutant-runs` seeds (default 50). Exit 0 only then. A survivor is named in the output and
+  in `summary.json` (`mutants.survived`). A target without mutants is refused.
+- In a repository with Stopbar, every run appends a `probe:result` entry to `events.jsonl` (target, sha256 of the
+  target file, tree snapshot, runs, steps, mutants, sha256 of `summary.json`). It is not a kernel step and does not
+  change `state.json`. `stopbar attest` shows the latest entry per target and whether the tree is still the one that
+  was probed. `--no-record` skips the entry. Outside a Stopbar repository nothing is recorded.
+
+A complete example with two mutants: [`examples/bounded-queue.probe.ts`](examples/bounded-queue.probe.ts)
+(`stopbar probe --target examples/bounded-queue.probe.ts --check-mutants`). TypeScript files need Node's type
+stripping (Node 22.18 or later): only erasable syntax, no `enum` and no constructor parameter properties.
 
 ## Configuration
 

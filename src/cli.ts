@@ -30,10 +30,16 @@ const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code ho
 Four pillars:
   PROVE   stopbar prove [--out f.json] [--lean f.lean]   inductive proof of the kernel and the 10 mutants
           (npm run verify:lean checks the Lean export with lake build in Docker)
-  PROBE   stopbar probe [--target wrapper] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir]
-          stateful probing of the hooks against the proven kernel on real git repositories
+  PROBE   stopbar probe [--target wrapper|<file>] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir]
+                        [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]
+          stateful probing: --target wrapper (default) checks the hooks against the proven kernel on real git
+          repositories; --target <file.ts|.mts|.js|.mjs> runs a model of any TS/JS project (defineModel from
+          'stopbar/probe', export default or export target). A failure is shrunk to repro-<seed>.json in --out.
+          --check-mutants: every mutant of the target must fail within --mutant-runs seeds (exit 0 only if all do)
+          --no-record: do not append probe:result to events.jsonl (else recorded when Stopbar is initialised)
   GATE    init, upgrade, hook, status, approve-tests, approve-shell, resume, reset, doctor (above)
-  ATTEST  stopbar attest [--format json|md]   deterministic attestation: HEAD, tree, gates, human actions, log sha256
+  ATTEST  stopbar attest [--format json|md]   deterministic attestation: HEAD, tree, gates, human actions, log sha256,
+          probe evidence (the latest probe:result per target, and whether it was taken at the current snapshot)
 All commands take --repo <dir> (default: the current directory). 'verify' is an alias of 'prove'.`
 
 function opts(a: string[]) {
@@ -77,9 +83,15 @@ async function main(): Promise<{code: number; msg?: string}> {
     const P = await import('./probe/index.ts')
     if (o.has('worker')) { await P.worker(JSON.parse(o.get('worker')!)); return {code: 0} }
     const num = (n: string) => (o.get(n) === undefined ? undefined : o.int(n, 0))
-    const r = await P.probe({target: o.get('target'), runs: num('runs'), seed: num('seed'), jobs: num('jobs'), work: o.get('work'), out: o.get('out'),
-      regressions: o.get('regressions'), regressionsOnly: o.has('regressions-only')})
-    return {code: r.ok ? 0 : 1}
+    try {
+      const r = await P.probe({target: o.get('target'), runs: num('runs'), seed: num('seed'), jobs: num('jobs'), work: o.get('work'), out: o.get('out'),
+        regressions: o.get('regressions'), regressionsOnly: o.has('regressions-only'), checkMutants: o.has('check-mutants'), mutantRuns: num('mutant-runs'),
+        repo: o.get('repo'), record: !o.has('no-record')})
+      return {code: r.ok ? 0 : 1}
+    } catch (e) {
+      if (e instanceof P.ProbeError) return {code: 1, msg: `stopbar probe: ${e.message}`}
+      throw e
+    }
   }
   if (cmd === 'attest') return (await import('./attest.ts')).attest({repo: o.get('repo'), format: o.get('format')})
   return {code: 1, msg: `unknown command ${cmd}\n\n${HELP}`}

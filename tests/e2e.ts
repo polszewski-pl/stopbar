@@ -3,7 +3,7 @@
 // Usage: node tests/e2e.ts   (log: .test-out/e2e/e2e-<time>.log + events-<scenario>.jsonl; exit 1 on a failure)
 import {spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
-import {appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import {homedir} from 'node:os'
 import {dirname, join, resolve} from 'node:path'
 import {fileURLToPath} from 'node:url'
@@ -1196,6 +1196,101 @@ say('\nS35 --base-ref main: tests taken over unchanged from a newer main do not 
   const v = status(repo)
   check('no base ref: a weakened test that equals the new HEAD (stash + checkout in one call) still taints', w.exit === 0 && w.post?.code === 2 && v.testsTainted === true, `${w.out.slice(0, 80)} ${JSON.stringify({tainted: v.testsTainted})}`)
   keepEvents(repo, 's35-head')
+}
+
+// ---------------------------------------------------------------- S36 universal PROBE for TS/JS projects
+say('\nS36 PROBE --target <file>: defineModel, --check-mutants, minimal repro and replay, probe:result in events.jsonl, Probe evidence in attest')
+{
+  function probeCli(cwd: string, ...args: string[]) {
+    const r = spawnSync(process.execPath, [CLI, 'probe', '--jobs', '4', ...args], {cwd, encoding: 'utf8'})
+    const res = {code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}`.trim()}
+    say(`    PROBE       ${args.join(' ').replace(TMP, '<tmp>').replace(ROOT, '<root>').slice(0, 150)} -> exit ${res.code} | ${res.out.replace(/\s+/g, ' ').slice(0, 170)}`)
+    return res
+  }
+  const attestJson = (repo: string) => JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  const attestMd = (repo: string) => spawnSync(process.execPath, [CLI, 'attest', '--repo', repo, '--format', 'md'], {encoding: 'utf8'}).stdout
+  const probeEvents = (repo: string) => events(repo).filter((e) => e.source === 'probe:result')
+  const repo = setupRepo('s36-probe')
+  const example = join(ROOT, 'examples', 'bounded-queue.probe.ts')
+  const work = join(TMP, 's36-work')
+  const stateBefore = readFileSync(join(stateDir(repo), 'state.json'), 'utf8')
+  const p = probeCli(ROOT, '--target', 'examples/bounded-queue.probe.ts', '--runs', '30', '--check-mutants', '--repo', repo, '--work', work)
+  const sum = JSON.parse(readFileSync(join(work, 'out', 'summary.json'), 'utf8'))
+  const exampleSha = createHash('sha256').update(readFileSync(example)).digest('hex')
+  check('bounded-queue --runs 30 --check-mutants: exit 0, original PASS 30/30, 2/2 mutants killed', p.code === 0 && sum.ok === true && sum.passed === 30 && sum.failed === 0 &&
+    sum.mutants?.total === 2 && sum.mutants?.killed === 2 && sum.mutants?.survived.length === 0 && /MUTANTS PASS: 2\/2 killed/.test(p.out), JSON.stringify(sum.mutants?.details?.map((d: any) => `${d.name}:${d.status}`)))
+  check('summary.json has targetSha256 of the target file (also in the log)', sum.targetSha256 === exampleSha && p.out.includes(exampleSha), sum.targetSha256)
+  const ev = probeEvents(repo)
+  check('probe:result appended to events.jsonl (no req), state.json unchanged byte for byte', ev.length === 1 && !('req' in ev[0]) && ev[0].target === 'bounded-queue' &&
+    ev[0].ok === true && ev[0].runs === 30 && ev[0].mutants?.killed === 2 && ev[0].targetSha256 === exampleSha && /examples\/bounded-queue\.probe\.ts$/.test(ev[0].targetPath) &&
+    ev[0].summarySha256 === createHash('sha256').update(readFileSync(join(work, 'out', 'summary.json'))).digest('hex') &&
+    readFileSync(join(stateDir(repo), 'state.json'), 'utf8') === stateBefore, JSON.stringify(ev[0] ?? null).slice(0, 160))
+  const a1 = attestJson(repo), md1 = attestMd(repo)
+  const pq1 = a1.probes?.find((x: any) => x.target === 'bounded-queue')
+  check('attest: consistent, probes has bounded-queue ok, mutants 2 killed, atCurrentSnapshot true', a1.consistent === true && a1.probes.length === 1 && pq1?.ok === true &&
+    pq1?.mutants?.killed === 2 && pq1?.atCurrentSnapshot === true, JSON.stringify(pq1 ?? null).slice(0, 160))
+  check('attest --format md: ## Probe evidence with PASS, mutants 2/2, at current snapshot: yes', /## Probe evidence\n\n- bounded-queue: PASS, 30 runs, \d+ steps, mutants 2\/2 killed, at current snapshot: yes, target sha256 `[0-9a-f]{16}`/.test(md1), md1.split('## Probe evidence')[1]?.split('\n')[2])
+  writeFileSync(join(repo, 'src', 'extra.mjs'), 'export const x = 1\n')
+  const a2 = attestJson(repo), pq2 = a2.probes?.find((x: any) => x.target === 'bounded-queue')
+  check('after a file edit: attest still consistent, bounded-queue atCurrentSnapshot false', a2.consistent === true && pq2?.atCurrentSnapshot === false && /at current snapshot: no/.test(attestMd(repo)), JSON.stringify({consistent: a2.consistent, at: pq2?.atCurrentSnapshot}))
+  const n0 = probeEvents(repo).length
+  const nr = probeCli(ROOT, '--target', example, '--runs', '5', '--repo', repo, '--work', work, '--no-record')
+  check('--no-record: exit 0, nothing appended to events.jsonl', nr.code === 0 && probeEvents(repo).length === n0 && !/recorded probe:result/.test(nr.out))
+
+  // targets written as plain .mjs next to the test (inside this package, so `stopbar/probe` resolves to it)
+  const tdir = join(TMP, 's36-targets'); mkdirSync(tdir, {recursive: true})
+  const stack = (bug: boolean, mutants: string) => `import {defineModel} from 'stopbar/probe'
+export default defineModel({
+  name: 'stack', description: 'a stack vs an array', minSteps: 10, maxSteps: 25,
+  setup: () => ({items: [], model: [], bug: ${bug}}),
+  actions: [
+    {name: 'push', weight: 2, gen: (r) => r.int(0, 99), run: (s, x) => { s.items.push(x); s.model.push(x) }},
+    {name: 'pop', gen: () => null, run: (s, _a, check) => {
+      const got = s.bug && s.items.length >= 2 ? s.items[0] : s.items.at(-1)
+      s.items.pop()
+      check.eq('pop result', got, s.model.pop())
+    }},
+  ],
+  invariants: [{name: 'size', check: (s, check) => check.eq('size', s.items.length, s.model.length)}],
+  ${mutants}
+})
+`
+  writeFileSync(join(tdir, 'broken.probe.mjs'), stack(true, ''))
+  writeFileSync(join(tdir, 'survivor.probe.mjs'), stack(false, `mutants: {M_kills: () => ({items: [], model: [], bug: true}), M_same: () => ({items: [], model: [], bug: false})},`))
+  writeFileSync(join(tdir, 'nomutants.probe.mjs'), stack(false, ''))
+  const bout = join(TMP, 's36-broken-out')
+  const b = probeCli(ROOT, '--target', join(tdir, 'broken.probe.mjs'), '--runs', '10', '--repo', repo, '--work', work, '--out', bout, '--no-record')
+  const repros = existsSync(bout) ? readdirSync(bout).filter((f) => /^repro-\d+\.json$/.test(f)) : []
+  const r0 = repros.length ? JSON.parse(readFileSync(join(bout, repros[0]), 'utf8')) : null
+  check('broken original: exit 1, repro-<seed>.json with a minimal run of <= 3 steps', b.code === 1 && repros.length > 0 && r0?.run.actions.length <= 3 && r0?.mismatch.what === 'pop result',
+    `${repros.length} repro(s), first ${JSON.stringify(r0?.run.actions)}`)
+  const rout = join(TMP, 's36-replay-out')
+  const rr = probeCli(ROOT, '--target', join(tdir, 'broken.probe.mjs'), '--regressions', bout, '--regressions-only', '--repo', repo, '--work', work, '--out', rout, '--no-record')
+  const rsum = JSON.parse(readFileSync(join(rout, 'summary.json'), 'utf8'))
+  const replayed = existsSync(join(rout, repros[0] ?? 'none')) ? JSON.parse(readFileSync(join(rout, repros[0]), 'utf8')) : null
+  check('--regressions <outDir> --regressions-only replays the same failure (exit 1, same mismatch, summary.json skipped)', rr.code === 1 && rsum.runs === 0 && rsum.regressions === repros.length &&
+    rsum.failed === repros.length && JSON.stringify(replayed?.mismatch) === JSON.stringify(r0?.mismatch), JSON.stringify({regressions: rsum.regressions, failed: rsum.failed, what: replayed?.mismatch?.what}))
+  const sout = join(TMP, 's36-survivor-out')
+  const sv = probeCli(ROOT, '--target', join(tdir, 'survivor.probe.mjs'), '--runs', '10', '--check-mutants', '--mutant-runs', '5', '--repo', repo, '--work', work, '--out', sout, '--no-record')
+  const ssum = JSON.parse(readFileSync(join(sout, 'summary.json'), 'utf8'))
+  check('a mutant that survives: exit 1, survived lists it, the other is killed', sv.code === 1 && JSON.stringify(ssum.mutants?.survived) === '["M_same"]' && ssum.mutants?.killed === 1 &&
+    /MUTANTS FAIL: 1\/2 killed; survived: M_same/.test(sv.out), JSON.stringify(ssum.mutants?.survived))
+  const nm = probeCli(ROOT, '--target', join(tdir, 'nomutants.probe.mjs'), '--check-mutants', '--repo', repo, '--work', work, '--no-record')
+  check('--check-mutants on a target without mutants: exit 1 with a clear message', nm.code === 1 && /declares no mutants/.test(nm.out), nm.out.slice(0, 120))
+  const missing = probeCli(ROOT, '--target', join(tdir, 'missing.probe.ts'), '--repo', repo, '--work', work, '--no-record')
+  writeFileSync(join(tdir, 'noexport.probe.mjs'), 'export const x = 1\n')
+  const noexp = probeCli(ROOT, '--target', join(tdir, 'noexport.probe.mjs'), '--repo', repo, '--work', work, '--no-record')
+  check('a missing file or a file without a valid export: exit 1 with a clear error', missing.code === 1 && /neither a known target/.test(missing.out) && noexp.code === 1 && /no valid export/.test(noexp.out))
+  check('probe runs with --no-record or failures left events.jsonl as it was', probeEvents(repo).length === n0)
+
+  // a git repository without Stopbar: the prober works on its own, records nothing, no error
+  const plain = join(TMP, 's36-plain'); mkdirSync(plain, {recursive: true}); run('git init -q', plain)
+  const pl = probeCli(plain, '--target', example, '--runs', '10')
+  const plainSummary = /summary (.+summary\.json)/.exec(pl.out)?.[1]?.trim()
+  check('outside a Stopbar repository: exit 0, nothing recorded, no .git/stopbar created, summary.json in a temporary directory', pl.code === 0 && /PROBE PASS: 10\/10/.test(pl.out) &&
+    !/recorded probe:result/.test(pl.out) && !existsSync(join(plain, '.git', 'stopbar')) && !!plainSummary && existsSync(plainSummary), pl.out.split('\n').pop())
+  if (plainSummary && /stopbar-probe-\d+$/.test(dirname(dirname(plainSummary)))) rmSync(dirname(dirname(plainSummary)), {recursive: true, force: true, maxRetries: 5})
+  keepEvents(repo, 's36-probe')
 }
 
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
