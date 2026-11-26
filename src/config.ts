@@ -1,4 +1,5 @@
 // config.json: gate commands, limits and path patterns. Lives in <git-dir>/stopbar/, out of the agent's reach.
+import {hasChain} from './classify.ts'
 import {globToRegExp} from './glob.ts'
 
 export type Paths = {tests: string[]; testConfig: string[]; secrets: string[]}
@@ -15,7 +16,15 @@ export type Config = {
   safeTools?: string[]
   /** Git ref against which a changed test file is judged "existing" (default: HEAD). */
   baseRef?: string
+  /** Command that starts this Stopbar CLI, used in hints such as `<cliCmd> run test` (missing = DEFAULT_CLI). */
+  cliCmd?: string
+  /** Stop hook: 'block' (missing = block) refuses "done" with unverified changes; 'warn' only logs and warns. Commit and push stay gated. */
+  stopGate?: StopGate
 }
+export type StopGate = 'block' | 'warn'
+export const STOP_GATES: readonly StopGate[] = ['block', 'warn']
+/** Hint command when config.cliCmd is not set: uses an installed stopbar only, never downloads it from the registry. */
+export const DEFAULT_CLI = 'npx --no-install stopbar'
 
 const TEST_COMMON = ['**/tests/**', '**/test/**', '**/__tests__/**']
 const TEST_JS = ['**/*.test.*', '**/*.spec.*', '**/e2e/**']
@@ -46,8 +55,8 @@ export const PROFILES: Record<string, Paths> = {
 }
 
 export const DEFAULTS = {maxRetries: 3, cap: 500, costPerCall: 1}
-// local UI tools of Claude Desktop (task list and turn summary): no network, no files
-export const DEFAULT_SAFE_TOOLS = ['mcp__ccd_turn__*']
+// local tools of Claude Desktop: task list and turn summary, and messages between local sessions (no network, no files)
+export const DEFAULT_SAFE_TOOLS = ['mcp__ccd_turn__*', 'mcp__ccd_session_mgmt__*']
 
 export class ConfigError extends Error {}
 
@@ -60,6 +69,11 @@ export function validateConfig(c: unknown): Config {
   if (o.version !== 1) throw new ConfigError(`config.version must be 1, got ${JSON.stringify(o.version)}`)
   for (const k of ['buildCmd', 'fullTestCmd'] as const) {
     if (typeof o[k] !== 'string' || !(o[k] as string).trim()) throw new ConfigError(`config.${k} must be a non-empty string`)
+  }
+  if ((o.buildCmd as string).trim() === (o.fullTestCmd as string).trim()) {
+    throw new ConfigError(`config.buildCmd and config.fullTestCmd must be different commands (both are ${JSON.stringify((o.buildCmd as string).trim())}): ` +
+      'a command equal to buildCmd is always recorded as a build, so the full test gate can never pass. Use one command for lint/types/build ' +
+      'and another one for the full test suite (e.g. --build "npm run build" --test "npm test")')
   }
   for (const k of ['maxRetries', 'cap', 'costPerCall'] as const) {
     if (!isNat(o[k])) throw new ConfigError(`config.${k} must be a safe non-negative integer`)
@@ -84,23 +98,51 @@ export function validateConfig(c: unknown): Config {
   if (o.baseRef !== undefined) {
     if (typeof o.baseRef !== 'string' || !isSafeRef(o.baseRef)) throw new ConfigError(`config.baseRef must be a valid git ref (no whitespace, ranges or leading '-'), got ${JSON.stringify(o.baseRef)}`)
   }
+  if (o.cliCmd !== undefined) {
+    const why = typeof o.cliCmd === 'string' ? cliCmdProblem(o.cliCmd) : 'must be a string'
+    if (why) throw new ConfigError(`config.cliCmd ${why}, got ${JSON.stringify(o.cliCmd)}`)
+  }
+  if (o.stopGate !== undefined && !STOP_GATES.includes(o.stopGate as StopGate)) {
+    throw new ConfigError(`config.stopGate must be ${STOP_GATES.map((g) => JSON.stringify(g)).join(' or ')}, got ${JSON.stringify(o.stopGate)}`)
+  }
   return o as unknown as Config
 }
+
+// A path segment such as .git or .claude. Self-protection (classify.ts protectedCommand) blocks every shell command that
+// names one, so a hint `<cliCmd> run test` with such a segment could never run.
+const PROTECTED_SEGMENT = /(^|[^a-z0-9_.\-])\.(git|claude|cursor|codex|gemini|agents)([^a-z0-9_\-]|$)/i
+
+/** Why a cliCmd value cannot be used, or null. */
+export function cliCmdProblem(cmd: string): string | null {
+  const c = cmd.trim()
+  if (!c) return 'must be a non-empty command'
+  if (hasChain(c)) return 'must be one command without shell operators (;, &&, ||, |, redirections or $(...))'
+  const seg = PROTECTED_SEGMENT.exec(c.replace(/\\/g, '/'))
+  if (seg) return `must not name a .${seg[2].toLowerCase()} directory (the agent's shell may not run commands that name it; point it at a Stopbar install outside .git and the agent settings directories)`
+  return null
+}
+
+/** The command that starts the Stopbar CLI in hints shown to the agent. */
+export const cliOf = (cfg: Pick<Config, 'cliCmd'>) => cfg.cliCmd?.trim() || DEFAULT_CLI
 
 export function isSafeRef(ref: string): boolean {
   return ref.length > 0 && !ref.startsWith('-') && !ref.includes('..') && !ref.endsWith('.') && !ref.endsWith('/') && /^[A-Za-z0-9._/@^~-]+$/.test(ref)
 }
 
-export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number; baseRef?: string}): Config {
+export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number; baseRef?: string
+  cliCmd?: string; stopGate?: string}): Config {
   const profile = a.profile ?? 'default'
   const paths = PROFILES[profile]
   if (!paths) throw new ConfigError(`unknown profile ${JSON.stringify(profile)}; known: ${Object.keys(PROFILES).join(', ')}`)
   const baseRef = a.baseRef?.trim()
+  const cliCmd = a.cliCmd?.trim()
   return validateConfig({
     version: 1, profile, buildCmd: a.buildCmd.trim(), fullTestCmd: a.fullTestCmd.trim(),
     maxRetries: a.maxRetries ?? DEFAULTS.maxRetries, cap: a.cap ?? DEFAULTS.cap, costPerCall: a.costPerCall ?? DEFAULTS.costPerCall,
     paths: {tests: [...paths.tests], testConfig: [...paths.testConfig], secrets: [...paths.secrets]},
     safeTools: [...DEFAULT_SAFE_TOOLS],
     ...(baseRef && baseRef !== 'HEAD' ? {baseRef} : {}),
+    ...(cliCmd !== undefined ? {cliCmd} : {}),
+    ...(a.stopGate !== undefined ? {stopGate: a.stopGate} : {}),
   })
 }

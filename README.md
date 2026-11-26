@@ -20,7 +20,7 @@ hook payload into one internal event and renders the decision in the client's ow
 |---|---|---|---|---|
 | Claude Code | `claude`: `.claude/settings.local.json` (`claude-project`: `.claude/settings.json`) | PreToolUse, PostToolUse, PostToolUseFailure, Stop | exit 2, reason on stderr | live-verified (Claude Code 2.1.326) |
 | Cursor | `cursor`: `.cursor/hooks.json` (`failClosed: true`) | preToolUse, postToolUse, postToolUseFailure, stop (also beforeShellExecution, beforeMCPExecution, beforeReadFile, afterFileEdit, afterShellExecution) | exit 2 and `{"permission": "deny"}`; stop: `followup_message` | spec-tested (Cursor hooks reference) |
-| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | live-verified (Codex CLI 0.172.0): denied commit and config write, tree changes, Stop. Run the gates as `npx stopbar run build` / `npx stopbar run test`, because Codex reports no exit status to hooks. Codex loads project hooks only in a trusted folder |
+| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | live-verified (Codex CLI 0.172.0): denied commit and config write, tree changes, Stop. Run the gates as `stopbar run build` / `stopbar run test` (the hint uses `--cli`, default `npx --no-install stopbar`), because Codex reports no exit status to hooks. Codex loads project hooks only in a trusted folder |
 | Gemini CLI | `gemini`: `.gemini/settings.json` | BeforeTool, AfterTool, AfterAgent | exit 2, reason on stderr; AfterAgent: `decision: "block"` | spec-tested (Gemini CLI hooks reference) |
 | Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | live-verified (Antigravity CLI 1.5.18): denied early commit and config write, build and full tests recorded, honest commit allowed, Stop |
 | Any tool, via git | `git`: `.git/hooks/pre-commit`, `.git/hooks/pre-push` | commit, push | exit 1 aborts git | tested with real git (E2E) |
@@ -33,7 +33,7 @@ client's published hook schema and the E2E suite runs it with payloads in that s
 working. An unknown or damaged payload fails closed (exit 2). The configs written by `init` pass `--adapter` explicitly.
 
 **Git fallback.** For a tool without hooks, run the gates through Stopbar so their real exit status counts:
-`npx stopbar run build` and `npx stopbar run test`. The git hooks then allow a commit only after both passed at the
+`stopbar run build` and `stopbar run test`. The git hooks then allow a commit only after both passed at the
 current tree, block it after an unapproved test change, and block a push after a secret read without approval.
 
 ## Four pillars
@@ -77,9 +77,13 @@ Requirements: Node.js 22.18 or later, git, a git repository.
    it finds, and makes a dry run of the real hook pipeline on a scratch repository.
 
 The agent must run the gate commands exactly as configured, alone and in the foreground, for example `npm test` and not
-`npm test | tail` or with `run_in_background`. For long-running gates (>10 min), run `npx stopbar run build` /
-`npx stopbar run test` (safe to run in the background: Stopbar records the real exit status only when the process
-finishes, and discards the result if the working tree changed in the meantime). Commits must be one command. The quoted
+`npm test | tail` or with `run_in_background`. For long-running gates (>10 min), run `stopbar run build` /
+`stopbar run test` (safe to run in the background: Stopbar records the real exit status only when the process
+finishes, and discards the result if the working tree changed in the meantime). The hints that Stopbar shows the agent
+name this command as `npx --no-install stopbar run build|test`: `--no-install` uses an installed Stopbar and never
+downloads the package from the npm registry. If Stopbar is installed elsewhere (a global install or a checkout outside
+the project), set the command with `stopbar init --cli "<cmd>"`, for example
+`--cli "node /opt/stopbar/bin/stopbar.mjs"`; the hints then say `node /opt/stopbar/bin/stopbar.mjs run test`. Commits must be one command. The quoted
 heredoc form that agents use is allowed:
 
 ```sh
@@ -95,7 +99,7 @@ EOF
 
 | Command | Who | What it does |
 |---|---|---|
-| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). |
+| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. |
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
 | `stopbar run build\|test` | human, agent, CI | Runs the configured gate command and records its real exit status. |
@@ -128,9 +132,14 @@ private snapshot index and the pinned runtime. They are outside the working tree
     "testConfig": ["package.json", "pyproject.toml", ".github/workflows/**"],
     "secrets": [".env*", "*.pem", "**/secrets/**"]
   },
-  "safeTools": ["mcp__ccd_turn__*"]
+  "safeTools": ["mcp__ccd_turn__*", "mcp__ccd_session_mgmt__*"]
 }
 ```
+
+`buildCmd` and `fullTestCmd` must be different commands. A command equal to `buildCmd` is always recorded as a build,
+so with two equal commands the full test gate could never pass. `init` refuses such a pair, and a `config.json` that has
+one makes every hook fail closed and `stopbar doctor` report `[FAIL] config.json` with the fix. Use one command for
+lint, types and build and one for the full test suite, for example `--build "npm run build" --test "npm test"`.
 
 A pattern without `/` matches the file name anywhere. `**` is a whole path segment. Matching ignores case. Change a
 profile by editing the lists: no code change is necessary.
@@ -146,10 +155,24 @@ profile by editing the lists: no code change is necessary.
   refine new test files it added on that branch across commits without triggering `testsTainted`, while existing tests
   from `baseRef` and all test-config files remain protected. A configured non-`HEAD` ref that cannot be resolved fails
   closed.
-- **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default is
-  `["mcp__ccd_turn__*"]`, the task-list and turn-summary tools of Claude Desktop. It only exempts tools from the
-  outbound gate (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before, and a halted
-  session still blocks every tool. A damaged or empty `config.json` or `state.json` blocks every
+- **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default
+  (`DEFAULT_SAFE_TOOLS`) is `["mcp__ccd_turn__*", "mcp__ccd_session_mgmt__*"]`: the task-list and turn-summary tools of
+  Claude Desktop and its tools for messages between local sessions. It only exempts tools from the outbound gate
+  (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before, and a halted session still
+  blocks every tool. A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
+  `PAUSE`s on the session tools after a secret read, add `"mcp__ccd_session_mgmt__*"` to `safeTools` or write the file
+  again with `stopbar init --force ...`. `stopbar doctor` shows a `[WARN] safeTools` while a default entry is missing.
+- **`cliCmd`** (optional, set via `stopbar init --cli "<cmd>"`) is the command that starts Stopbar in the hints shown to
+  the agent (`<cliCmd> run build|test`). Without it the hints say `npx --no-install stopbar`. It must be one command
+  without shell operators and must not name a `.git` or agent-settings directory, because the agent's shell may not run
+  such a command. With `--no-pin`, `init` also refuses a `--cli` that points at the hook runtime itself. `approve-tests`,
+  `approve-shell`, `resume`, `reset` and `init` stay blocked for the agent whatever `cliCmd` is.
+- **`stopGate`** (optional, set via `stopbar init --stop-gate block|warn`, default `block`) controls only the `Stop` hook.
+  `block`: the agent cannot declare "done" while the tree differs from `HEAD` and the gates have not passed (exit 2).
+  `warn`: for long tasks with one commit at the end, the turn may end with unverified changes (for example to ask the
+  human a question); Stopbar logs a `stop:warn` entry in `events.jsonl` and answers `WARN (stopbar): ...` without
+  blocking. `git commit` and `git push` in the agent hooks and in the git hooks stay fully gated by the kernel.
+  `status`, `doctor` and `attest` show the mode. A damaged or empty `config.json` or `state.json` blocks every
 tool call (exit 2) with a message that says how to repair it.
 
 ## Local use
@@ -204,8 +227,8 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 31/31 | 258/258 | 202/202 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 31/31 | 258/258 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 38/38 | 305/305 | 202/202 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 38/38 | 305/305 | 202/202 sequences | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5007 steps

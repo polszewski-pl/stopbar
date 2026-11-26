@@ -119,9 +119,11 @@ test('secret mentions: *.key on a code field is not a file, a real or slashed pa
   assert.ok(k.kind === 'shell' && k.secret === null)
 })
 
-test('config: safeTools defaults to the Claude Desktop turn tools and is validated', () => {
-  assert.deepEqual(cfg.safeTools, ['mcp__ccd_turn__*'])
+test('config: safeTools defaults to the Claude Desktop turn and session tools and is validated', () => {
+  assert.deepEqual(cfg.safeTools, ['mcp__ccd_turn__*', 'mcp__ccd_session_mgmt__*'])
   assert.ok(matchAny('mcp__ccd_turn__update_plan', cfg.safeTools!))
+  assert.ok(matchAny('mcp__ccd_session_mgmt__send_message', cfg.safeTools!))
+  assert.ok(!matchAny('mcp__ccd_session__start_session', cfg.safeTools!))
   assert.ok(!matchAny('mcp__github__create_issue', cfg.safeTools!))
   assert.ok(validateConfig({...cfg, safeTools: undefined}))
   assert.throws(() => validateConfig({...cfg, safeTools: 'x'}), /safeTools must be a list/)

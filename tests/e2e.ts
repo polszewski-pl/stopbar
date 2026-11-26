@@ -641,7 +641,7 @@ for (const c of CLIENTS) {
     const r = run('node --test', repo)
     const post = clientHook(c, c.post(repo, 'shell', 'node --test', r.code), false)
     check(`${c.name}: a gate run without an exit status is neither a pass nor a failure, and the agent is told to use stopbar run`,
-      c.allowed(pre) && r.code !== 0 && status(repo).testFails === 0 && /npx stopbar run test/.test(J(post.out)?.reason ?? ''), post.out.slice(0, 160))
+      c.allowed(pre) && r.code !== 0 && status(repo).testFails === 0 && /`npx --no-install stopbar run test`/.test(J(post.out)?.reason ?? ''), post.out.slice(0, 160))
     check(`${c.name}: \`stopbar run test\` from the agent's shell is allowed`, c.allowed(clientHook(c, c.pre(repo, 'shell', 'npx stopbar run test'), false)))
     check(`${c.name}: failing full tests through stopbar run are counted as a failure`, gate('test').status !== 0 && status(repo).testFails === 1, `testFails=${status(repo).testFails}`)
   } else {
@@ -890,6 +890,132 @@ say('\nS30 --base-ref <ref>: iterating on new tests across commits without taint
   check('unresolvable baseRef fails closed on test edit (exit 2, FAIL-CLOSED)',
     wFail.post?.code === 2 && /FAIL-CLOSED: baseRef/.test(wFail.post?.msg ?? ''), wFail.post?.msg)
   keepEvents(repo, 's30-base-ref')
+}
+
+// ---------------------------------------------------------------- S31 distinct gate commands, session tools, --cli
+say('\nS31 init refuses buildCmd == fullTestCmd; mcp__ccd_session_mgmt__* is local; --cli in hints and allowed with a pinned runtime')
+{
+  const repo = setupRepo('s31-cli', 3, false, [])
+  const cf = join(stateDir(repo), 'config.json')
+  const before = readFileSync(cf, 'utf8')
+  for (const [b, t] of [['node --test', 'node --test'], ['node --test', '  node --test '], ['node build.mjs ', 'node build.mjs']]) {
+    const r = human(repo, 'init', '--force', '--build', b, '--test', t)
+    check(`init --build ${JSON.stringify(b)} --test ${JSON.stringify(t)} is refused (exit 1) before any file is written`,
+      r.code === 1 && /buildCmd and config\.fullTestCmd must be different commands/.test(r.out) && readFileSync(cf, 'utf8') === before, r.out.slice(0, 160))
+  }
+  const fresh = join(TMP, 's31-no-config'); mkdirSync(fresh, {recursive: true}); run('git init -q', fresh)
+  check('init with identical commands in a new repository writes no Stopbar state',
+    human(fresh, 'init', '--build', 'npm test', '--test', 'npm test').code === 1 && !existsSync(join(stateDir(fresh), 'config.json')))
+  // an old or damaged config.json with identical commands: doctor reports FAIL with the fix, hooks fail closed
+  const old = JSON.parse(before); old.fullTestCmd = old.buildCmd; writeFileSync(cf, JSON.stringify(old, null, 2))
+  const d = human(repo, 'doctor')
+  check('doctor: config.json with buildCmd == fullTestCmd is [FAIL] with a fix', d.code === 1 && /\[FAIL\] config\.json .*must be different commands.*Fix: /.test(d.out), d.out.split('\n').find((l) => l.includes('config.json')) ?? '')
+  const fc = hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, 'src', 'sum.mjs')})
+  check('hooks fail closed on that config.json', fc.code === 2 && /FAIL-CLOSED: config\.json is invalid: .*must be different commands/.test(fc.msg))
+  writeFileSync(cf, before)
+
+  // the 1.1.1 default safeTools in an existing config.json: session tools still count as outbound, doctor says how to migrate
+  agentRead(repo, '.env')
+  const legacy = JSON.parse(before); legacy.safeTools = ['mcp__ccd_turn__*']; writeFileSync(cf, JSON.stringify(legacy, null, 2))
+  check('1.1.1 config.json (safeTools without mcp__ccd_session_mgmt__*) still works and keeps it outbound', hook(repo, 'PreToolUse', 'mcp__ccd_session_mgmt__send_message', {message: 'x'}).code === 2)
+  check('doctor: missing default safeTools is a WARN with the migration', /\[WARN\] safeTools .*mcp__ccd_session_mgmt__\*/.test(human(repo, 'doctor').out))
+  writeFileSync(cf, before)
+  human(repo, 'reset'); agentRead(repo, '.env')
+  const n0 = events(repo).filter((e) => e.req?.op === 'SHELL').length
+  const sm = hook(repo, 'PreToolUse', 'mcp__ccd_session_mgmt__send_message', {to: 'local_x', message: 'status?'})
+  check('mcp__ccd_session_mgmt__send_message after reading .env is allowed and is no outbound step',
+    status(repo).secretTainted === true && sm.code === 0 && events(repo).filter((e) => e.req?.op === 'SHELL').length === n0, sm.msg)
+  const other = hook(repo, 'PreToolUse', 'mcp__github__create_issue', {title: 'x'})
+  check('other MCP tools after reading .env still PAUSE', other.code === 2 && /^PAUSE/.test(other.msg))
+
+  // --cli: the checkout's CLI outside .git; the hooks run the pinned runtime inside .git
+  const cli = `node "${CLI.replace(/\\/g, '/')}"`
+  const pinned = join(stateDir(repo), 'runtime', 'bin', 'stopbar.mjs')
+  for (const bad of ['stopbar; echo', 'stopbar && x', 'stopbar | tee x', '', 'node .git/stopbar/runtime/bin/stopbar.mjs']) {
+    const r = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--cli', bad)
+    check(`init --cli ${JSON.stringify(bad)} is refused (exit 1)`, r.code === 1 && /cliCmd/.test(r.out) && readFileSync(cf, 'utf8') === before, r.out.slice(0, 140))
+  }
+  const np = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--no-pin', '--cli', cli)
+  check('init --no-pin --cli <the unpinned hook runtime> is refused: the agent could not run it', np.code === 1 && /could not run/.test(np.out), np.out.slice(0, 160))
+  const ini = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--cli', cli)
+  check('init --cli writes cliCmd and prints it', ini.code === 0 && JSON.parse(readFileSync(cf, 'utf8')).cliCmd === cli && ini.out.includes(`gate hints use: ${cli} run build|test`), ini.out.slice(0, 200))
+  check('hooks run the pinned runtime', existsSync(pinned))
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // cli\n')
+  const bg = hook(repo, 'PreToolUse', 'Bash', {command: 'node --test', run_in_background: true}, undefined, {}, pinned)
+  check('PreToolUse background block names `<cli> run test`', bg.code === 2 && bg.msg.includes(`\`${cli} run test\``) && !/npx/.test(bg.msg), bg.msg.slice(0, 200))
+  const cm = hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q -m "early"'}, undefined, {}, pinned)
+  check('commit refusal (whyBlocked) names `<cli> run build` and `<cli> run test`', cm.code === 2 && cm.msg.includes(`\`${cli} run build\``) && cm.msg.includes(`\`${cli} run test\``), cm.msg.slice(0, 200))
+  const cx = CLIENTS.find((x) => x.name === 'codex')!
+  clientHook(cx, cx.pre(repo, 'shell', 'node --test'), false)
+  const cxPost = clientHook(cx, cx.post(repo, 'shell', 'node --test', 0), false)
+  check('Codex gate run without an exit status names `<cli> run test`', (J(cxPost.out)?.reason ?? '').includes(`\`${cli} run test\``), cxPost.out.slice(0, 200))
+  const runPre = hook(repo, 'PreToolUse', 'Bash', {command: `${cli} run test`}, undefined, {}, pinned)
+  check('`<cli> run test` passes PreToolUse with the pinned runtime', runPre.code === 0, runPre.msg)
+  const rr = run(`${cli} run test`, repo)
+  hook(repo, 'PostToolUse', 'Bash', {command: `${cli} run test`}, {stdout: '', stderr: '', interrupted: false, exitCode: rr.code}, {}, pinned)
+  const rb = run(`${cli} run build`, repo)
+  const v = status(repo)
+  check('`<cli> run test` and `<cli> run build` record real passes at the current revision', rr.code === 0 && rb.code === 0 && v.testsOkRev === v.treeRev && v.buildOkRev === v.treeRev, `${rr.code} ${rb.code} ${JSON.stringify(v)}`)
+  for (const sub of ['approve-tests', 'approve-shell', 'resume --extra 5', 'reset', 'init --force --build a --test b']) {
+    const r = hook(repo, 'PreToolUse', 'Bash', {command: `${cli} ${sub}`}, undefined, {}, pinned)
+    check(`\`<cli> ${sub}\` stays blocked by self-protection`, r.code === 2 && /^BLOCK/.test(r.msg) && /human-only/.test(r.msg), r.msg.slice(0, 140))
+  }
+  keepEvents(repo, 's31-cli')
+}
+
+// ---------------------------------------------------------------- S32 --stop-gate warn
+say('\nS32 --stop-gate warn: Stop warns and logs stop:warn; git commit (hook and git fallback) stays blocked until the gates pass')
+{
+  const repo = setupRepo('s32-stop-warn', 3, false, ['--stop-gate', 'warn', '--hooks', 'git'])
+  const cf = join(stateDir(repo), 'config.json')
+  check('init --stop-gate warn writes stopGate', JSON.parse(readFileSync(cf, 'utf8')).stopGate === 'warn')
+  check('init --stop-gate off is refused', human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--stop-gate', 'off').code === 1 && JSON.parse(readFileSync(cf, 'utf8')).stopGate === 'warn')
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // warn\n')
+  const st = hook(repo, 'Stop', '', {})
+  const w = events(repo).filter((e) => e.source === 'stop:warn').at(-1)
+  check('Stop with uncommitted, unverified changes: exit 0 and WARN', st.code === 0 && /^WARN \(stopbar\): uncommitted changes are not yet verified \(.*no passing build.*\); commit remains blocked until gates pass\.$/.test(st.msg), st.msg)
+  check('events.jsonl has stop:warn with reason, treeRev, buildOkRev, testsOkRev, testsTainted, halted',
+    !!w && /no passing build/.test(w.reason) && typeof w.treeRev === 'number' && typeof w.buildOkRev === 'number' && typeof w.testsOkRev === 'number' && w.testsTainted === false && w.halted === false, JSON.stringify(w))
+  check('warn takes no COMMIT step in the kernel', !events(repo).some((e) => e.source === 'stop:declare-done'))
+  check('status shows stop gate warn (text and json)', /stop gate  warn/.test(human(repo, 'status').out) && JSON.parse(human(repo, 'status', '--json').out).stopGate === 'warn')
+  const doc = human(repo, 'doctor').out
+  check('doctor shows stopGate warn', /stopGate warn/.test(doc) && /\[WARN\] stopGate/.test(doc))
+  check('attest json has config.stopGate and md has the Stop gate row',
+    JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout).config.stopGate === 'warn' &&
+    spawnSync(process.execPath, [CLI, 'attest', '--format', 'md', '--repo', repo], {encoding: 'utf8'}).stdout.includes('| Stop gate | warn'))
+  run('git add -A', repo)
+  const n = commits(repo)
+  const cm = hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q -m "unverified"'})
+  check('git commit through the agent hook is still BLOCK (exit 2)', cm.code === 2 && /commit refused/.test(cm.msg), cm.msg.slice(0, 120))
+  const raw = run('git commit -q -m "unverified, by git directly"', repo)
+  check('git commit through the git fallback hook is still refused', raw.code !== 0 && commits(repo) === n, raw.stderr.trim().slice(0, 120))
+  for (const c of CLIENTS.filter((x) => x.name !== 'claude')) {
+    const r = clientHook(c, c.stop(repo), false)
+    const quiet = c.name === 'codex' ? r.out === '' : JSON.stringify(J(r.out)) === '{}'
+    check(`${c.name}: stopGate warn does not block the turn (exit 0, no block/continue/followup)`, r.code === 0 && !c.stopBlocked(r) && quiet, r.out || r.err)
+  }
+  // tainted tests: still only a warning at Stop, still no commit
+  agentWrite(repo, 'tests/sum.test.mjs', "import {test} from 'node:test'\ntest('weak', () => {})\n")
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  const st2 = hook(repo, 'Stop', '', {})
+  check('Stop with tainted tests and green gates: WARN naming approve-tests', st2.code === 0 && /^WARN/.test(st2.msg) && /approve-tests/.test(st2.msg), st2.msg)
+  check('git commit with tainted tests stays blocked', hook(repo, 'PreToolUse', 'Bash', {command: 'git commit -q -m "tainted"'}).code === 2)
+  human(repo, 'approve-tests')
+  run('git add -A', repo)
+  const st3 = hook(repo, 'Stop', '', {})
+  check('Stop after green gates and approval: exit 0, no warning (kernel COMMIT ALLOW)', st3.code === 0 && st3.msg === '' && events(repo).some((e) => e.source === 'stop:declare-done' && e.decision === 'ALLOW'), st3.msg)
+  const ok = agentBashCC(repo, 'git commit -q -m "verified"')
+  check('git commit is allowed after the gates pass', ok.pre.code === 0 && ok.exit === 0 && commits(repo) === n + 1, ok.out.slice(0, 120))
+  keepEvents(repo, 's32-stop-warn')
+}
+{
+  const repo = setupRepo('s32-stop-warn-halted', 1, false, ['--no-pin', '--stop-gate', 'warn'])
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a - b\n')
+  agentBashCC(repo, 'node --test')
+  const st = hook(repo, 'Stop', '', {})
+  const w = events(repo).filter((e) => e.source === 'stop:warn').at(-1)
+  check('halted session with stopGate warn: Stop warns with "session halted" and logs halted=true', status(repo).halted === true && st.code === 0 && /session halted/.test(st.msg) && w?.halted === true && w?.reason === 'session halted', st.msg)
+  keepEvents(repo, 's32-stop-warn-halted')
 }
 
 // ---------------------------------------------------------------- S12 (last: over all hook calls)

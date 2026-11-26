@@ -2,12 +2,12 @@
 // through its shell (classify.ts protectedCommand) and cannot edit their files (protectedPath).
 import {cpSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
-import {hasChain} from './classify.ts'
+import {hasChain, protectedCommand} from './classify.ts'
 import {CLAUDE_POST_MATCHER, claudeHooks, hookCommand, installHooks, parseTargets} from './integrations.ts'
-import {type Config, ConfigError, makeConfig, PROFILES} from './config.ts'
+import {cliOf, type Config, ConfigError, makeConfig, PROFILES} from './config.ts'
 import {decode, initKernel, kstep, MACHINE, type Req} from './engine.ts'
 import {whyBlocked} from './hook.ts'
-import {PKG_ROOT} from './pkg.ts'
+import {CODE_PARTS, PKG_ROOT} from './pkg.ts'
 import {findRepo, forgetSnapshots, hasRefTree, markCounted, type Repo, snapshot} from './repo.ts'
 import {appendEvent, paths, readConfig, readEvents, readState, type Saved, VERSION, withLock, writeConfig, writeState} from './store.ts'
 
@@ -55,11 +55,21 @@ export function init(o: Opts): Out {
   for (const [k, v] of [['--build', buildCmd], ['--test', fullTestCmd]]) {
     if (hasChain(v)) return {code: 1, msg: `${k} ${JSON.stringify(v)} has shell operators; put it in one script (e.g. an npm script) so its exit status is the gate`}
   }
-  if (existsSync(paths(repo).config) && !o.has('force')) return {code: 1, msg: `already initialised (${paths(repo).config}); use --force to replace config and state`}
+  for (const f of ['cli', 'stop-gate']) if (o.has(f) && o.get(f) === undefined) return {code: 1, msg: `--${f} needs a value`}
   let cfg: Config
   try {
-    cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1), baseRef: o.get('base-ref')})
+    cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1), baseRef: o.get('base-ref'),
+      cliCmd: o.get('cli'), stopGate: o.get('stop-gate')})
   } catch (e) { if (e instanceof ConfigError) return {code: 1, msg: e.message}; throw e }
+  if (existsSync(paths(repo).config) && !o.has('force')) return {code: 1, msg: `already initialised (${paths(repo).config}); use --force to replace config and state`}
+  const pin = !o.has('no-pin')
+  if (cfg.cliCmd) {
+    // the hint `<cli> run test` must pass self-protection with the runtime the hooks will use
+    const rt = pin ? join(repo.stateDir, 'runtime') : PKG_ROOT
+    const protect = {gitDir: repo.gitDir, stateDir: repo.stateDir, codeDirs: CODE_PARTS.map((n) => join(rt, n))}
+    const why = protectedCommand(`${cfg.cliCmd} run test`, protect)
+    if (why) return {code: 1, msg: `--cli ${JSON.stringify(cfg.cliCmd)}: the agent could not run \`${cfg.cliCmd} run test\` (${why}); point --cli at a Stopbar install outside the hook runtime`}
+  }
   if (cfg.baseRef && !hasRefTree(repo.root, cfg.baseRef)) {
     return {code: 1, msg: `--base-ref ${JSON.stringify(cfg.baseRef)} does not resolve to a commit/tree in ${repo.root}`}
   }
@@ -69,11 +79,11 @@ export function init(o: Opts): Out {
   return withLock(repo, () => {
     writeConfig(repo, cfg)
     writeState(repo, fresh(repo, cfg))
-    const pin = !o.has('no-pin')
     const runtime = pin ? pinRuntime(repo) : PKG_ROOT
     const command = hookCommand(runtime)
     appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE})
     const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}${cfg.baseRef ? `; base ref: ${cfg.baseRef}` : ''}`,
+      `  stop gate: ${cfg.stopGate ?? 'block'}; gate hints use: ${cliOf(cfg)} run build|test`,
       `  hooks run: ${command}`]
     if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
     else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
@@ -108,6 +118,7 @@ function statusText(repo: Repo, cfg: Config, s: Saved): string {
     `tainted    ${yn(v.testsTainted)}   secret read ${v.secretTainted ? `yes (${secretReason(repo)?.text ?? 'reason not in the event log'})` : 'no'}   shell approval held ${yn(v.shellToken)}`,
     `session    ${v.halted ? 'HALTED' : 'running'}   spent ${v.spent}/${v.capNow}   test failures ${v.testFails}/${s.params.maxRetries}   build failures ${v.buildFails}/${s.params.maxRetries}`,
     `commit     ${commit}`,
+    `stop gate  ${cfg.stopGate ?? 'block'}${cfg.stopGate === 'warn' ? '   (Stop only warns; git commit and git push stay blocked until the gates pass)' : ''}`,
     ...(torn ? [`event log  ${torn} torn line(s) kept as they are (see stopbar doctor)`] : []),
   ].join('\n')
 }
@@ -123,7 +134,7 @@ export function human(cmd: string, o: Opts): Out {
     }
     const s = readState(repo)
     if (cmd === 'status') {
-      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
+      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, stopGate: cfg.stopGate ?? 'block', snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
         secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null}, null, 1) : statusText(repo, cfg, s)}
     }
     let res: Out

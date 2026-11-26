@@ -3,7 +3,7 @@
 import {existsSync} from 'node:fs'
 import {resolve} from 'node:path'
 import * as K from './classify.ts'
-import {type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
+import {cliOf, type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
 import {matchAny} from './glob.ts'
 import {decode, kstep, type Req, type View} from './engine.ts'
 import {changesSinceHead, countedEntries, diffEntries, differsFromHead, FailClosed, findRepo, gitCalls, inRef, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
@@ -30,10 +30,13 @@ function step(ctx: Ctx, req: Req, source: string, extra: Record<string, unknown>
   return {before, after}
 }
 
-export function whyBlocked(v: View, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd'>): string {
+/** `<cli> run build|test`: the Stopbar command that runs a gate and records its real exit status (config.cliCmd). */
+export const runHint = (cfg: Pick<Config, 'cliCmd'>, which: 'build' | 'test') => `${cliOf(cfg)} run ${which}`
+
+export function whyBlocked(v: View, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd' | 'cliCmd'>): string {
   const r: string[] = []
-  if (v.buildOkRev !== v.treeRev) r.push(`no passing build at revision ${v.treeRev} (run \`${cfg.buildCmd}\` exactly, alone, or \`npx stopbar run build\`)`)
-  if (v.testsOkRev !== v.treeRev) r.push(`no passing FULL test suite at revision ${v.treeRev} (run \`${cfg.fullTestCmd}\` exactly, alone, or \`npx stopbar run test\`)`)
+  if (v.buildOkRev !== v.treeRev) r.push(`no passing build at revision ${v.treeRev} (run \`${cfg.buildCmd}\` exactly, alone, or \`${runHint(cfg, 'build')}\`)`)
+  if (v.testsOkRev !== v.treeRev) r.push(`no passing FULL test suite at revision ${v.treeRev} (run \`${cfg.fullTestCmd}\` exactly, alone, or \`${runHint(cfg, 'test')}\`)`)
   if (v.testsTainted) r.push(`existing tests or test config changed: a human must review and run \`stopbar approve-tests --rev ${v.treeRev}\``)
   return r.join('; ') || 'kernel decision'
 }
@@ -124,7 +127,7 @@ function pre(ctx: Ctx, input: any): Out {
         const which = k.kind === 'build' ? 'build' : 'test'
         const gate = k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd
         appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: `background gate command (${k.kind})`})
-        return block(`do not run \`${gate}\` in the background (run_in_background): the hook fires before the process finishes, so its exit status is unknown. Run \`${gate}\` in the foreground, or start \`npx stopbar run ${which}\` in the background so Stopbar records the real exit status only when it finishes.`)
+        return block(`do not run \`${gate}\` in the background (run_in_background): the hook fires before the process finishes, so its exit status is unknown. Run \`${gate}\` in the foreground, or start \`${runHint(cfg, which)}\` in the background so Stopbar records the real exit status only when it finishes.`)
       }
       return {code: 0} // the result is recorded in PostToolUse
     }
@@ -192,7 +195,7 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
       if (k.kind !== 'shell') {
         const which = k.kind === 'build' ? 'build' : 'test'
         const gate = k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd
-        msgs.push(`BLOCK (stopbar): \`${gate}\` was started in the background, so its exit status is not known yet and the run is not recorded. Run \`${gate}\` in the foreground, or start \`npx stopbar run ${which}\` in the background.`)
+        msgs.push(`BLOCK (stopbar): \`${gate}\` was started in the background, so its exit status is not known yet and the run is not recorded. Run \`${gate}\` in the foreground, or start \`${runHint(cfg, which)}\` in the background.`)
       }
     } else if (staleRun && (k.kind === 'build' || k.kind === 'fulltest')) {
       const curRev = decode(ctx.s.kernel).treeRev
@@ -201,7 +204,7 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
     } else if (!failure && unknown && (k.kind === 'build' || k.kind === 'fulltest' || (k.kind === 'shell' && k.partialTests))) {
       // no exit status in the client's post event: neither a pass nor a failure is recorded (no evidence either way)
       appendEvent(repo, {source: 'post:gate-without-exit-code', tool, kind: k.kind})
-      if (k.kind !== 'shell') msgs.push(`NOTE (stopbar): this client does not report the exit status of \`${k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd}\`, so the run is not recorded. Run \`npx stopbar run ${k.kind === 'build' ? 'build' : 'test'}\` instead: it runs the same command and records its real exit status.`)
+      if (k.kind !== 'shell') msgs.push(`NOTE (stopbar): this client does not report the exit status of \`${k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd}\`, so the run is not recorded. Run \`${runHint(cfg, k.kind === 'build' ? 'build' : 'test')}\` instead: it runs the same command and records its real exit status.`)
     } else if (k.kind === 'build') {
       step(ctx, {op: 'RUN_BUILD', passed, cost: cfg.costPerCall}, `post:build${note}`)
     } else if (k.kind === 'fulltest') {
@@ -221,10 +224,21 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
 }
 
 // ---------------------------------------------------------------- Stop: "I am done" = the COMMIT gate when the tree differs from HEAD
+// stopGate 'warn': the turn may end with unverified changes (e.g. to ask the human a question). Only the Stop hook
+// changes: no COMMIT step is taken, so `git commit` / `git push` in PreToolUse and the git hooks stay fully gated.
 function stop(ctx: Ctx, input: any): Out {
   if (input.stop_hook_active) return {code: 0}
   syncTree(ctx, 0, 'stop:sync')
   if (!differsFromHead(ctx.repo, ctx.now!.entries)) return {code: 0}
+  if (ctx.cfg.stopGate === 'warn') {
+    const v = decode(ctx.s.kernel)
+    const commitOk = !v.halted && v.buildOkRev === v.treeRev && v.testsOkRev === v.treeRev && !v.testsTainted
+    if (!commitOk) {
+      const reason = v.halted ? 'session halted' : whyBlocked(v, ctx.cfg)
+      appendEvent(ctx.repo, {source: 'stop:warn', reason, treeRev: v.treeRev, buildOkRev: v.buildOkRev, testsOkRev: v.testsOkRev, testsTainted: v.testsTainted, halted: v.halted})
+      return {code: 0, msg: `WARN (stopbar): uncommitted changes are not yet verified (${reason}); commit remains blocked until gates pass.`}
+    }
+  }
   const {after} = step(ctx, {op: 'COMMIT'}, 'stop:declare-done')
   return after.decision === 'ALLOW' ? {code: 0}
     : {code: 2, msg: `Not done (stopbar): uncommitted changes and ${after.halted ? 'the session is halted' : whyBlocked(after, ctx.cfg)}.`}

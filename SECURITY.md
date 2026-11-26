@@ -94,8 +94,11 @@ that tries to defeat it:
    ordinary files are not seen. The exfiltration gate works on command text only. In a shell command, a bare token
    that matches only an extension pattern such as `*.key` counts only if that file exists (a field access like
    `claim.key` is not a file); a command that names a `.key` file which does not exist yet is therefore not a read.
-   Tools listed in `config.safeTools` (default: Claude Desktop's `mcp__ccd_turn__*` UI tools) are not treated as
-   outbound; a human who adds a glob there vouches that those tools send nothing out.
+   Tools listed in `config.safeTools` (default: Claude Desktop's `mcp__ccd_turn__*` UI tools and its
+   `mcp__ccd_session_mgmt__*` tools for messages between local sessions) are not treated as outbound; a human who adds
+   a glob there vouches that those tools send nothing out. A message to another local session can carry text the agent
+   has read; that session runs under its own hooks. A `config.json` from 1.0.0–1.1.1 keeps its old list until a human
+   adds `mcp__ccd_session_mgmt__*` or runs `stopbar init --force ...`.
 4. **Weak new tests and mutable `baseRef`.** A new test file is not suspicious. A mock of the system under test or an
    empty assertion in a new file passes. Hard-coded answers in production code are an ordinary code edit. When
    `config.baseRef` is a mutable local branch name (such as `main`) rather than a commit SHA, an agent with shell access
@@ -103,7 +106,11 @@ that tries to defeat it:
 5. **Ignored files.** Files ignored by `.gitignore` are invisible to the snapshot (for example patches in
    `node_modules`). A change to `.gitignore` itself is suspicious.
 6. **Other commit paths.** Git aliases, `git commit-tree`, `gh pr create` and similar are not detected. The Stop hook
-   catches uncommitted work only.
+   catches uncommitted work only. With `config.stopGate: "warn"` it does not even block that: the turn ends with a
+   `WARN (stopbar)` answer and a `stop:warn` entry in `events.jsonl`. This mode takes no kernel step at Stop and does not
+   weaken the commit gate: `git commit` and `git push` in the agent hooks and in the git hooks are judged by the kernel
+   exactly as in `block` mode (laws L1, L2.1 and L3.x). What `warn` gives up is the reminder at the end of a turn, so
+   unverified work can stay uncommitted in the working tree.
 7. **Concurrency and humans.** A change made between two hook calls (a background job, a human edit) is counted as the
    agent's change at the next hook. With parallel tool calls a change can be attributed to the wrong call.
 8. **Agent configuration.** Settings outside the repository (user settings, managed settings, `--settings`,
@@ -131,7 +138,17 @@ For a hostile-agent threat model, run the agent in a container or VM: no network
 read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
 the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
 
-## Known limits of 1.1.1
+## Known limits of 1.1.2
+
+- `stopGate: "warn"`: in Cursor, Codex CLI, Gemini CLI and Antigravity CLI the WARN text is not shown to the agent,
+  because their Stop protocols have no non-blocking message (a `followup_message`, `decision: "block"` or
+  `decision: "continue"` would start another turn). The entry in `events.jsonl` and `stopbar status` show it.
+  Claude Code gets the text on stdout with exit 0.
+- `cliCmd` is checked as text: one command, no shell operators, no `.git` or agent-settings directory. Stopbar does not
+  check that the command really starts Stopbar; a wrong `cliCmd` gives the agent a hint that does not work, and the
+  gates still count only real runs. Self-protection still blocks the human-only commands through `cliCmd`.
+- `buildCmd` and `fullTestCmd` that differ only in whitespace at the ends count as equal and are refused. Two different
+  commands that run the same script (for example `npm test` and `npm run test`) are not detected.
 
 - Lean: the check needs Docker and a one-time image build with network access. The base image is pinned by digest and
   the Lean archive by sha256, both recorded at the first build (trust on first use). The Lean export is not

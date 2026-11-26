@@ -75,6 +75,26 @@ test('rendering: each client gets its own deny, allow and stop format', () => {
   assert.deepEqual(JSON.parse(r('antigravity', 'stop', {code: 2, msg: 'Not done'}).stdout!), {decision: 'continue', reason: 'Not done'})
 })
 
+test('rendering: a Stop with exit 0 and a WARN message (stopGate warn) never blocks the turn in any client', () => {
+  const warn = {code: 0, msg: 'WARN (stopbar): uncommitted changes are not yet verified (x); commit remains blocked until gates pass.'}
+  const r = (a: string, i: object | null = null) => adapterByName(a)!.render('stop', warn as any, i as any)
+  // Claude Code: exit 0, the text on stdout (exit 2 or {"decision":"block"} would block)
+  assert.deepEqual(r('claude'), {code: 0, stdout: warn.msg + '\n'})
+  // Cursor: exit 0 and {} (a followup_message would start another turn)
+  assert.deepEqual(r('cursor', {...CURSOR, hook_event_name: 'stop'}), {code: 0, stdout: '{}\n'})
+  // Codex CLI: exit 0, no {"decision":"block"}
+  assert.deepEqual(r('codex'), {code: 0})
+  // Gemini CLI: exit 0 and {}, no {"decision":"block"}
+  assert.deepEqual(r('gemini'), {code: 0, stdout: '{}\n'})
+  // Antigravity CLI: exit 0 and {}, no {"decision":"continue"}
+  assert.deepEqual(r('antigravity'), {code: 0, stdout: '{}\n'})
+  for (const a of ['claude', 'cursor', 'codex', 'gemini', 'antigravity']) {
+    const o = r(a, a === 'cursor' ? {...CURSOR, hook_event_name: 'stop'} : null)
+    assert.equal(o.code, 0, a)
+    if (o.stdout && o.stdout.trim().startsWith('{')) assert.deepEqual(JSON.parse(o.stdout), {}, a)
+  }
+})
+
 test('fail closed: unknown payload, bad JSON, unknown adapter', () => {
   assert.equal(handle('{"foo":1}').code, 2)
   assert.match(handle('{"foo":1}').stderr!, /unknown hook payload/)

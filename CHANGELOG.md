@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.2 (2026-11-26)
+
+`src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.1. A `config.json` from
+1.0.0–1.1.1 with two different gate commands works without migration.
+
+- **`buildCmd` and `fullTestCmd` must differ.** The classifier matches `buildCmd` first, so with two equal commands
+  (after trimming) every run was recorded as a build and the full test gate could never pass. `validateConfig` now
+  refuses such a config with a `ConfigError` that says how to fix it; `stopbar init` exits 1 before it writes a file;
+  for an existing `config.json` with equal commands the hooks fail closed and `stopbar doctor` reports
+  `[FAIL] config.json` with the fix.
+- **Claude Desktop session tools are local.** `DEFAULT_SAFE_TOOLS` is now `["mcp__ccd_turn__*",
+  "mcp__ccd_session_mgmt__*"]`, so a message to another local session after a secret read no longer causes a false
+  `PAUSE`. Other MCP tools stay outbound. An existing `config.json` keeps its own `safeTools`: add
+  `"mcp__ccd_session_mgmt__*"` or run `stopbar init --force ...`; `stopbar doctor` shows a `[WARN] safeTools` while a
+  default entry is missing.
+- **`stopbar init --cli "<cmd>"` (`config.cliCmd`).** The hints in the commit refusal, in the block of a background gate
+  command (`PreToolUse` and `PostToolUse`) and in the note for a gate run without an exit status (Codex CLI) name
+  `<cliCmd> run build|test`. Without `--cli` they name `npx --no-install stopbar run build|test`, which never downloads
+  the package from the npm registry (1.1.1 said `npx stopbar`). `cliCmd` must be one command without shell operators
+  and must not name `.git` or an agent-settings directory; with `--no-pin`, `init` also refuses a `cliCmd` that points
+  at the hook runtime. `<cliCmd> run test` passes the hooks; `<cliCmd> approve-tests`, `approve-shell`, `resume`,
+  `reset` and `init` stay blocked.
+- **`stopbar init --stop-gate block|warn` (`config.stopGate`, default `block`).** `warn` changes only the `Stop` hook:
+  with uncommitted changes that are not verified (no green build or full tests at the current revision, tainted tests,
+  or a halted session) it answers exit 0 with `WARN (stopbar): ...` and logs a `stop:warn` entry (reason, revisions,
+  taint, halt) in `events.jsonl`, without a kernel step. `git commit` and `git push` in the agent hooks and in the git
+  hooks stay gated by the kernel. All five adapters render this answer without blocking the turn. `status` (text and
+  `--json`), `doctor` and `attest` (`config.stopGate` in JSON, a `Stop gate` row in Markdown when `warn`) show the mode.
+- Tests: unit tests for the new config rules and for the non-blocking Stop answer in every adapter; E2E scenarios S31
+  (equal gate commands, session tools, `--cli` with a pinned runtime) and S32 (`--stop-gate warn` with the agent hooks,
+  the git hooks and every adapter).
+
 ## 1.1.1 (2026-11-26)
 
 - **Security fix (background gate commands):** Claude Code fires `PostToolUse` immediately with `backgroundTaskId` when

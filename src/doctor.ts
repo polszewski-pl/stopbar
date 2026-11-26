@@ -5,7 +5,7 @@ import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:f
 import {isAbsolute, join} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
-import {DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
+import {cliOf, DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
 import {decode, MACHINE} from './engine.ts'
 import {runHook} from './hook.ts'
 import {PKG_ROOT} from './pkg.ts'
@@ -156,7 +156,12 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     try {
       const cfg = readConfig(repo); cfgOk = true
       add('OK', 'config.json', `profile ${cfg.profile}; build \`${cfg.buildCmd}\`; full tests \`${cfg.fullTestCmd}\`; maxRetries ${cfg.maxRetries}; cap ${cfg.cap}; ` +
-        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}${cfg.baseRef ? `; baseRef ${cfg.baseRef}` : ''}`)
+        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}${cfg.baseRef ? `; baseRef ${cfg.baseRef}` : ''}; ` +
+        `stopGate ${cfg.stopGate ?? 'block'}; cli ${cliOf(cfg)}`)
+      if (cfg.stopGate === 'warn') add('WARN', 'stopGate', 'warn: Stop does not block a turn with unverified changes (logged as stop:warn); git commit and git push stay blocked until the gates pass')
+      const safe = cfg.safeTools ?? DEFAULT_SAFE_TOOLS
+      const missing = DEFAULT_SAFE_TOOLS.filter((t) => !safe.includes(t))
+      if (missing.length) add('WARN', 'safeTools', `missing default ${missing.join(', ')}: these local tools count as outbound after a secret read; add them to config.safeTools or run \`stopbar init --force ...\``)
       if (cfg.baseRef) add(hasRefTree(repo.root, cfg.baseRef) ? 'OK' : 'FAIL', 'baseRef', hasRefTree(repo.root, cfg.baseRef) ? `${cfg.baseRef} resolves to a tree` : `${cfg.baseRef} does not resolve in git (existing-test checks will fail closed)`)
       for (const [k, v] of [['buildCmd', cfg.buildCmd], ['fullTestCmd', cfg.fullTestCmd]]) if (hasChain(v)) add('FAIL', 'config.json', `${k} has shell operators: it can never pass as a gate`)
       try {
