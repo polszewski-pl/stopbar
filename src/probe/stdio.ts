@@ -169,13 +169,24 @@ export class CmdClient {
     return this.bad('execute', 'ok must be true or false', v)
   }
 
+  /** Kills the process tree. taskkill reports a failure (no rights, a sandbox, not on PATH) by its status, not by an
+   *  exception: then the direct child is killed. The pipes are always destroyed and the child unref'd, so a process
+   *  that survives (a grandchild of the shell) can never hold the event loop of Stopbar open. */
   private kill() {
     const ch = this.ch
-    if (!ch || ch.pid === undefined || this.exited !== null) return
-    try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(ch.pid), '/T', '/F'], {stdio: 'ignore', windowsHide: true})
-      else process.kill(-ch.pid, 'SIGKILL')
-    } catch { try { ch.kill('SIGKILL') } catch { /* gone */ } }
+    if (!ch) return
+    if (ch.pid !== undefined && this.exited === null) {
+      let treeKilled = false
+      try {
+        if (process.platform === 'win32') {
+          const r = spawnSync('taskkill', ['/pid', String(ch.pid), '/T', '/F'], {stdio: 'ignore', windowsHide: true})
+          treeKilled = !r.error && r.status === 0
+        } else { process.kill(-ch.pid, 'SIGKILL'); treeKilled = true }
+      } catch { /* fall back to the direct child below */ }
+      if (!treeKilled) try { ch.kill('SIGKILL') } catch { /* gone */ }
+    }
+    for (const s of [ch.stdin, ch.stdout, ch.stderr]) try { s?.destroy() } catch { /* closed */ }
+    ch.unref()
   }
 
   /** Ends stdin (a well-behaved target exits on EOF); kills the process tree after `graceMs`. */
@@ -187,6 +198,9 @@ export class CmdClient {
     const gone = new Promise<void>((ok) => ch.once('exit', () => ok()))
     try { ch.stdin!.end() } catch { /* already closed */ }
     const timer = new Promise<'late'>((ok) => { const t = setTimeout(() => ok('late'), graceMs); t.unref?.() })
-    if (await Promise.race([gone.then(() => 'gone' as const), timer]) === 'late') { this.kill(); await Promise.race([gone, new Promise((ok) => setTimeout(ok, 1000))]) }
+    if (await Promise.race([gone.then(() => 'gone' as const), timer]) === 'late') {
+      this.kill() // destroys the pipes and unrefs the child even when the kill itself fails
+      await Promise.race([gone, new Promise((ok) => { const t = setTimeout(ok, 1000); t.unref?.() })])
+    }
   }
 }

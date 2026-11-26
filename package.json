@@ -25,7 +25,8 @@
   },
   "files": [
     "bin/",
-    "dist/",
+    "dist/**/*.js",
+    "dist/build-info.json",
     "src/kernel.ts",
     "src/probe/sdk.ts",
     "claude-hooks.example.json",
@@ -47,6 +48,7 @@
     "verify:lean": "node scripts/build.ts && node scripts/verify-lean.ts",
     "probe": "node scripts/build.ts && node bin/stopbar.mjs probe",
     "bench": "node bench/hook-latency.ts",
+    "typecheck": "tsc --noEmit",
     "prepack": "node scripts/build.ts"
   },
   "keywords": [
@@ -64,5 +66,9 @@
   ],
   "dependencies": {
     "gdp-wired": "0.60.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.4",
+    "typescript": "5.9.3"
   }
 }

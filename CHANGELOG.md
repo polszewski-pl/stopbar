@@ -7,6 +7,50 @@
 This release joins 1.2.0-rc.1 (PROBE for TS/JS) with PROBE for any language and `stopbar probe init`. No new runtime
 dependency: `gdp-wired` 0.60.0 is still the only one.
 
+Launch hardening:
+
+- **`stopbar probe --cmd` never hangs after a failed kill.** `taskkill` reports a failure (no rights, a sandbox, not on
+  `PATH`) by its exit status, not by an exception; Stopbar now checks it and then kills the direct child. The pipes of
+  the process are always destroyed and the child is unref'd, also after the grace period of `close()`, so a process that
+  survives can no longer keep Stopbar's event loop open.
+- **Git hooks by default.** `init --hooks <clients>` also writes `pre-commit` and `pre-push` (they close git aliases,
+  and before a push `merge`, `cherry-pick`, `am` and `commit-tree`). `--no-git-hooks` skips them. A foreign git hook is
+  kept with a `WARN` that names `--hooks git --force-hooks`; with `git` named in `--hooks` it is still an error.
+  `init` without `--hooks` writes nothing outside `.git/stopbar/`. `stopbar doctor` reports `[WARN] hooks git` while
+  one of the two Stopbar git hooks is missing, with the fix `stopbar upgrade --hooks git`.
+- **`git -c alias.<name>=...` is blocked** (also `-calias.`, quoted, `--config-env alias.*` and
+  `GIT_CONFIG_KEY_<n>=alias.*`): a one-off alias hid the real git subcommand from the commit and push gates.
+- **Quote splicing.** The secret and self-protection checks also read the command as bash joins the quoted parts of a
+  word: `cat .e""nv` is a read of `.env`, `rm -rf .g""it` and `cat .cl''aude/...` are blocked.
+- **`--require-run`** (`config.requireRun`, default `false`): the build and full test gates count only through
+  `stopbar run build|test`; the same command from the agent's shell is not recorded and the hook names `stopbar run`
+  (`post:require-run` in the log). `status`, `doctor` and `attest` show it.
+- `scripts/*test*` is a test pattern in every profile (new `config.json` files).
+- **`safeTools` while halted** (telemetry): the tools in `config.safeTools` (default `mcp__ccd_turn__*`,
+  `mcp__ccd_session_mgmt__*`) pass in `HALT`, so the agent can ask a human for `stopbar resume`. They take no kernel
+  step. Read, Edit, Write, Bash, WebFetch and every other MCP tool stay paused.
+- **A single-quoted heredoc as stdin is data** (telemetry): `agy -p - <<'EOF'` … `EOF` whose prompt mentions
+  `approve-tests` is no longer blocked as a human-only command. A shell or interpreter on the command line, a pipe, a
+  `>`/`>>` redirection, a variable or a command that stores or runs stdin (`xargs`, `at`, `tee`, `stopbar`) keeps the
+  full check; `.git`, agent settings and Stopbar code stay protected in the body.
+- **No false `[WARN] kernel link`** (telemetry): `stopbar doctor` finds `gdp-wired` with `import.meta.resolve`, so a
+  hoisted install (`npm install stopbar`) is checked. The WARN stays for a copy where it cannot be resolved.
+- `stopbar doctor` reports missing Claude Code hooks also when only the git hooks are present, if the last `init` or
+  `upgrade` wrote Claude Code hooks (`human:init` now logs the hook targets).
+- **Typecheck.** `npm run typecheck` (`tsc --noEmit`, strict, over `src/`, `scripts/`, `tests/`, `bench/`) with
+  `typescript` 5.9.3 and `@types/node` 24 as devDependencies only. `src/hook.ts` has no `any` left. The build writes
+  `dist/*.d.ts` files that point at `src/*.ts` for the typecheck; they are not in the npm package and not in the pinned
+  runtime.
+- **CI.** `.github/workflows/ci.yml`: build, typecheck, tests and a PROBE of `examples/bounded-queue.probe.ts` with
+  mutants on Ubuntu, Windows and macOS; `npm run prove`; `lake build` with Lean 4.34.0 from elan through the new
+  `node scripts/verify-lean.ts --local` (no Docker). The Docker mode is unchanged.
+- README and SECURITY.md say in their first lines what is proven (the kernel) and what is tested (the wrapper), and
+  that without an OS sandbox Stopbar is no security boundary against a hostile agent.
+- Tests: unit tests for the kill fallback (a stuck target with no `taskkill` on `PATH`), `git -c alias.*`, quote
+  splicing, the stdin heredoc and the documented limits; E2E scenarios S38 (`safeTools` in `HALT`), S39
+  (`--require-run`, `.e""nv`, `.g""it`, `git -c alias.*`, a heredoc prompt) and S40 (git hooks by default, foreign hooks,
+  `--no-git-hooks`, `[WARN] hooks git`, kernel link).
+
 - **PROBE for any language: `stopbar probe --cmd "<command>"`.** Each worker starts the command once (in a shell) and
   speaks NDJSON with it on stdin/stdout: `{"op":"info"}` (name, description, optional mutants),
   `{"op":"generate","seed":N}` (a run of pure JSON actions) and `{"op":"execute","run":...,"dir":...,"mutant"?}` (an

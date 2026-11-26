@@ -79,6 +79,13 @@ export function scanShell(cmd: string): {chain: boolean; reason?: string; heredo
 }
 export const hasChain = (cmd: string) => scanShell(cmd).chain
 
+/** The command text as bash joins quoted parts of one word: `.e""nv`, `.g''it`, `.e"n"v` and `.cl''aude` become `.env`,
+ *  `.git`, `.env` and `.claude`. For the text scans of secrets and self-protection only (never for gate matching):
+ *  empty quote pairs are dropped, and so is a quote between two characters of a word. */
+export function unsplice(cmd: string): string {
+  return cmd.replace(/""|''/g, '').replace(/(?<=[\w.\-/\\~])["'](?=[\w.\-/\\~])/g, '')
+}
+
 // ---------------------------------------------------------------- risky / outbound shell
 const NET_TOOLS = /\b(curl|wget|nc|ncat|netcat|socat|ssh|scp|sftp|rsync|ftp|tftp|telnet)\b/i
 const PS_NET = /Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b|Start-BitsTransfer|Net\.WebClient|System\.Net\.|Net\.Sockets/i
@@ -127,7 +134,9 @@ export type SecretHit = {token: string; pattern: string}
 
 /** The first secret path named in a command (e.g. `cat .env`, `type secrets\\db.txt`), with the pattern it matched. */
 export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true): SecretHit | null {
-  for (const tok of cmd.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)) {
+  const words = (s: string) => s.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)
+  // the words as written, then as bash joins them (`.e""nv` is `.env`)
+  for (const tok of new Set([...words(cmd), ...words(unsplice(cmd))])) {
     const hits = paths.secrets.filter((g) => matchesSecretGlob(tok, g))
     if (!hits.length) continue
     const strong = hits.find((g) => !EXT_ONLY.test(g))
@@ -147,7 +156,7 @@ export type BashKind =
 /** Exact match of gate commands: no chain operators, no extra arguments. `shell` is 'bash' or 'powershell'. */
 export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd' | 'paths'>, shell: 'bash' | 'powershell' = 'bash', exists?: (p: string) => boolean): BashKind {
   const c = cmd.trim()
-  const scan = shell === 'bash' ? scanShell(c) : scanPlain(c)
+  const scan: {chain: boolean; reason?: string; heredoc?: boolean} = shell === 'bash' ? scanShell(c) : scanPlain(c)
   if (COMMIT_RE.test(scan.heredoc ? commandPart(c) : c)) {
     if (scan.chain) return {kind: 'commit-chained', reason: scan.reason ?? 'chain'}
     return {kind: 'commit', heredoc: !!scan.heredoc, push: isPushCmd(c)}
@@ -260,14 +269,62 @@ export function commandForSelfProtect(cmd: string, shell: 'bash' | 'powershell' 
   return out
 }
 
-/** Shell command text. Returns the reason for a block, or null. Text matching only: see SECURITY.md. */
-export function protectedCommand(cmd: string, pr: Protect): string | null {
-  const c = norm(cmd).toLowerCase()
-  if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
-  for (const [re, d] of AGENT_DIRS) if (re.test(c)) return `the command names a ${d} directory (agent settings there hold the Stopbar hooks)`
-  if (isGitConfigWrite(cmd)) return '`git config` writes .git/config; only reads (--get, --list) are allowed'
-  if (c.includes(lc(pr.stateDir)) || c.includes(lc(pr.gitDir) + '/')) return 'the command names the git directory'
-  for (const d of pr.codeDirs) if (c.includes(lc(d))) return `the command names Stopbar code (${d})`
-  if (HUMAN_ONLY.test(cmd) || STOPBAR_ADMIN.test(cmd)) return 'human-only Stopbar command or setting'
+// `git -c alias.ci=commit ci` (also `-calias.`, `--config-env alias.`, GIT_CONFIG_KEY_n=alias.): a one-off alias hides
+// the real git subcommand from the classification of commits and pushes in PreToolUse.
+const GIT_ALIAS = new RegExp(String.raw`\bgit(?:\.exe)?${GIT_GLOBALS}\s+(?:-c\s*|--config-env(?:=|\s+))["']?\s*alias\.`, 'i')
+const GIT_ALIAS_ENV = /\bGIT_CONFIG_(?:PARAMETERS\b|KEY_\d+\s*=\s*["']?alias\.)/i
+
+// A single-quoted heredoc fed to a command as stdin, e.g. a prompt for another agent CLI: `agy -p - <<'EOF'` ... `EOF`.
+// With the delimiter in quotes bash expands nothing in the body, so the body is data for the command, unless the command
+// runs it as code (a shell or an interpreter, xargs, at), hands it to Stopbar, or stores it in a file (> / >>, tee).
+const STDIN_HEREDOC = /<<-?[ \t]*'([A-Za-z_][A-Za-z0-9_]*)'/g
+const RUNS_STDIN = /^(?:sh|bash|zsh|dash|ksh|fish|pwsh|powershell|cmd|eval|source|\.|node|deno|bun|tsx|ts-node|python[0-9.]*|py|pypy[0-9.]*|perl|ruby|php|lua|osascript|xargs|parallel|at|batch|crontab|tee|dd|stopbar(?:\.mjs)?)$/i
+
+/** The command without the body of its one single-quoted heredoc, when that body is plain stdin data (see above);
+ *  else null. The lines before and after the heredoc stay: they are commands. */
+export function withoutStdinHeredoc(cmd: string): string | null {
+  if (cmd.includes('\r') || cmd.includes('\0')) return null
+  const all = [...cmd.matchAll(STDIN_HEREDOC)]
+  if (all.length !== 1 || (cmd.match(/<</g) ?? []).length !== 1) return null
+  const m = all[0], at = m.index
+  const lineStart = cmd.lastIndexOf('\n', at) + 1
+  const nl = cmd.indexOf('\n', at)
+  if (nl < 0) return null
+  const header = cmd.slice(lineStart, at) + ' ' + cmd.slice(at + m[0].length, nl)
+  const lines = cmd.slice(nl + 1).split('\n')
+  const end = lines.indexOf(m[1])
+  if (end < 0) return null // no closing delimiter line: not a heredoc this function understands
+  // on the header line, outside quotes: a write redirection (fd duplication such as 2>&1 is fine) or a pipe; outside
+  // single quotes: an expansion ($X, $(...), `...`), which may name an interpreter (X=bash; $X <<'EOF')
+  if (/>(?!&\d)|&>|\|/.test(header.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "''"))) return null
+  if (/[$`]/.test(header.replace(/'[^']*'/g, "''"))) return null
+  // a word anywhere before the body that runs or stores stdin (also in a function or alias defined on an earlier line)
+  for (const w of (cmd.slice(0, at) + ' ' + header).split(/[\s;&|(){}<>=]+/).filter(Boolean)) {
+    const base = w.replace(/^["']+|["']+$/g, '').replace(/\\/g, '/').split('/').pop()!.replace(/\.exe$/i, '')
+    if (RUNS_STDIN.test(base)) return null
+  }
+  return [cmd.slice(0, nl), ...lines.slice(end)].join('\n')
+}
+
+/** Shell command text. Returns the reason for a block, or null. Text matching only: see SECURITY.md.
+ *  Every check runs on the text as written and as bash joins quoted parts of a word (`.g""it`). For bash, the body of
+ *  one single-quoted heredoc that is plain stdin data (withoutStdinHeredoc) is skipped by the human-only checks only:
+ *  .git, the agent settings directories and Stopbar code stay protected in it. */
+export function protectedCommand(cmd: string, pr: Protect, shell: 'bash' | 'powershell' = 'bash'): string | null {
+  const texts = [...new Set([cmd, unsplice(cmd)])]
+  for (const t of texts) {
+    const c = norm(t).toLowerCase()
+    if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
+    for (const [re, d] of AGENT_DIRS) if (re.test(c)) return `the command names a ${d} directory (agent settings there hold the Stopbar hooks)`
+  }
+  for (const t of texts) {
+    const c = norm(t).toLowerCase()
+    if (isGitConfigWrite(t)) return '`git config` writes .git/config; only reads (--get, --list) are allowed'
+    if (GIT_ALIAS.test(t) || GIT_ALIAS_ENV.test(t)) return '`git -c alias.<name>=...` defines a one-off git alias, which hides the real git subcommand'
+    if (c.includes(lc(pr.stateDir)) || c.includes(lc(pr.gitDir) + '/')) return 'the command names the git directory'
+    for (const d of pr.codeDirs) if (c.includes(lc(d))) return `the command names Stopbar code (${d})`
+  }
+  const admin = (shell === 'bash' ? withoutStdinHeredoc(cmd) : null) ?? cmd
+  for (const t of new Set([admin, unsplice(admin)])) if (HUMAN_ONLY.test(t) || STOPBAR_ADMIN.test(t)) return 'human-only Stopbar command or setting'
   return null
 }

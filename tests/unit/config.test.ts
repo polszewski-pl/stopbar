@@ -1,7 +1,7 @@
 // Config rules added in 1.1.2: distinct gate commands, default safeTools, cliCmd and stopGate.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {commandForSelfProtect, protectedCommand} from '../../dist/classify.js'
+import {commandForSelfProtect, isTestPath, protectedCommand} from '../../dist/classify.js'
 import {cliCmdProblem, cliOf, DEFAULT_CLI, DEFAULT_SAFE_TOOLS, makeConfig, validateConfig} from '../../dist/config.js'
 import {runHint, whyBlocked} from '../../dist/hook.js'
 
@@ -74,4 +74,17 @@ test('stopGate: block and warn are valid, missing means block, anything else is 
     assert.throws(() => validateConfig({...cfg, stopGate: bad}), /stopGate must be "block" or "warn"/, JSON.stringify(bad))
   }
   assert.throws(() => makeConfig({buildCmd: 'b', fullTestCmd: 't', stopGate: 'off'}), /stopGate/)
+})
+
+test('requireRun: optional boolean, written only when on; scripts/*test* is a test path in every profile', () => {
+  assert.equal(cfg.requireRun, undefined)
+  assert.equal(makeConfig({buildCmd: 'b', fullTestCmd: 't', requireRun: true}).requireRun, true)
+  assert.equal('requireRun' in makeConfig({buildCmd: 'b', fullTestCmd: 't', requireRun: false}), false)
+  for (const ok of [true, false]) assert.equal(validateConfig({...cfg, requireRun: ok}).requireRun, ok)
+  for (const bad of ['true', 1, null, 'yes']) assert.throws(() => validateConfig({...cfg, requireRun: bad}), /requireRun must be true or false/, JSON.stringify(bad))
+  for (const profile of ['default', 'ts', 'python', 'strict']) {
+    const p = makeConfig({buildCmd: 'b', fullTestCmd: 't', profile}).paths
+    for (const f of ['scripts/test.sh', 'scripts/run-tests.mjs', 'scripts/e2e-test.py']) assert.ok(isTestPath(f, p), `${profile}: ${f}`)
+    assert.ok(!isTestPath('scripts/build.ts', p), `${profile}: scripts/build.ts`)
+  }
 })

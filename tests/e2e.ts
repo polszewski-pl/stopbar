@@ -1374,6 +1374,107 @@ say('\nS37 PROBE --cmd "<command>": NDJSON target in any language, mutants, prob
   keepEvents(repo, 's37-cmd')
 }
 
+// ---------------------------------------------------------------- S38 safeTools while halted
+say('\nS38 HALT: local session tools (config.safeTools) still pass, so the agent can ask a human for resume; file, shell and outbound tools stay paused')
+{
+  const repo = setupRepo('s38-halt-safe-tools', 1)
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a - b\n')
+  agentBashCC(repo, 'node --test')
+  check('one failing full suite with --max-retries 1 halts the session', status(repo).halted === true)
+  const steps0 = events(repo).filter((e) => e.req).length
+  for (const t of ['mcp__ccd_session_mgmt__send_message', 'mcp__ccd_turn__update_plan']) {
+    const r = hook(repo, 'PreToolUse', t, {to: 'local_orchestrator', message: 'halted: please run stopbar resume'})
+    check(`${t} while halted: exit 0`, r.code === 0, r.msg)
+  }
+  check('safe tools while halted take no kernel step and the session stays halted', events(repo).filter((e) => e.req).length === steps0 && status(repo).halted === true)
+  check('events.jsonl logs them as ALLOW (safe tool while halted)', events(repo).filter((e) => e.reason === 'safe tool while halted').length === 2)
+  const paused: [string, object][] = [['Read', {file_path: join(repo, 'src', 'sum.mjs')}], ['Bash', {command: 'echo hi'}], ['Edit', {file_path: join(repo, 'src', 'sum.mjs')}],
+    ['Write', {file_path: join(repo, 'src', 'x.mjs'), content: ''}], ['WebFetch', {url: 'https://example.invalid'}], ['mcp__github__create_issue', {title: 'x'}], ['mcp__ccd_session__start_session', {}]]
+  for (const [tool, ti] of paused) {
+    const r = hook(repo, 'PreToolUse', tool, ti)
+    check(`${tool} while halted: PAUSE (exit 2)`, r.code === 2 && /^PAUSE \(stopbar\): the session is halted/.test(r.msg), r.msg.slice(0, 120))
+  }
+  check('self-protection still comes first while halted', /^BLOCK/.test(hook(repo, 'PreToolUse', 'Bash', {command: 'rm -rf .git'}).msg))
+  human(repo, 'resume', '--extra', '5')
+  check('after resume Read passes again', status(repo).halted === false && hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, 'src', 'sum.mjs')}).code === 0)
+  keepEvents(repo, 's38-halt-safe-tools')
+}
+
+// ---------------------------------------------------------------- S39 --require-run, quote splicing, git -c alias.*, stdin heredoc
+say('\nS39 --require-run: gates count only through stopbar run; .e""nv and .g""it, git -c alias.*, a quoted heredoc prompt as stdin')
+{
+  const repo = setupRepo('s39-require-run', 3, false, ['--no-pin', '--require-run'])
+  check('init --require-run writes requireRun: true', JSON.parse(readFileSync(join(stateDir(repo), 'config.json'), 'utf8')).requireRun === true)
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // rr\n')
+  const b = agentBash(repo, 'node build.mjs'), t = agentBash(repo, 'node --test')
+  const v = status(repo)
+  check('buildCmd and fullTestCmd from the agent shell ran (exit 0) but are not recorded', b.exit === 0 && t.exit === 0 && v.buildOkRev !== v.treeRev && v.testsOkRev !== v.treeRev, JSON.stringify(v))
+  check('PostToolUse says to use stopbar run build|test (exit 2, NOTE)', b.post?.code === 2 && /config\.requireRun/.test(b.post.msg) && /run build/.test(b.post.msg) &&
+    t.post?.code === 2 && /run test/.test(t.post.msg), t.post?.msg.slice(0, 160))
+  check('events.jsonl logs post:require-run for both', events(repo).filter((e) => e.source === 'post:require-run').length === 2)
+  agentBash(repo, 'git add -A')
+  check('git commit stays blocked', agentBash(repo, 'git commit -q -m "rr"').pre.code === 2)
+  const rb = spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo], {encoding: 'utf8'}), rt = spawnSync(process.execPath, [CLI, 'run', 'test', '--repo', repo], {encoding: 'utf8'})
+  const v2 = status(repo)
+  check('stopbar run build and stopbar run test record the passes', rb.status === 0 && rt.status === 0 && v2.buildOkRev === v2.treeRev && v2.testsOkRev === v2.treeRev, `${rb.status} ${rt.status}`)
+  const n = commits(repo)
+  check('git commit is allowed after stopbar run', agentBash(repo, 'git commit -q -m "rr"').pre.code === 0 && commits(repo) === n + 1)
+  const att = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  check('status, status --json, doctor and attest show requireRun', /requireRun true/.test(human(repo, 'status').out) && JSON.parse(human(repo, 'status', '--json').out).requireRun === true &&
+    /requireRun: true/.test(human(repo, 'doctor').out) && att.config?.requireRun === true)
+
+  writeFileSync(join(repo, '.env'), 'X=1\n')
+  human(repo, 'reset')
+  const e = hook(repo, 'PreToolUse', 'Bash', {command: 'cat .e""nv'})
+  check('cat .e""nv counts as a read of .env (READ_SECRET, pattern .env*)', e.code === 0 && status(repo).secretTainted === true &&
+    events(repo).some((x) => x.req?.op === 'READ_SECRET' && x.secret?.pattern === '.env*'))
+  for (const c of ['rm -rf .g""it', "cat .cl''aude/settings.local.json", 'git -c alias.ci=commit ci -m x', 'git -c "alias.ci=commit" ci', 'git -calias.ci=commit ci',
+    "bash <<'EOF'\nstopbar approve-tests\nEOF", "cat <<'EOF' > x.sh\nstopbar approve-tests\nEOF"]) {
+    const r = hook(repo, 'PreToolUse', 'Bash', {command: c})
+    check(`${JSON.stringify(c)}: BLOCK (exit 2)`, r.code === 2 && /^BLOCK/.test(r.msg), r.msg.slice(0, 140))
+  }
+  check('.git is still there', existsSync(join(repo, '.git', 'config')))
+  const p = hook(repo, 'PreToolUse', 'Bash', {command: "agy -p - <<'EOF'\nReview the diff. Do not run stopbar approve-tests yourself.\nEOF"})
+  check('a single-quoted heredoc prompt that mentions approve-tests passes (stdin data)', p.code === 0, p.msg)
+  keepEvents(repo, 's39-require-run')
+}
+
+// ---------------------------------------------------------------- S40 git hooks by default, doctor [WARN] hooks git, kernel link
+say('\nS40 init --hooks <client> adds the git hooks; a foreign git hook is kept with a WARN; --no-git-hooks; doctor [WARN] hooks git; kernel link')
+{
+  const repo = setupRepo('s40-default-git-hooks')
+  const hd = join(repo, '.git', 'hooks')
+  const ours = (dir: string, n: string) => existsSync(join(dir, n)) && readFileSync(join(dir, n), 'utf8').includes('stopbar.mjs" git-hook')
+  check('init without --hooks writes no hooks (no git hooks, no .claude)', !existsSync(join(hd, 'pre-commit')) && !existsSync(join(hd, 'pre-push')) && !existsSync(join(repo, '.claude')))
+  const d0 = human(repo, 'doctor')
+  check('doctor without git hooks: [WARN] hooks git with the fix', /\[WARN\] hooks git .*no Stopbar pre-commit and pre-push hook.*stopbar upgrade --hooks git/.test(d0.out), d0.out.split('\n').find((l) => /hooks git/.test(l)))
+  check('doctor in the package: [OK] kernel link (gdp-wired resolved as Node resolves it)', /\[OK  \] kernel link/.test(d0.out), d0.out.split('\n').find((l) => /kernel link/.test(l)))
+  const r1 = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude')
+  check('init --hooks claude also writes pre-commit and pre-push', r1.code === 0 && ours(hd, 'pre-commit') && ours(hd, 'pre-push') && /added to --hooks by default/.test(r1.out), r1.out.slice(0, 200))
+  check('the pinned runtime has no .d.ts files', !readdirSync(join(stateDir(repo), 'runtime', 'dist'), {recursive: true}).some((f) => String(f).endsWith('.d.ts')))
+  const d1 = human(repo, 'doctor')
+  check('doctor: [OK] hooks git', /\[OK  \] hooks git/.test(d1.out))
+  const pd = spawnSync(process.execPath, [join(stateDir(repo), 'runtime', 'bin', 'stopbar.mjs'), 'doctor', '--repo', repo], {encoding: 'utf8'})
+  check('doctor from the pinned runtime has no false [WARN] kernel link while gdp-wired resolves', !/\[WARN\] kernel link .*cannot be resolved/.test(pd.stdout + pd.stderr), (pd.stdout + pd.stderr).split('\n').find((l) => /kernel link/.test(l)))
+
+  rmSync(join(hd, 'pre-push')); writeFileSync(join(hd, 'pre-commit'), '#!/bin/sh\necho user hook\n')
+  const r2 = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude')
+  check('foreign pre-commit with git hooks by default: init exit 0, the hook is kept, WARN names --hooks git --force-hooks',
+    r2.code === 0 && readFileSync(join(hd, 'pre-commit'), 'utf8').includes('user hook') && /WARN: .*pre-commit exists and is not a Stopbar hook; kept it.*--hooks git --force-hooks/.test(r2.out) && ours(hd, 'pre-push'), r2.out.slice(0, 300))
+  check('doctor: [WARN] hooks git names the missing pre-commit', /\[WARN\] hooks git .*no Stopbar pre-commit hook/.test(human(repo, 'doctor').out))
+  const r3 = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude,git')
+  check('explicit --hooks git with a foreign hook still fails (exit 2) without --force-hooks', r3.code === 2 && /not a Stopbar hook/.test(r3.out), r3.out.slice(0, 160))
+  const r4 = human(repo, 'upgrade', '--hooks', 'git', '--force-hooks')
+  check('stopbar upgrade --hooks git --force-hooks replaces it and keeps a backup', r4.code === 0 && ours(hd, 'pre-commit') && readFileSync(join(hd, 'pre-commit.stopbar-backup'), 'utf8').includes('user hook'), r4.out.slice(0, 160))
+
+  const repo2 = setupRepo('s40-no-git-hooks'), hd2 = join(repo2, '.git', 'hooks')
+  const r5 = human(repo2, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude', '--no-git-hooks')
+  check('--no-git-hooks: only the client hooks, with a WARN', r5.code === 0 && !existsSync(join(hd2, 'pre-commit')) && !existsSync(join(hd2, 'pre-push')) &&
+    existsSync(join(repo2, '.claude', 'settings.local.json')) && /WARN: --no-git-hooks/.test(r5.out), r5.out.slice(0, 200))
+  check('--no-git-hooks together with --hooks git is refused (exit 1)', human(repo2, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'git', '--no-git-hooks').code === 1)
+  keepEvents(repo, 's40-default-git-hooks')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

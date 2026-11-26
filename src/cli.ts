@@ -10,9 +10,12 @@ const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code ho
 
   stopbar init --build "<cmd>" --test "<cmd>" [--profile default|ts|python|strict] [--base-ref <ref>] [--max-retries 3] [--cap 500]
                [--cost 1] [--hooks claude,claude-project,cursor,codex,gemini,antigravity,git] [--no-pin] [--force] [--force-hooks] [--repo <dir>]
-               [--cli "<cmd>"] [--stop-gate block|warn]
+               [--cli "<cmd>"] [--stop-gate block|warn] [--require-run] [--no-git-hooks]
+                                   --hooks <clients> adds the git hooks (pre-commit, pre-push) unless --no-git-hooks;
+                                     a foreign git hook is kept with a warning (replace it: --hooks git --force-hooks)
                                    --cli: command that starts Stopbar in hints (default: npx --no-install stopbar)
                                    --stop-gate warn: Stop only warns; git commit and git push stay blocked until the gates pass
+                                   --require-run: build and full test gates count only through stopbar run build|test
   stopbar upgrade [--hooks <targets>] [--force-hooks] [--repo <dir>]
                                    a human re-pins the hook runtime from this package (and rewrites hooks with --hooks);
                                    state, gates, taint and budget stay as they are

@@ -1,7 +1,16 @@
 # Stopbar
 
-Stopbar is a formally proven execution gate for AI coding agents. It runs as the hooks of Claude Code, Cursor, Codex
-CLI, Gemini CLI and Antigravity CLI, and as git hooks for any other tool. It stops an agent from:
+Stopbar is an execution gate for AI coding agents in two parts: a **formally proven decision kernel**
+(`src/kernel.ts`, about 160 lines, its laws proven by induction and checked again by `lake build` in Lean 4.34.0) and
+a **tested wrapper** around it: the hooks of Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, and git
+hooks for any other tool. The wrapper reads tool calls and command text and asks the kernel; it is covered by unit and
+E2E tests and stateful probing, not by the proof.
+
+**Without an OS sandbox, Stopbar stops shortcuts and mistakes of an agent; it is not a security boundary against a
+hostile agent.** A command can build a path at run time or hide it in a script that the text rules do not see. See
+[SECURITY.md](SECURITY.md) for what is proven, what the wrapper enforces and what needs an OS sandbox.
+
+It stops an agent from:
 
 - committing without a passing build and a passing **full** test suite at the current revision of the working tree;
 - weakening existing tests or test configuration without a human approval;
@@ -11,8 +20,7 @@ CLI, Gemini CLI and Antigravity CLI, and as git hooks for any other tool. It sto
 
 The decisions come from one rule, `src/kernel.ts`. gdp-wired 0.60.0 proves its laws by induction, and 10 mutants of
 the rule each fall with a counterexample. Every client goes through the same rule: an adapter translates the client's
-hook payload into one internal event and renders the decision in the client's own output format. See
-[SECURITY.md](SECURITY.md) for what is proven, what the wrapper enforces and what needs an OS sandbox.
+hook payload into one internal event and renders the decision in the client's own output format.
 
 ## Supported agents
 
@@ -63,9 +71,13 @@ Requirements: Node.js 22.18 or later, git, a git repository.
 
    Profiles for the path patterns: `--profile default|ts|python|strict`. `init` copies the runtime to
    `.git/stopbar/runtime/` and points every hook to it. Existing settings and hooks in those files stay; earlier
-   Stopbar entries are replaced. `init` does not overwrite a git hook it did not write, unless you pass
-   `--force-hooks` (the old hook is kept as `<name>.stopbar-backup`). Without `--hooks`, it prints the Claude Code JSON
-   to paste. A template is in [claude-hooks.example.json](claude-hooks.example.json).
+   Stopbar entries are replaced. Since 1.2.0, `--hooks <clients>` also writes the git hooks (`pre-commit`,
+   `pre-push`): they close git aliases, and before a push `merge`, `cherry-pick`, `am` and `commit-tree`, which an
+   agent hook does not see. Pass `--no-git-hooks` to skip them. `init` does not overwrite a git hook it did not write:
+   when the git hooks were added by default, it keeps the foreign hook and prints a `WARN`; when you named `git` in
+   `--hooks`, it stops with an error. `--hooks git --force-hooks` replaces it (the old hook is kept as
+   `<name>.stopbar-backup`). Without `--hooks`, `init` writes nothing outside `.git/stopbar/` and prints the Claude
+   Code JSON to paste. A template is in [claude-hooks.example.json](claude-hooks.example.json).
 
 3. **Check** the setup, then restart the agent in the repository:
 
@@ -99,7 +111,7 @@ EOF
 
 | Command | Who | What it does |
 |---|---|---|
-| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. |
+| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--require-run] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-git-hooks] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated; `git` is added to any other target unless `--no-git-hooks`. `--require-run`: the build and full test gates count only through `stopbar run build\|test`. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. |
 | `stopbar upgrade [--hooks <targets>] [--force-hooks]` | human | After you update the Stopbar package: re-pins the hook runtime in `.git/stopbar/runtime` and, with `--hooks`, rewrites the hooks. `state.json`, `config.json` and the snapshots stay as they are (revision, gates, taint, budget), so an active session keeps its green gates. Use it instead of `init --force`. |
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
@@ -251,8 +263,9 @@ profile by editing the lists: no code change is necessary.
 - **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default
   (`DEFAULT_SAFE_TOOLS`) is `["mcp__ccd_turn__*", "mcp__ccd_session_mgmt__*"]`: the task-list and turn-summary tools of
   Claude Desktop and its tools for messages between local sessions. It only exempts tools from the outbound gate
-  (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before, and a halted session still
-  blocks every tool. A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
+  (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before. Since 1.2.0 these tools also
+  pass while the session is halted, so the agent can still ask a human for `stopbar resume`; they never take a kernel
+  step. Every other tool stays paused while halted. A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
   `PAUSE`s on the session tools after a secret read, add `"mcp__ccd_session_mgmt__*"` to `safeTools` or write the file
   again with `stopbar init --force ...`. `stopbar doctor` shows a `[WARN] safeTools` while a default entry is missing.
 - **`cliCmd`** (optional, set via `stopbar init --cli "<cmd>"`) is the command that starts Stopbar in the hints shown to
@@ -265,13 +278,22 @@ profile by editing the lists: no code change is necessary.
   `warn`: for long tasks with one commit at the end, the turn may end with unverified changes (for example to ask the
   human a question); Stopbar logs a `stop:warn` entry in `events.jsonl` and answers `WARN (stopbar): ...` without
   blocking. `git commit` and `git push` in the agent hooks and in the git hooks stay fully gated by the kernel.
-  `status`, `doctor` and `attest` show the mode. A damaged or empty `config.json` or `state.json` blocks every
-tool call (exit 2) with a message that says how to repair it.
+  `status`, `doctor` and `attest` show the mode.
+- **`requireRun`** (optional, set via `stopbar init --require-run`, default `false`): the build and full test gates
+  count only when they run through `stopbar run build` or `stopbar run test`. The same command run from the agent's own
+  shell is not recorded (neither a pass nor a failure); the hook answers with a `NOTE` that names `stopbar run` and logs
+  `post:require-run`. `status`, `doctor` and `attest` show `requireRun: true` when it is on.
+
+A damaged or empty `config.json` or `state.json` blocks every tool call (exit 2) with a message that says how to
+repair it.
 
 ## Local use
 
 - `npm run build` builds `dist/` from `src/` with Node's own type stripping and generates `dist/kernel.gen.js` from
-  the kernel with gdp-wired's `compileJs`. There is no TypeScript compiler and no bundler.
+  the kernel with gdp-wired's `compileJs`. There is no bundler, and the build needs no TypeScript compiler.
+- `npm run typecheck` runs `tsc --noEmit` (TypeScript is a devDependency only) over `src/`, `scripts/`, `tests/` and
+  `bench/` in strict mode. The build writes small `dist/*.d.ts` files that point the tests' `dist/*.js` imports at
+  `src/*.ts`; they are not in the npm package and not in the pinned runtime.
 - `npm test` runs the unit tests, the E2E suite (real git repositories, a separate hook process for each call) and the
   stateful fuzzer (200 random sequences of 20–30 steps, compared with the proven kernel). It takes about 3 minutes.
   In Claude Code, give the Bash tool enough time, for example `"env": {"BASH_DEFAULT_TIMEOUT_MS": "600000"}` in the
@@ -280,13 +302,18 @@ tool call (exit 2) with a message that says how to repair it.
 - `npm run verify:lean` exports the Lean project (`leanProject()` of gdp-wired) and runs `lake build` in the
   container from `docker/lean.Dockerfile` with `--network none`. It is the release gate for changes of `src/kernel.ts`,
   not part of `npm test`. Build the image once (this needs the network):
-  `docker build -f docker/lean.Dockerfile -t stopbar-lean:4.34.0 docker`.
+  `docker build -f docker/lean.Dockerfile -t stopbar-lean:4.34.0 docker`. Without Docker, with Lean 4.34.0 on `PATH`
+  (for example from elan): `npm run build` and `node scripts/verify-lean.ts --local`. Both write
+  `results/lean/lean-verify.json`.
 - `npm run bench` measures the hook latency.
 - `npm run test:e2e` or `npm run test:fuzz` runs only the E2E suite or only the stateful prober.
 
 ## Use in CI
 
-Prove the kernel and run the tests on every change of Stopbar itself:
+Stopbar's own workflow, [.github/workflows/ci.yml](.github/workflows/ci.yml), runs on every push to `main` and every
+pull request: build, typecheck, the full test suite and a PROBE of `examples/bounded-queue.probe.ts` with mutants on
+Ubuntu, Windows and macOS (Node 24); `npm run prove`; and `lake build` of the Lean export with Lean 4.34.0 from elan
+(`node scripts/verify-lean.ts --local`). The minimum for a fork:
 
 ```yaml
 - run: npm ci
@@ -318,10 +345,13 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 ## Tested platforms
 
-| Platform | Node | git | Python | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
-|---|---|---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 56/56 | 394/394 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 56/56 | 394/394 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Platform | Node | git | Python | Typecheck | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 62/62 | 439/439 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 62/62 | 439/439 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Ubuntu, Windows, macOS (GitHub Actions) | 24 | runner | runner | CI | CI | CI | CI | – | CI (Ubuntu) | – |
+
+The last row is the CI workflow: it runs after a push, so its results are on the repository's Actions page, not here.
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5020 steps
@@ -330,7 +360,8 @@ The `--cmd` column is `stopbar probe --cmd "<python> examples/bounded_queue_prob
 (3970 steps on both platforms). E2E scenario S37 runs `--cmd` with a Node target everywhere, and the Python example
 and the `--lang py` template only where `python3` or `python` is found.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry` (run on the same
-`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 does not change).
+`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 does not change). `node scripts/verify-lean.ts --local`
+gives the same result with Lean 4.34.0 on `PATH` (checked in a Debian 13 container with the toolchain of that image).
 
 ## License
 

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
+import {spawn, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import {dirname, join, resolve} from 'node:path'
 import {test} from 'node:test'
-import {fileURLToPath} from 'node:url'
+import {fileURLToPath, pathToFileURL} from 'node:url'
 import {loadCmd, probe, ProbeError, shrink} from '../../dist/probe/index.js'
 import {initProbe} from '../../dist/probe/init.js'
 import {CmdClient, commandFile, splitCommand} from '../../dist/probe/stdio.js'
@@ -96,6 +97,51 @@ test('errors of the external process are ProbeErrors with the end of stderr, nev
   const nx = new CmdClient('stopbar-no-such-program-xyz --x')
   await within(assert.rejects(nx.info(), (e: Error) => e instanceof ProbeError && /exited with code \d+ before answering/.test(e.message)))
   await nx.close()
+})
+
+test('kill(): a failed taskkill still ends the target, and the client never holds the event loop open', async () => {
+  // A child Node process runs a target that never answers and ignores the end of stdin (a stuck process); the answer
+  // times out, which kills the target. On Windows the child has no taskkill on PATH: spawnSync then returns an error
+  // status instead of throwing (as in a sandbox or with too few rights), so the tree kill fails. The child must still
+  // exit by itself: no process.exit, nothing left that keeps its event loop alive.
+  const stuck = join(TMP, 'stuck-target.mjs'), pidFile = join(TMP, 'stuck-target.pid')
+  rmSync(pidFile, {force: true})
+  writeFileSync(stuck, [
+    "import {writeFileSync} from 'node:fs'",
+    'writeFileSync(process.argv[2], String(process.pid))',
+    "process.stdin.resume(); process.stdin.on('end', () => {})",
+    'setInterval(() => {}, 1000); setTimeout(() => process.exit(0), 60000)',
+  ].join('\n') + '\n')
+  const script = join(TMP, 'hang-check.mjs')
+  writeFileSync(script, [
+    `import {CmdClient} from ${JSON.stringify(pathToFileURL(join(ROOT, 'dist', 'probe', 'stdio.js')).href)}`,
+    `const c = new CmdClient(${JSON.stringify([`"${process.execPath}"`, `"${stuck}"`, `"${pidFile}"`].join(' '))}, {timeoutMs: 1500})`,
+    "c.generate(5).then(() => console.log('answered'), (e) => { console.log('rejected: ' + e.message); c.close(300) })",
+  ].join('\n') + '\n')
+  const env: Record<string, string | undefined> = {...process.env}
+  if (process.platform === 'win32') {
+    for (const k of Object.keys(env)) if (k.toLowerCase() === 'path') delete env[k]
+    env.PATH = join(TMP, 'no-taskkill'); mkdirSync(env.PATH, {recursive: true})
+    assert.ok(spawnSync('taskkill', ['/?'], {env, stdio: 'ignore'}).error, 'taskkill must not be found on the PATH of the child')
+  }
+  const ch = spawn(process.execPath, [script], {env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true})
+  let out = ''
+  ch.stdout.on('data', (d) => { out += d }); ch.stderr.on('data', (d) => { out += d })
+  const exited = new Promise<number | null>((ok) => ch.on('exit', (code) => ok(code)))
+  try {
+    const code = await within(exited, 20000)
+    assert.equal(code, 0, out)
+    assert.match(out, /rejected: probe command .* did not answer within 1500 ms/)
+    assert.doesNotMatch(out, /answered/)
+    assert.ok(existsSync(pidFile), 'the target ran')
+  } finally {
+    if (ch.exitCode === null) {
+      if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(ch.pid), '/T', '/F'], {stdio: 'ignore'})
+      else ch.kill('SIGKILL')
+    }
+    // the target itself may outlive a failed tree kill (a grandchild of the shell): end it here
+    try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL') } catch { /* already gone */ }
+  }
 })
 
 test('probe(): --cmd runs workers over NDJSON with mutants and summary; --cmd with --target, or --target-file alone, is refused', async () => {

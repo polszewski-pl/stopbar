@@ -2,6 +2,7 @@
 // proven kernel with gdp-wired's toLean + leanProject and runs `lake build` in the pinned Lean 4.34.0 container with no
 // network. Pass: exit 0, 0 errors, 0 `sorry`.
 // Usage: node scripts/verify-lean.ts   (after `npm run build` and the one-time image build in docker/lean.Dockerfile)
+//        node scripts/verify-lean.ts --local   (no Docker: lean and lake of the pinned toolchain on PATH, as in CI)
 import {execFileSync, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
@@ -32,17 +33,37 @@ const project = {
 console.log(`Lean project: ${project.files} files (${project.leanFiles} .lean), ${project.toolchain}, StopbarKernel.lean sha256 ${project.main.sha256}, ` +
   `${project.main.theorems} theorems in it, ${project.theoremsAll} in all, sorry in source: ${project.sorryInSource}`)
 
-const img = spawnSync('docker', ['image', 'inspect', '--format', '{{.Id}}', IMAGE], {encoding: 'utf8'})
-if (img.status !== 0) {
-  console.error(`no image ${IMAGE}. Build it once (needs the network):\n  docker build -f docker/lean.Dockerfile -t ${IMAGE} docker`)
-  process.exit(2)
+// --local (CI, no Docker): `lake build` with the lean and lake on PATH (e.g. installed by elan), which must be the
+// toolchain the project pins (lean-toolchain); without --local: the pinned container with no network, as before.
+const LOCAL = process.argv.includes('--local')
+const PINNED = /v?(\d+\.\d+\.\d+)/.exec(project.toolchain)?.[1] ?? project.toolchain
+let imageId: string | null = null, archive: string | null = null, leanVersion: string
+if (LOCAL) {
+  const v = spawnSync('lean', ['--version'], {encoding: 'utf8'})
+  if (v.status !== 0) {
+    console.error(`--local: no lean on PATH (${v.error?.message ?? (v.stderr || '').trim()}). Install Lean ${PINNED} with elan, or run without --local (Docker)`)
+    process.exit(2)
+  }
+  leanVersion = v.stdout.trim()
+  if (!leanVersion.includes(PINNED)) {
+    console.error(`--local: ${leanVersion} on PATH, but the project pins ${project.toolchain}`)
+    process.exit(2)
+  }
+} else {
+  const img = spawnSync('docker', ['image', 'inspect', '--format', '{{.Id}}', IMAGE], {encoding: 'utf8'})
+  if (img.status !== 0) {
+    console.error(`no image ${IMAGE}. Build it once (needs the network):\n  docker build -f docker/lean.Dockerfile -t ${IMAGE} docker\nor install Lean ${PINNED} with elan and run: node scripts/verify-lean.ts --local`)
+    process.exit(2)
+  }
+  imageId = img.stdout.trim()
+  const inImage = (cmd: string) => execFileSync('docker', ['run', '--rm', '--network', 'none', IMAGE, 'sh', '-c', cmd], {encoding: 'utf8'}).trim()
+  leanVersion = inImage('lean --version'); archive = inImage('cat /lean-archive.sha256')
 }
-const imageId = img.stdout.trim()
-const inImage = (cmd: string) => execFileSync('docker', ['run', '--rm', '--network', 'none', IMAGE, 'sh', '-c', cmd], {encoding: 'utf8'}).trim()
-const leanVersion = inImage('lean --version'), archive = inImage('cat /lean-archive.sha256')
 
 const t0 = Date.now()
-const run = spawnSync('docker', ['run', '--rm', '--network', 'none', '-v', `${PROJECT}:/src:ro`, IMAGE], {encoding: 'utf8', maxBuffer: 256 << 20})
+const run = LOCAL
+  ? spawnSync('lake', ['build'], {cwd: PROJECT, encoding: 'utf8', maxBuffer: 256 << 20})
+  : spawnSync('docker', ['run', '--rm', '--network', 'none', '-v', `${PROJECT}:/src:ro`, IMAGE], {encoding: 'utf8', maxBuffer: 256 << 20})
 const ms = Date.now() - t0
 const log = `${run.stdout ?? ''}${run.stderr ?? ''}`
 const errors = (log.match(/^.*\berror\b.*$/gim) ?? []).filter((l) => !/0 errors?/i.test(l))
@@ -54,14 +75,14 @@ const axioms = [...new Set(axiomLines.flatMap((l) => (/\[(.*)\]/.exec(l)?.[1] ??
 const warnings = (log.match(/warning:/g) ?? []).length
 const warningsInMain = log.split('\n').filter((l) => /warning:.*StopbarKernel\.lean/.test(l)).length
 const built = /Build completed successfully \((\d+) jobs\)/.exec(log)?.[1]
-const res = {image: IMAGE, imageId, leanVersion, leanArchive: archive, network: 'none', command: 'lake build', exit: run.status, ms,
+const res = {mode: LOCAL ? 'local' : 'docker', image: LOCAL ? null : IMAGE, imageId, leanVersion, leanArchive: archive, network: LOCAL ? 'host' : 'none', command: 'lake build', exit: run.status, ms,
   errors: errors.length, sorryWarnings, sorryAx, axiomReports: axiomLines.length, axioms, warnings, warningsInMain, jobs: built ? Number(built) : null, project,
   ok: run.status === 0 && errors.length === 0 && sorryWarnings === 0 && sorryAx === 0 && project.sorryInSource === 0 && !!built}
 mkdirSync(OUT, {recursive: true})
 writeFileSync(join(OUT, 'lake-build.log'), log)
 writeFileSync(join(OUT, 'lean-verify.json'), JSON.stringify(res, null, 1) + '\n')
 writeFileSync(join(OUT, 'StopbarKernel.lean'), files['StopbarKernel.lean'])
-console.log(`lake build: exit ${run.status}, ${(ms / 1000).toFixed(1)} s, errors ${errors.length}, sorry warnings ${sorryWarnings}, sorryAx ${sorryAx} in ${axiomLines.length} axiom reports (axioms: ${axioms.join(', ')}), ${built} jobs, ${warnings} warnings (${warningsInMain} in StopbarKernel.lean) (${leanVersion}, image ${imageId.slice(0, 19)})`)
+console.log(`lake build: exit ${run.status}, ${(ms / 1000).toFixed(1)} s, errors ${errors.length}, sorry warnings ${sorryWarnings}, sorryAx ${sorryAx} in ${axiomLines.length} axiom reports (axioms: ${axioms.join(', ')}), ${built} jobs, ${warnings} warnings (${warningsInMain} in StopbarKernel.lean) (${leanVersion}, ${imageId ? `image ${imageId.slice(0, 19)}` : 'local lake'})`)
 console.log(`LEAN ${res.ok ? 'PASS' : 'FAIL'}`)
 if (!res.ok) console.log(errors.slice(0, 20).join('\n'))
 process.exitCode = res.ok ? 0 : 1

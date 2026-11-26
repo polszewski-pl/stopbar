@@ -1,8 +1,11 @@
 # Security model
 
-Stopbar is a set of Claude Code hooks with a formally proven decision kernel. This file says what is proven, what the
-wrapper enforces, and what Stopbar cannot give you without an operating-system sandbox. Read the last part before you
-rely on Stopbar against a hostile agent.
+Stopbar has two parts: a formally proven decision kernel (`src/kernel.ts`, proven by induction with gdp-wired and
+checked again by `lake build` in Lean 4.34.0) and a tested wrapper around it: the hooks of Claude Code, Cursor, Codex
+CLI, Gemini CLI and Antigravity CLI, and git hooks (`pre-commit`, `pre-push`) for any other tool. This file says what
+is proven (section 1), what the wrapper enforces and how it is tested (section 2), and what Stopbar cannot give you
+without an operating-system sandbox (section 3). Without an OS sandbox, Stopbar stops shortcuts and mistakes of an
+agent; it is not a security boundary against a hostile agent.
 
 ## 1. What is proven
 
@@ -82,8 +85,20 @@ There is no proof for them.
   `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`, `.gemini/**/hooks.json`,
   `.agents/hooks.json`, at project and user level), or the Stopbar code that runs the hooks. A shell command may not
   name a `.git`, `.claude`, `.cursor`, `.codex`, `.gemini` or `.agents` directory, write git config (`git config`
-  without `--get` or `--list`), name the Stopbar code, use a `STOPBAR_*` variable, or run a human command
-  (`approve-tests`, `approve-shell`, `stopbar init/resume/reset`).
+  without `--get` or `--list`), define a one-off git alias (`git -c alias.<name>=...`, `--config-env alias.*`,
+  `GIT_CONFIG_KEY_<n>=alias.*`), name the Stopbar code, use a `STOPBAR_*` variable, or run a human command
+  (`approve-tests`, `approve-shell`, `stopbar init/resume/reset`). Since 1.2.0 every text check runs on the command as
+  written and as bash joins the quoted parts of a word, so `.e""nv`, `.g''it` and `.cl''aude` count as `.env`, `.git`
+  and `.claude`. In Bash, the body of one single-quoted heredoc that is stdin data (`agy -p - <<'EOF'` … `EOF`) is
+  skipped by the human-only checks, so a prompt may mention `approve-tests`; this does not apply when the command line
+  pipes, redirects with `>`/`>>`, expands a variable, or names a shell, an interpreter, `xargs`, `at`, `tee` or
+  `stopbar`. `.git`, the agent settings directories and the Stopbar code stay protected inside the body.
+- **Halted sessions.** While halted, every tool is paused except the tools in `config.safeTools` (default: the local
+  task-list, turn and session-message tools of Claude Desktop), so the agent can still ask a human for `stopbar resume`.
+  These tools never take a kernel step, so they cannot change the state that laws L4.1 and L4.4 speak about. Edit,
+  Write, Read, Bash, WebFetch and every other MCP tool stay paused.
+- **`requireRun`.** With `config.requireRun: true`, a build or full test run counts only through `stopbar run
+  build|test`; the same command from the agent's shell is recorded neither as a pass nor as a failure.
 - **One kernel for every agent.** An adapter per client (Claude Code, Cursor, Codex CLI, Gemini CLI, Antigravity CLI)
   translates the hook payload into one internal event and the decision into the client's output protocol. The
   adapters are wrapper code: the E2E suite runs each with payloads in the client's published schema.
@@ -102,7 +117,9 @@ that tries to defeat it:
 
 1. **Indirect execution.** A script written to a normal file and then run (`node x.js`, `bash x.sh`) can do anything:
    delete `.git/stopbar`, edit `.claude/settings.local.json`, run `stopbar approve-tests`. The text checks do not see
-   inside the script. Obfuscation (`c=cu; ${c}rl`), aliases and shell functions also pass the text checks.
+   inside the script. Obfuscation (`c=cu; ${c}rl`, `g=.g; d=$g"it"; rm -rf $d`), backslash escapes inside a word,
+   aliases and shell functions also pass the text checks. Only simple quote splicing (`.g""it`) is undone. The unit
+   test "known limits without an OS sandbox" keeps these cases visible.
 2. **Gate commands run arbitrary code.** `buildCmd` and `fullTestCmd` run the repository's code. A new test file is
    trusted. It can read secrets, use the network or weaken other checks at run time.
 3. **Secrets by file name only.** Secrets in environment variables, in files with ordinary names, or found with Grep in
@@ -123,8 +140,11 @@ that tries to defeat it:
    flagged. Stopbar does not watch the ref itself.
 5. **Ignored files.** Files ignored by `.gitignore` are invisible to the snapshot (for example patches in
    `node_modules`). A change to `.gitignore` itself is suspicious.
-6. **Other commit paths.** Git aliases, `git commit-tree`, `git stash`, `git cherry-pick`, `git rebase`, `gh pr create`
-   and similar are not detected as commits. The Stop hook
+6. **Other commit paths.** Aliases from a git config file, `git commit-tree`, `git stash`, `git cherry-pick`,
+   `git rebase`, `gh pr create` and similar are not detected as commits by the agent hooks (a one-off
+   `git -c alias.*` is blocked). The git hooks, which `init --hooks <client>` writes by default since 1.2.0, close part
+   of this: `pre-commit` runs for every `git commit`, also through an alias, and `pre-push` gates every push of
+   commits made by `merge`, `cherry-pick`, `am` or `commit-tree`. `--no-verify` still skips them. The Stop hook
    catches uncommitted work only. With `config.stopGate: "warn"` it does not even block that: the turn ends with a
    `WARN (stopbar)` answer and a `stop:warn` entry in `events.jsonl`. This mode takes no kernel step at Stop and does not
    weaken the commit gate: `git commit` and `git push` in the agent hooks and in the git hooks are judged by the kernel
@@ -176,6 +196,22 @@ the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gi
 
 ## Known limits of 1.2.0
 
+- `safeTools` in `HALT`: a halted session still lets the tools in `config.safeTools` through. A human who adds a glob
+  there vouches that those tools are local; with a broad glob (for example `mcp__*`) a halted agent keeps those tools.
+  Edit, Write, Read, the shell and every tool outside the list stay paused.
+- `--require-run` decides by the event's source (`stopbar run` or an agent hook), not by what ran. Without it, the
+  exact gate command from the agent's shell still counts, as before.
+- Quote splicing: only quotes inside a word are undone (`.e""nv`, `.e"n"v`). A path built at run time
+  (`g=.g; d=$g"it"`), a backslash escape, a variable or a script (`node /tmp/x.js`) passes the text checks; section 3
+  point 1. Only an OS sandbox closes this.
+- The stdin heredoc exception trusts the command on the header line not to run its stdin. Stopbar knows the common
+  shells and interpreters (and `xargs`, `at`, `tee`, `stopbar`); another program that executes stdin passes. The
+  exception covers only `HUMAN_ONLY` and `STOPBAR_ADMIN`; every other check still reads the body.
+- Git hooks by default: a foreign `pre-commit` or `pre-push` is kept with a `WARN` when the git hooks were added by
+  default; then that git action is not gated until a human runs `stopbar upgrade --hooks git --force-hooks`.
+  `stopbar doctor` reports `[WARN] hooks git` while one of the two Stopbar git hooks is missing.
+- `stopbar doctor` checks the kernel link only where `gdp-wired` resolves from the running copy (`import.meta.resolve`).
+  A pinned runtime outside any `node_modules` tree reports `[WARN] kernel link`; run `stopbar prove` in the package.
 - `--cmd`: the command runs through the system shell (`cmd.exe` on Windows, `/bin/sh` elsewhere), so quoting follows
   that shell. A shell can hold stdout open after the program closed it; then only `--cmd-timeout` (default 300000 ms)
   ends the wait.
@@ -210,11 +246,13 @@ the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gi
 - `buildCmd` and `fullTestCmd` that differ only in whitespace at the ends count as equal and are refused. Two different
   commands that run the same script (for example `npm test` and `npm run test`) are not detected.
 
-- Lean: the check needs Docker and a one-time image build with network access. The base image is pinned by digest and
+- Lean: the check needs Docker and a one-time image build with network access, or (since 1.2.0, used in CI) Lean
+  4.34.0 on `PATH` with `node scripts/verify-lean.ts --local`. The base image is pinned by digest and
   the Lean archive by sha256, both recorded at the first build (trust on first use). The Lean export is not
   deterministic: each export is a different proof tree, and the gate checks the one it exports.
 - Platforms: the unit tests, E2E, `stopbar probe` and `stopbar prove` pass on Windows 11 with Git for Windows and on
-  Linux (Debian 13, Node 24, git 2.47). A live Claude Code session ran on Windows. macOS is not tested.
+  Linux (Debian 13, Node 24, git 2.47). A live Claude Code session ran on Windows. macOS runs only in CI (since
+  1.2.0, `.github/workflows/ci.yml`).
 - Adapters: Cursor, Codex CLI, Gemini CLI and Antigravity CLI are spec-tested (see the README table); a client can
   change its hook schema in a later version.
 - Hook latency: Windows starts a process in 50–70 ms, so a hook with one git process takes about 120–200 ms in all.

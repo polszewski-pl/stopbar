@@ -12,6 +12,23 @@ import {codeDirs} from './pkg.ts'
 
 export type Out = {code: number; msg?: string}
 type Ctx = {repo: Repo; cfg: Config; s: Saved; protect: K.Protect; dirty: boolean; now?: Snap}
+/** A hook event: Claude Code's JSON object (adapters translate other clients into it). Fields are read with guards. */
+export type HookEvent = Record<string, unknown>
+/** Stopbar's own fields on an event: set by the adapters and by `stopbar run`, never by the agent's client. */
+type Meta = {adapter?: string; rawKeys?: unknown; expectedSnapshot?: string; expectedRev?: number; requireExitCode?: boolean}
+
+const obj = (x: unknown): Record<string, unknown> => (x && typeof x === 'object' && !Array.isArray(x) ? x as Record<string, unknown> : {})
+const strings = (...xs: unknown[]): string[] => xs.flatMap((x) => (Array.isArray(x) ? x as unknown[] : [x])).filter((x): x is string => typeof x === 'string' && x.length > 0)
+function metaOf(x: unknown): Meta {
+  const m = obj(x)
+  return {
+    ...(typeof m.adapter === 'string' ? {adapter: m.adapter} : {}),
+    ...(m.rawKeys !== undefined ? {rawKeys: m.rawKeys} : {}),
+    ...(typeof m.expectedSnapshot === 'string' ? {expectedSnapshot: m.expectedSnapshot} : {}),
+    ...(typeof m.expectedRev === 'number' ? {expectedRev: m.expectedRev} : {}),
+    ...(m.requireExitCode === true ? {requireExitCode: true} : {}),
+  }
+}
 
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS'])
@@ -76,42 +93,48 @@ function syncTree(ctx: Ctx, cost: number, source: string) {
 
 const block = (reason: string): Out => ({code: 2, msg: `BLOCK (stopbar): ${reason}`})
 
-function isBackgroundInput(ti: any): boolean {
-  return ti?.run_in_background === true || ti?.run_in_background === 'true' || ti?.background === true
+function isBackgroundInput(ti: Record<string, unknown>): boolean {
+  return ti.run_in_background === true || ti.run_in_background === 'true' || ti.background === true
 }
-function isBackgroundResponse(tr: any): boolean {
-  if (!tr || typeof tr !== 'object') return false
-  return (typeof tr.backgroundTaskId === 'string' && tr.backgroundTaskId.length > 0) ||
-    (typeof tr.background_task_id === 'string' && tr.background_task_id.length > 0) ||
-    tr.isAsync === true || tr.background === true
+function isBackgroundResponse(tr: unknown): boolean {
+  const r = obj(tr)
+  return (typeof r.backgroundTaskId === 'string' && r.backgroundTaskId.length > 0) ||
+    (typeof r.background_task_id === 'string' && r.background_task_id.length > 0) ||
+    r.isAsync === true || r.background === true
 }
 
 // ---------------------------------------------------------------- PreToolUse
-function pre(ctx: Ctx, input: any): Out {
-  const tool = String(input.tool_name ?? ''), ti = input.tool_input ?? {}
+function pre(ctx: Ctx, input: HookEvent): Out {
+  const tool = String(input.tool_name ?? ''), ti = obj(input.tool_input)
   const {repo, cfg} = ctx
+  const shell = tool === 'PowerShell' ? 'powershell' as const : 'bash' as const
   // self-protection: unconditional, before the kernel, also when halted
   if (EDIT_TOOLS.has(tool)) {
-    const list = [ti.file_path, ti.notebook_path, ti.path, ...(Array.isArray(ti.file_paths) ? ti.file_paths : [])]
-    for (const p of list.filter((x) => typeof x === 'string' && x)) {
+    for (const p of strings(ti.file_path, ti.notebook_path, ti.path, ti.file_paths)) {
       const why = K.protectedPath(resolve(repo.root, p), repo.root, ctx.protect)
       if (why) { appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: why, path: p}); return block(`writing ${p} is not allowed: ${why}. Ask the human.`) }
     }
   }
   if (SHELL_TOOLS.has(tool)) {
     const cmd = String(ti.command ?? '')
-    const why = K.protectedCommand(K.commandForSelfProtect(cmd, tool === 'PowerShell' ? 'powershell' : 'bash'), ctx.protect)
+    const why = K.protectedCommand(K.commandForSelfProtect(cmd, shell), ctx.protect, shell)
     if (why) { appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: why}); return block(`${why}. Ask the human.`) }
   }
   const v = decode(ctx.s.kernel)
+  // local tools in config.safeTools (task list, turn summary, messages between local sessions) never take a kernel step,
+  // so they stay allowed while halted: the agent can still ask a human for `stopbar resume`. File, shell and every
+  // other tool stay paused.
+  if (!EDIT_TOOLS.has(tool) && !READ_TOOLS.has(tool) && !SHELL_TOOLS.has(tool) && matchAny(tool, cfg.safeTools ?? DEFAULT_SAFE_TOOLS)) {
+    if (v.halted) appendEvent(repo, {source: 'pre', tool, wrapper: 'ALLOW', reason: 'safe tool while halted'})
+    return {code: 0}
+  }
   if (v.halted) {
     appendEvent(repo, {source: 'pre', tool, wrapper: 'PAUSE', reason: 'halted'})
     return {code: 2, msg: `PAUSE (stopbar): the session is halted (testFails=${v.testFails}, buildFails=${v.buildFails}, spent=${v.spent}/${v.capNow}). A human must run: stopbar resume --extra <n>`}
   }
   const cost = cfg.costPerCall
   if (READ_TOOLS.has(tool)) {
-    const ps = [ti.file_path, ti.path, ti.glob, ti.pattern, ...(Array.isArray(ti.file_paths) ? ti.file_paths : [])].filter((x) => typeof x === 'string' && x)
-    for (const p of ps) {
+    for (const p of strings(ti.file_path, ti.path, ti.glob, ti.pattern, ti.file_paths)) {
       const pattern = K.secretPattern(p, cfg.paths)
       if (pattern) { step(ctx, {op: 'READ_SECRET', cost}, `pre:${tool}`, {secret: {pattern, path: p, tool}}); break }
     }
@@ -122,7 +145,7 @@ function pre(ctx: Ctx, input: any): Out {
     const cmd = String(ti.command ?? '')
     const base = typeof input.cwd === 'string' && input.cwd ? input.cwd : repo.root
     const exists = (t: string) => existsSync(resolve(base, t)) || existsSync(resolve(repo.root, t))
-    const k = K.classifyBash(cmd, cfg, tool === 'PowerShell' ? 'powershell' : 'bash', exists)
+    const k = K.classifyBash(cmd, cfg, shell, exists)
     if (k.kind === 'commit-chained') {
       appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: `chained commit (${k.reason})`})
       return block(`run \`git commit\` / \`git push\` as a single command (${k.reason}): no &&, ;, |, redirections or $(...). ` +
@@ -159,8 +182,7 @@ function pre(ctx: Ctx, input: any): Out {
     }
     return {code: 0}
   }
-  if (OUTBOUND(tool)) {
-    if (matchAny(tool, cfg.safeTools ?? DEFAULT_SAFE_TOOLS)) return {code: 0} // local tools listed in config.safeTools
+  if (OUTBOUND(tool)) { // tools in config.safeTools returned above
     const {after} = step(ctx, {op: 'SHELL', risky: true, cost}, `pre:${tool}`)
     if (after.decision === 'PAUSE') return {code: 2, msg: `PAUSE (stopbar): ${tool} is outbound and a secret was read (or the budget is spent); a human runs \`stopbar approve-shell\` or \`stopbar resume\``}
   }
@@ -170,27 +192,27 @@ function pre(ctx: Ctx, input: any): Out {
 // ---------------------------------------------------------------- PostToolUse / PostToolUseFailure
 // Claude Code sends PostToolUse after success and PostToolUseFailure after an error (non-zero exit of Bash).
 // PostToolUse carries no exit code: success unless is_error / interrupted. Failure is the event type itself.
-function exitCodeOf(tr: any): number | undefined {
-  if (!tr || typeof tr !== 'object') return undefined
-  for (const k of ['exitCode', 'exit_code', 'returnCode', 'code']) if (typeof tr[k] === 'number') return tr[k]
+function exitCodeOf(tr: unknown): number | undefined {
+  const r = obj(tr)
+  for (const k of ['exitCode', 'exit_code', 'returnCode', 'code']) { const v = r[k]; if (typeof v === 'number') return v }
   return undefined
 }
 
-function post(ctx: Ctx, input: any, failure: boolean): Out {
-  const tool = String(input.tool_name ?? ''), ti = input.tool_input ?? {}
+function post(ctx: Ctx, input: HookEvent, failure: boolean): Out {
+  const tool = String(input.tool_name ?? ''), ti = obj(input.tool_input)
   const {repo, cfg} = ctx
   const msgs: string[] = []
   if (SHELL_TOOLS.has(tool)) {
     const k = K.classifyBash(String(ti.command ?? ''), cfg, tool === 'PowerShell' ? 'powershell' : 'bash')
-    const tr = input.tool_response
-    const meta = input.stopbar ?? {}
-    appendEvent(repo, {source: `payload:${input.hook_event_name}`, tool, ...(meta.adapter ? {adapter: meta.adapter, rawKeys: meta.rawKeys} : {inputKeys: Object.keys(input)}),
+    const tr = input.tool_response, r = obj(tr)
+    const meta = metaOf(input.stopbar)
+    appendEvent(repo, {source: `payload:${String(input.hook_event_name)}`, tool, ...(meta.adapter ? {adapter: meta.adapter, rawKeys: meta.rawKeys} : {inputKeys: Object.keys(input)}),
       toolResponseKeys: tr && typeof tr === 'object' ? Object.keys(tr) : typeof tr})
     const bg = isBackgroundInput(ti) || isBackgroundResponse(tr)
     const staleRun = typeof meta.expectedSnapshot === 'string' &&
       (meta.expectedSnapshot !== ctx.s.snapshot || (typeof meta.expectedRev === 'number' && meta.expectedRev !== decode(ctx.s.kernel).treeRev))
     const code = exitCodeOf(tr)
-    const flagged = input.is_error === true || tr?.is_error === true || tr?.interrupted === true
+    const flagged = input.is_error === true || r.is_error === true || r.interrupted === true
     // some clients send the same post event for success and failure: then only an explicit exit code 0 is a pass
     const unknown = meta.requireExitCode === true && code === undefined
     const passed = failure ? false : code !== undefined ? code === 0 : !flagged && !unknown
@@ -198,10 +220,15 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
     if (failure && input.is_interrupt === true) {
       // Ctrl+C by the user: not a failed gate and not a retry; the tree is still checked below
       appendEvent(repo, {source: 'post:user-interrupt', tool, kind: k.kind})
+    } else if (cfg.requireRun === true && meta.adapter !== 'run' && (k.kind === 'build' || k.kind === 'fulltest')) {
+      // config.requireRun: a gate counts only through `stopbar run build|test`, never from the agent's own shell
+      const which = k.kind === 'build' ? 'build' : 'test'
+      appendEvent(repo, {source: 'post:require-run', tool, kind: k.kind, ...(meta.adapter ? {adapter: meta.adapter} : {})})
+      msgs.push(`NOTE (stopbar): this repository records gates only through \`${runHint(cfg, which)}\` (config.requireRun), so \`${k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd}\` run from the agent's shell is not recorded. Run \`${runHint(cfg, which)}\` instead: it runs the same command and records its real exit status.`)
     } else if (!failure && bg && (k.kind === 'build' || k.kind === 'fulltest' || (k.kind === 'shell' && k.partialTests))) {
       // a background launch fires PostToolUse before the process finishes (e.g. Claude Code backgroundTaskId): never count it
       appendEvent(repo, {source: 'post:background-gate-ignored', tool, kind: k.kind === 'shell' ? 'partial-tests' : k.kind,
-        ...(typeof tr?.backgroundTaskId === 'string' ? {backgroundTaskId: tr.backgroundTaskId} : typeof tr?.background_task_id === 'string' ? {backgroundTaskId: tr.background_task_id} : {})})
+        ...(typeof r.backgroundTaskId === 'string' ? {backgroundTaskId: r.backgroundTaskId} : typeof r.background_task_id === 'string' ? {backgroundTaskId: r.background_task_id} : {})})
       if (k.kind !== 'shell') {
         const which = k.kind === 'build' ? 'build' : 'test'
         const gate = k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd
@@ -236,7 +263,7 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
 // ---------------------------------------------------------------- Stop: "I am done" = the COMMIT gate when the tree differs from HEAD
 // stopGate 'warn': the turn may end with unverified changes (e.g. to ask the human a question). Only the Stop hook
 // changes: no COMMIT step is taken, so `git commit` / `git push` in PreToolUse and the git hooks stay fully gated.
-function stop(ctx: Ctx, input: any): Out {
+function stop(ctx: Ctx, input: HookEvent): Out {
   if (input.stop_hook_active) return {code: 0}
   syncTree(ctx, 0, 'stop:sync')
   if (!differsFromHead(ctx.repo, ctx.now!.entries)) return {code: 0}
@@ -262,14 +289,14 @@ export function failMsg(e: unknown): string {
 
 /** One hook call with Claude Code's JSON on stdin (the v1.0 interface). Never throws. */
 export function runHook(raw: string, t0 = performance.now()): Out {
-  let input: any
+  let input: unknown
   try { input = JSON.parse(raw) } catch (e) { return {code: 2, msg: `STOPBAR FAIL-CLOSED: hook input is not JSON (${(e as Error).message})`} }
   if (!input || typeof input !== 'object') return {code: 2, msg: 'STOPBAR FAIL-CLOSED: hook input must be a JSON object'}
-  return runEvent(input, t0)
+  return runEvent(input as HookEvent, t0)
 }
 
 /** One normalised hook event (Claude Code's shape; adapters translate other clients into it). Never throws. */
-export function runEvent(input: any, t0 = performance.now()): Out {
+export function runEvent(input: HookEvent, t0 = performance.now()): Out {
   try {
     const repo = findRepo(typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd())
     const g0 = gitCalls
@@ -282,7 +309,7 @@ export function runEvent(input: any, t0 = performance.now()): Out {
           : ev === 'PostToolUseFailure' ? post(ctx, input, true)
             : ev === 'Stop' ? stop(ctx, input) : {code: 0}
       if (ctx.dirty) writeState(repo, ctx.s)
-      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, ...(input.stopbar?.adapter ? {adapter: input.stopbar.adapter} : {}), exit: res.code, gitCalls: gitCalls - g0,
+      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, ...(metaOf(input.stopbar).adapter ? {adapter: metaOf(input.stopbar).adapter} : {}), exit: res.code, gitCalls: gitCalls - g0,
         handlerMs: Math.round(performance.now() - t0), processMs: Math.round(process.uptime() * 1000)})
       return res
     })

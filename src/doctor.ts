@@ -68,8 +68,8 @@ function stopbarCommands(events: Record<string, unknown> | undefined): Record<st
   return out
 }
 
-/** Other clients and the git fallback. Returns how many have Stopbar hooks. */
-function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: string) => void): number {
+/** Other clients and the git fallback. Returns how many clients have Stopbar hooks, and how many Stopbar git hooks exist. */
+function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: string) => void): {clients: number; git: number} {
   let found = 0
   const clients: [string, string, (j: any) => Record<string, unknown> | undefined, string[]][] = [
     ['cursor', join(repo.root, '.cursor', 'hooks.json'), (j) => j.hooks, ['preToolUse', 'postToolUse', 'postToolUseFailure', 'stop']],
@@ -94,8 +94,11 @@ function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: s
   let dir = join(repo.gitDir, 'hooks')
   try { const rel = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], {cwd: repo.root, encoding: 'utf8'}).trim(); dir = isAbsolute(rel) ? rel : join(repo.root, rel) } catch { /* default */ }
   const gh = ['pre-commit', 'pre-push'].filter((n) => existsSync(join(dir, n)) && readFileSync(join(dir, n), 'utf8').includes('stopbar.mjs" git-hook'))
-  if (gh.length) { found++; add(gh.length === 2 ? 'OK' : 'WARN', 'hooks git', `${gh.join(', ')} in ${dir}${gh.length === 2 ? '' : ' (one of pre-commit, pre-push is missing)'}`) }
-  return found
+  const lacking = ['pre-commit', 'pre-push'].filter((n) => !gh.includes(n))
+  // the git hooks close what an agent hook cannot see: git aliases, and on pre-push merge, cherry-pick, am and commit-tree
+  if (!lacking.length) add('OK', 'hooks git', `pre-commit, pre-push in ${dir}`)
+  else add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in ${dir}: the git hooks close git aliases, and on pre-push merge, cherry-pick, am and commit-tree, which an agent hook does not see; a human runs \`stopbar upgrade --hooks git\``)
+  return {clients: found, git: gh.length}
 }
 
 /** The real hook pipeline (in process) on a scratch repository inside <git-dir>/stopbar/doctor-run. */
@@ -141,13 +144,16 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
   add(maj > 22 || (maj === 22 && min >= 18) ? 'OK' : 'FAIL', 'node', `v${process.versions.node} (needs >= 22.18)`)
   try { add('OK', 'git', execFileSync('git', ['--version'], {encoding: 'utf8'}).trim()) } catch { add('FAIL', 'git', 'git not found on PATH') }
   add(MACHINE.name === 'stopbar_kernel_none' ? 'OK' : 'FAIL', 'kernel', `${MACHINE.name}, kernel.ts sha256 ${MACHINE.kernelSha256.slice(0, 16)}, machine sha256 ${MACHINE.machineSha256.slice(0, 16)}`)
-  if (existsSync(join(PKG_ROOT, 'node_modules', 'gdp-wired')) && existsSync(join(PKG_ROOT, 'dist', 'kernel.js'))) {
+  // npm may hoist gdp-wired next to this package (npm install stopbar): resolve it as Node does, never by a fixed path
+  let prover = false
+  try { import.meta.resolve('gdp-wired/machine'); prover = true } catch { /* not resolvable: a pinned runtime has no node_modules */ }
+  if (prover && existsSync(join(PKG_ROOT, 'dist', 'kernel.js'))) {
     try {
       const {checkGenerated} = await import('./verify.ts')
       const g = await checkGenerated(500)
       add(g.ok ? 'OK' : 'FAIL', 'kernel link', `compileJs(kernel.ts) == dist/kernel.gen.js: ${g.sameMachine}; kernel.ts hash: ${g.sameSource}; ${(g.differential as any).steps} steps vs interpreter, ${(g.differential as any).mismatches} mismatches`)
     } catch (e) { add('WARN', 'kernel link', `not checked: ${(e as Error).message}`) }
-  } else add('WARN', 'kernel link', 'gdp-wired not installed next to this copy (pinned runtime): run `stopbar prove` in the package')
+  } else add('WARN', 'kernel link', 'gdp-wired cannot be resolved from this copy (a pinned runtime has no node_modules): run `stopbar prove` in the package')
 
   let repo: Repo | null = null
   try { repo = findRepo(o.repo ?? process.cwd()); add('OK', 'repository', `${repo.root} (state in ${repo.stateDir})`) } catch (e) { add('FAIL', 'repository', (e as Error).message) }
@@ -157,7 +163,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
       const cfg = readConfig(repo); cfgOk = true
       add('OK', 'config.json', `profile ${cfg.profile}; build \`${cfg.buildCmd}\`; full tests \`${cfg.fullTestCmd}\`; maxRetries ${cfg.maxRetries}; cap ${cfg.cap}; ` +
         `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}${cfg.baseRef ? `; baseRef ${cfg.baseRef}` : ''}; ` +
-        `stopGate ${cfg.stopGate ?? 'block'}; cli ${cliOf(cfg)}`)
+        `stopGate ${cfg.stopGate ?? 'block'}; cli ${cliOf(cfg)}${cfg.requireRun ? '; requireRun: true' : ''}`)
       if (cfg.stopGate === 'warn') add('WARN', 'stopGate', 'warn: Stop does not block a turn with unverified changes (logged as stop:warn); git commit and git push stay blocked until the gates pass')
       const safe = cfg.safeTools ?? DEFAULT_SAFE_TOOLS
       const missing = DEFAULT_SAFE_TOOLS.filter((t) => !safe.includes(t))
@@ -179,7 +185,11 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     } else if (cfgOk) add('WARN', 'pinned runtime', 'none: hooks run an unpinned copy (init --no-pin)')
     const others = checkOtherClients(repo, add)
     const claudeHas = ['settings.json', 'settings.local.json'].some((n) => { const h = hooksIn(join(repo!.root, '.claude', n)); return h !== null && Object.keys(stopbarCommands(h)).length > 0 })
-    if (claudeHas || others === 0) checkHooks(repo.root, add) // without any client hooks, report the Claude Code ones as missing (v1.0 output)
+    // Claude Code hooks named at the last init or upgrade must be there, also when other hooks (now the git hooks by
+    // default) exist; without any client hooks, the Claude Code ones are reported as missing (v1.0 output)
+    const named = ev.events.filter((e) => (e.source === 'human:init' || e.source === 'human:upgrade') && Array.isArray(e.hooks)).at(-1)?.hooks as unknown[] | undefined
+    const wantClaude = !!named?.some((t) => t === 'claude' || t === 'claude-project')
+    if (claudeHas || (others.clients === 0 && (others.git === 0 || wantClaude))) checkHooks(repo.root, add)
     try { dryRun(repo.stateDir, add) } catch (e) { add('FAIL', 'dry run', String(e)) }
   }
   const fails = checks.filter((c) => c.status === 'FAIL').length, warns = checks.filter((c) => c.status === 'WARN').length

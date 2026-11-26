@@ -19,14 +19,18 @@ rmSync(DIST, {recursive: true, force: true})
 mkdirSync(DIST, {recursive: true})
 
 // 1. src/**/*.ts -> dist/**/*.js (types erased, positions kept; relative .ts imports become .js)
-const files = (readdirSync(SRC, {recursive: true}) as string[]).map((f) => f.replace(/\\/g, '/')).filter((f) => f.endsWith('.ts'))
+const files = (readdirSync(SRC, {recursive: true}) as string[]).map((f) => f.replace(/\\/g, '/')).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts'))
 for (const f of files) {
   const code = stripTypeScriptTypes(readFileSync(join(SRC, f), 'utf8'), {mode: 'strip'})
   const js = code.replace(/((?:from\s+|import\s*\(\s*)['"])(\.{1,2}\/[^'"]+?)\.ts(['"])/g, '$1$2.js$3')
   if (/from\s+['"]\.{1,2}\/[^'"]+\.ts['"]|import\(\s*['"]\.{1,2}\/[^'"]+\.ts['"]/.test(js)) throw new Error(`${f}: a .ts import was not rewritten`)
   mkdirSync(dirname(join(DIST, f)), {recursive: true})
   writeFileSync(join(DIST, f.replace(/\.ts$/, '.js')), `// Built from src/${f} by scripts/build.ts. Do not edit.\n${js}`)
+  // types for `npm run typecheck`: the tests import dist/*.js, whose types are those of src/*.ts (not in the npm package)
+  const up = '../'.repeat(f.split('/').length)
+  writeFileSync(join(DIST, f.replace(/\.ts$/, '.d.ts')), `// Types of dist/${f.replace(/\.ts$/, '.js')} for the typecheck. Written by scripts/build.ts.\nexport * from '${up}src/${f}'\n`)
 }
+writeFileSync(join(DIST, 'kernel.gen.d.ts'), "// Types of dist/kernel.gen.js for the typecheck. Written by scripts/build.ts.\nexport * from '../src/kernel.gen.d.ts'\n")
 
 // 2. the proven rule -> standalone step function, plus the codec between the wrapper's requests and the machine's numbers
 const kernelSrc = readFileSync(join(SRC, 'kernel.ts'))

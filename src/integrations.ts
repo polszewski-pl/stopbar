@@ -104,7 +104,10 @@ function antigravityFile(root: string, command: string) {
   return f
 }
 
-function gitHooks(repo: Repo, runtimeRoot: string, force: boolean): string[] {
+/** A foreign pre-commit or pre-push hook: 'fail' (git named in --hooks), 'backup' (--force-hooks: kept as
+ *  <name>.stopbar-backup, then replaced) or 'keep' (git added by default: the foreign hook stays, with a warning). */
+type Foreign = 'fail' | 'backup' | 'keep'
+function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: string) => void): string[] {
   const rel = git(repo.root, ['rev-parse', '--git-path', 'hooks'])
   const dir = isAbsolute(rel) ? rel : resolve(repo.root, rel)
   mkdirSync(dir, {recursive: true})
@@ -114,7 +117,11 @@ function gitHooks(repo: Repo, runtimeRoot: string, force: boolean): string[] {
     const f = join(dir, name)
     const body = `#!/bin/sh\n# Stopbar fallback gate, written by \`stopbar init --hooks git\`.\nexec node "${bin}" git-hook ${name}\n`
     if (existsSync(f) && !readFileSync(f, 'utf8').includes('stopbar.mjs" git-hook')) {
-      if (!force) throw new FailClosed(`${f} exists and is not a Stopbar hook; not overwriting it`, 'remove it, chain it by hand, or run init again with --force-hooks (the old hook is kept as <name>.stopbar-backup)')
+      if (foreign === 'keep') {
+        warn(`WARN: ${f} exists and is not a Stopbar hook; kept it, so git ${name === 'pre-commit' ? 'commit' : 'push'} is not gated by Stopbar here. To replace it (the old hook is kept as ${name}.stopbar-backup): stopbar upgrade --hooks git --force-hooks`)
+        continue
+      }
+      if (foreign === 'fail') throw new FailClosed(`${f} exists and is not a Stopbar hook; not overwriting it`, 'remove it, chain it by hand, or run init again with --force-hooks (the old hook is kept as <name>.stopbar-backup)')
       renameSync(f, `${f}.stopbar-backup`)
     }
     writeFileSync(f, body)
@@ -124,9 +131,11 @@ function gitHooks(repo: Repo, runtimeRoot: string, force: boolean): string[] {
   return out
 }
 
-/** Installs every target; returns one line per written file. */
-export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string, force: boolean): string[] {
+/** Installs every target; returns one line per written file. `gitByDefault`: git was not named in --hooks but added by
+ *  init, so a foreign git hook is kept with a warning (`warn`) instead of failing; --force-hooks still replaces it. */
+export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string, force: boolean, o: {gitByDefault?: boolean; warn?: (s: string) => void} = {}): string[] {
   const lines: string[] = []
+  const foreign: Foreign = force ? 'backup' : o.gitByDefault ? 'keep' : 'fail'
   for (const t of targets) {
     if (t === 'claude') lines.push(`claude: ${claudeFile(repo.root, 'settings.local.json', hookCommand(runtimeRoot))}`)
     else if (t === 'claude-project') lines.push(`claude: ${claudeFile(repo.root, 'settings.json', hookCommand(runtimeRoot))}`)
@@ -134,7 +143,7 @@ export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string,
     else if (t === 'codex') lines.push(`codex: ${codexFile(repo.root, hookCommand(runtimeRoot, 'codex'))}`)
     else if (t === 'gemini') lines.push(`gemini: ${geminiFile(repo.root, hookCommand(runtimeRoot, 'gemini'))}`)
     else if (t === 'antigravity') lines.push(`antigravity: ${antigravityFile(repo.root, hookCommand(runtimeRoot, 'antigravity'))}`)
-    else if (t === 'git') for (const f of gitHooks(repo, runtimeRoot, force)) lines.push(`git: ${f}`)
+    else if (t === 'git') for (const f of gitHooks(repo, runtimeRoot, foreign, o.warn ?? (() => {}))) lines.push(`git: ${f}`)
   }
   return lines
 }

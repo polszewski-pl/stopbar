@@ -20,13 +20,16 @@ export type Config = {
   cliCmd?: string
   /** Stop hook: 'block' (missing = block) refuses "done" with unverified changes; 'warn' only logs and warns. Commit and push stay gated. */
   stopGate?: StopGate
+  /** true: the build and full test gates count only through `stopbar run build|test`; the same command run from the
+   *  agent's own shell is not recorded (missing = false). */
+  requireRun?: boolean
 }
 export type StopGate = 'block' | 'warn'
 export const STOP_GATES: readonly StopGate[] = ['block', 'warn']
 /** Hint command when config.cliCmd is not set: uses an installed stopbar only, never downloads it from the registry. */
 export const DEFAULT_CLI = 'npx --no-install stopbar'
 
-const TEST_COMMON = ['**/tests/**', '**/test/**', '**/__tests__/**']
+const TEST_COMMON = ['**/tests/**', '**/test/**', '**/__tests__/**', 'scripts/*test*']
 const TEST_JS = ['**/*.test.*', '**/*.spec.*', '**/e2e/**']
 const TEST_PY = ['**/test_*.py', '**/*_test.py']
 const TEST_OTHER = ['**/*_test.go', '**/*_test.rs', '**/*Test.java', '**/*Tests.cs']
@@ -105,6 +108,7 @@ export function validateConfig(c: unknown): Config {
   if (o.stopGate !== undefined && !STOP_GATES.includes(o.stopGate as StopGate)) {
     throw new ConfigError(`config.stopGate must be ${STOP_GATES.map((g) => JSON.stringify(g)).join(' or ')}, got ${JSON.stringify(o.stopGate)}`)
   }
+  if (o.requireRun !== undefined && typeof o.requireRun !== 'boolean') throw new ConfigError(`config.requireRun must be true or false, got ${JSON.stringify(o.requireRun)}`)
   return o as unknown as Config
 }
 
@@ -130,7 +134,7 @@ export function isSafeRef(ref: string): boolean {
 }
 
 export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number; baseRef?: string
-  cliCmd?: string; stopGate?: string}): Config {
+  cliCmd?: string; stopGate?: string; requireRun?: boolean}): Config {
   const profile = a.profile ?? 'default'
   const paths = PROFILES[profile]
   if (!paths) throw new ConfigError(`unknown profile ${JSON.stringify(profile)}; known: ${Object.keys(PROFILES).join(', ')}`)
@@ -144,5 +148,6 @@ export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: 
     ...(baseRef && baseRef !== 'HEAD' ? {baseRef} : {}),
     ...(cliCmd !== undefined ? {cliCmd} : {}),
     ...(a.stopGate !== undefined ? {stopGate: a.stopGate} : {}),
+    ...(a.requireRun === true ? {requireRun: true} : {}),
   })
 }

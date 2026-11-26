@@ -3,7 +3,7 @@
 import {cpSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {hasChain, protectedCommand} from './classify.ts'
-import {CLAUDE_POST_MATCHER, claudeHooks, hookCommand, installHooks, parseTargets} from './integrations.ts'
+import {CLAUDE_POST_MATCHER, claudeHooks, hookCommand, installHooks, parseTargets, type Target} from './integrations.ts'
 import {cliOf, type Config, ConfigError, DEFAULT_SAFE_TOOLS, makeConfig, PROFILES} from './config.ts'
 import {decode, initKernel, kstep, MACHINE, type Req} from './engine.ts'
 import {classifyChanges, whyBlocked} from './hook.ts'
@@ -66,7 +66,8 @@ export function pinRuntime(r: Repo): string {
   const dst = join(r.stateDir, 'runtime')
   rmSync(dst, {recursive: true, force: true})
   mkdirSync(dst, {recursive: true})
-  for (const n of ['bin', 'dist']) cpSync(join(PKG_ROOT, n), join(dst, n), {recursive: true})
+  // the .d.ts files in dist/ only type the tests (npm run typecheck); the runtime never loads them
+  for (const n of ['bin', 'dist']) cpSync(join(PKG_ROOT, n), join(dst, n), {recursive: true, filter: (f) => !f.endsWith('.d.ts')})
   for (const n of ['package.json', 'LICENSE']) if (existsSync(join(PKG_ROOT, n))) cpSync(join(PKG_ROOT, n), join(dst, n))
   return dst
 }
@@ -81,11 +82,11 @@ export function init(o: Opts): Out {
   for (const [k, v] of [['--build', buildCmd], ['--test', fullTestCmd]]) {
     if (hasChain(v)) return {code: 1, msg: `${k} ${JSON.stringify(v)} has shell operators; put it in one script (e.g. an npm script) so its exit status is the gate`}
   }
-  for (const f of ['cli', 'stop-gate']) if (o.has(f) && o.get(f) === undefined) return {code: 1, msg: `--${f} needs a value`}
+  for (const f of ['cli', 'stop-gate', 'hooks']) if (o.has(f) && o.get(f) === undefined) return {code: 1, msg: `--${f} needs a value`}
   let cfg: Config
   try {
     cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1), baseRef: o.get('base-ref'),
-      cliCmd: o.get('cli'), stopGate: o.get('stop-gate')})
+      cliCmd: o.get('cli'), stopGate: o.get('stop-gate'), requireRun: o.has('require-run')})
   } catch (e) { if (e instanceof ConfigError) return {code: 1, msg: e.message}; throw e }
   if (existsSync(paths(repo).config) && !o.has('force')) return {code: 1, msg: `already initialised (${paths(repo).config}); use --force to replace config and state`}
   const pin = !o.has('no-pin')
@@ -100,7 +101,12 @@ export function init(o: Opts): Out {
     return {code: 1, msg: `--base-ref ${JSON.stringify(cfg.baseRef)} does not resolve to a commit/tree in ${repo.root}`}
   }
   const hooksOpt = o.get('hooks')
-  const targets = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
+  const named = hooksOpt === undefined ? [] : parseTargets(hooksOpt) // validated before anything is written
+  if (o.has('no-git-hooks') && named.includes('git')) return {code: 1, msg: '--no-git-hooks and --hooks ...git exclude each other'}
+  // the git hooks close what an agent hook cannot see (git aliases, merge, cherry-pick, am, commit-tree before a push):
+  // added to every --hooks <client> unless --no-git-hooks
+  const gitByDefault = named.length > 0 && !named.includes('git') && !o.has('no-git-hooks')
+  const targets: Target[] = gitByDefault ? [...named, 'git'] : named
   mkdirSync(repo.stateDir, {recursive: true})
   return withLock(repo, () => {
     const {s, snap} = freshWithSnap(repo, cfg)
@@ -109,14 +115,17 @@ export function init(o: Opts): Out {
     writeState(repo, s)
     const runtime = pin ? pinRuntime(repo) : PKG_ROOT
     const command = hookCommand(runtime)
-    appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE})
+    appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE, ...(targets.length ? {hooks: targets} : {})})
     const warn = countDirtyTests(repo, s, dirty, 'init:dirty-tests')
     const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}${cfg.baseRef ? `; base ref: ${cfg.baseRef}` : ''}`,
-      `  stop gate: ${cfg.stopGate ?? 'block'}; gate hints use: ${cliOf(cfg)} run build|test`,
+      `  stop gate: ${cfg.stopGate ?? 'block'}; gate hints use: ${cliOf(cfg)} run build|test${cfg.requireRun ? '; requireRun: true (gates count only through stopbar run build|test)' : ''}`,
       `  hooks run: ${command}`]
-    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
+    const warns: string[] = []
+    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'), {gitByDefault, warn: (w) => warns.push(w)})) lines.push(`  hooks written: ${l}`)
     else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
-    lines.push(...warn, 'Next: restart the agent in this repository and run `stopbar doctor`.')
+    if (gitByDefault) lines.push('  git hooks (pre-commit, pre-push) were added to --hooks by default; pass --no-git-hooks to skip them')
+    else if (named.length && o.has('no-git-hooks')) lines.push('  WARN: --no-git-hooks: git aliases, merge, cherry-pick, am and commit-tree are not gated before a push; stopbar doctor reports it')
+    lines.push(...warns.map((w) => `  ${w}`), ...warn, 'Next: restart the agent in this repository and run `stopbar doctor`.')
     return {code: 0, msg: lines.join('\n')}
   })
 }
@@ -172,6 +181,7 @@ function statusText(repo: Repo, cfg: Config, s: Saved): string {
     `session    ${v.halted ? 'HALTED' : 'running'}   spent ${v.spent}/${v.capNow}   test failures ${v.testFails}/${s.params.maxRetries}   build failures ${v.buildFails}/${s.params.maxRetries}`,
     `commit     ${commit}`,
     `stop gate  ${cfg.stopGate ?? 'block'}${cfg.stopGate === 'warn' ? '   (Stop only warns; git commit and git push stay blocked until the gates pass)' : ''}`,
+    ...(cfg.requireRun ? ['requireRun true   (the build and full test gates count only through stopbar run build|test)'] : []),
     ...(torn ? [`event log  ${torn} torn line(s) kept as they are (see stopbar doctor)`] : []),
   ].join('\n')
 }
@@ -190,7 +200,7 @@ export function human(cmd: string, o: Opts): Out {
     }
     const s = readState(repo)
     if (cmd === 'status') {
-      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, stopGate: cfg.stopGate ?? 'block', snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
+      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, stopGate: cfg.stopGate ?? 'block', ...(cfg.requireRun ? {requireRun: true} : {}), snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
         secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null}, null, 1) : statusText(repo, cfg, s)}
     }
     let res: Out

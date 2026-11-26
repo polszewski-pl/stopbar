@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {classifyBash, classifyTreeChange, commandForSelfProtect, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath} from '../../dist/classify.js'
+import {classifyBash, classifyTreeChange, commandForSelfProtect, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath, unsplice, withoutStdinHeredoc} from '../../dist/classify.js'
 import {makeConfig, PROFILES, validateConfig} from '../../dist/config.js'
 import {globToRegExp, matchAny} from '../../dist/glob.js'
 
@@ -206,4 +206,76 @@ test('config: baseRef validation and makeConfig defaults', () => {
   for (const bad of ['', '  ', '--evil', 'main..HEAD', 'a b', 'main.', 'main/', 'a;b']) {
     assert.throws(() => validateConfig({...cfg, baseRef: bad}), /baseRef/, JSON.stringify(bad))
   }
+})
+
+test('self-protection: git -c alias.* is blocked (it hides the real subcommand); other -c settings pass', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  for (const c of ['git -c alias.ci=commit ci', 'git -c "alias.ci=commit" ci', "git -c 'alias.ci=commit' ci -m x", 'git -calias.ci=commit ci',
+    'git -C . -c alias.p=push p origin main', 'git -c Alias.ci=commit ci', 'git --config-env=alias.ci=CI_ALIAS ci', 'git -c al""ias.ci=commit ci',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.ci GIT_CONFIG_VALUE_0=commit git ci']) {
+    assert.match(protectedCommand(commandForSelfProtect(c, 'bash'), pr) ?? '', /alias/, c)
+  }
+  for (const c of ['git -c user.name=x commit -m "y"', 'git -c core.pager=cat log --oneline', 'git log --grep alias.ci', 'git -c color.ui=never status'])
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr), null, c)
+})
+
+test('quote splicing: .e""nv is .env, .g""it is .git, .cl\'\'aude is .claude (bash joins the parts of a word)', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  assert.equal(unsplice('cat .e""nv .e\'\'nv .e"n"v'), 'cat .env .env .env')
+  for (const c of ['cat .e""nv', "cat .e''nv", 'cat .e"n"v', 'cat "."env', 'less ./.e""nv.local']) {
+    assert.equal(secretInCommand(c, P, () => false)?.pattern, '.env*', c)
+    const k = classifyBash(c, cfg, 'bash', () => false)
+    assert.ok(k.kind === 'shell' && k.secret?.pattern === '.env*', c)
+  }
+  assert.equal(secretInCommand('cat id_""rsa', P, () => false)?.pattern, 'id_rsa*')
+  for (const c of ['rm -rf .g""it', "rm -rf .g''it/stopbar", 'cat .g"i"t/config', "echo x > .cl''aude/settings.json", 'rm -r .cu""rsor', 'stopbar app""rove-tests',
+    "npx stopbar res''ume --extra 9", 'git con""fig core.hooksPath x']) assert.ok(protectedCommand(commandForSelfProtect(c, 'bash'), pr), c)
+  // quotes in a plain commit message stay data, and empty quotes elsewhere change nothing
+  for (const c of ['git commit -m "fix .e\\"\\"nv parsing"', "git commit -m 'note: .g\"\"it is not touched'", 'echo "" ok', "printf '%s' '' x"])
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr), null, c)
+  assert.equal(secretInCommand('echo "" ok', P, () => false), null)
+})
+
+test('known limits without an OS sandbox: a path built at run time or hidden in a script passes the text wrapper (SECURITY.md)', () => {
+  // These pass on purpose: the wrapper reads command text, it does not run bash. SECURITY.md lists them; an OS sandbox
+  // (or the git hooks, for commits and pushes) closes them.
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  for (const c of ['g=.g; d=$g"it"; rm -rf $d', 'node /tmp/x.js', 'sh ./cleanup.sh']) assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr), null, c)
+  assert.equal(secretInCommand('f=.e; cat ${f}nv', P, () => false), null)
+})
+
+test('single-quoted heredoc as stdin: a prompt that mentions approve-tests is data; interpreters, pipes and > stay blocked', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  const HUMAN = 'human-only Stopbar command or setting'
+  const body = 'Review the change. Do not run stopbar approve-tests or stopbar resume yourself; STOPBAR_X is a setting.'
+  const allowed = [
+    `agy -p - <<'EOF'\n${body}\nEOF`,
+    `cd sub && agy --model x -p - <<'PROMPT'\n${body}\nsecond line\nPROMPT`,
+    `cat <<'EOF'\n${body}\nEOF`,
+    `codex exec - 2>&1 << 'EOF'\n${body}\nEOF\necho done`,
+  ]
+  for (const c of allowed) {
+    assert.ok(withoutStdinHeredoc(c) !== null, c)
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr, 'bash'), null, c)
+  }
+  assert.equal(withoutStdinHeredoc(`agy -p - <<'EOF'\n${body}\nEOF\necho after`), "agy -p - <<'EOF'\nEOF\necho after")
+  const blocked = [
+    `bash <<'EOF'\nstopbar approve-tests\nEOF`, `sh -s <<'EOF'\nstopbar approve-tests\nEOF`, `python <<'EOF'\nimport os; os.system('stopbar approve-tests')\nEOF`,
+    `python3 - <<'EOF'\nstopbar resume\nEOF`, `node <<'EOF'\nstopbar approve-tests\nEOF`, `/usr/bin/env bash <<'EOF'\nstopbar approve-tests\nEOF`,
+    `cat <<'EOF' > x.sh\nstopbar approve-tests\nEOF`, `cat <<'EOF' >> x.sh\nstopbar approve-tests\nEOF`, `cat > x.sh <<'EOF'\nstopbar approve-tests\nEOF`,
+    `cat <<'EOF' | sh\nstopbar approve-tests\nEOF`, `tee x.sh <<'EOF'\nstopbar approve-tests\nEOF`, `xargs stopbar <<'EOF'\napprove-tests\nEOF`,
+    `X=bash; $X <<'EOF'\nstopbar approve-tests\nEOF`, `f() { bash; }\nf <<'EOF'\nstopbar approve-tests\nEOF`, `. /dev/stdin <<'EOF'\nstopbar approve-tests\nEOF`,
+    // unquoted delimiter: bash expands $(...) in the body
+    `cat <<EOF\n$(stopbar approve-tests)\nEOF`, `cat <<"EOF"\nstopbar approve-tests\nEOF`,
+    // two heredocs, no closing delimiter, a command after the body
+    `cat <<'A' <<'B'\nstopbar approve-tests\nA\nB`, `agy -p - <<'EOF'\nstopbar approve-tests`, `agy -p - <<'EOF'\nok\nEOF\nstopbar approve-tests`,
+    // the header itself
+    `stopbar approve-tests <<'EOF'\nx\nEOF`,
+  ]
+  for (const c of blocked) assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr, 'bash'), HUMAN, JSON.stringify(c))
+  // .git, agent settings directories and Stopbar code stay protected in the body
+  for (const c of [`agy -p - <<'EOF'\nlook at .git/config\nEOF`, `agy -p - <<'EOF'\nedit .claude/settings.json\nEOF`, `agy -p - <<'EOF'\nsee C:/tools/stopbar/dist/hook.js\nEOF`])
+    assert.ok(protectedCommand(c, pr, 'bash') && protectedCommand(c, pr, 'bash') !== HUMAN, c)
+  // PowerShell has no heredoc: the whole text is checked
+  assert.equal(protectedCommand(`agy -p - <<'EOF'\n${body}\nEOF`, pr, 'powershell'), HUMAN)
 })
