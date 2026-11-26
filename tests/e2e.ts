@@ -1475,6 +1475,23 @@ say('\nS40 init --hooks <client> adds the git hooks; a foreign git hook is kept 
   keepEvents(repo, 's40-default-git-hooks')
 }
 
+// ---------------------------------------------------------------- S41 status on an uncounted working tree (selftest F8)
+say('\nS41 stopbar status: a change no hook has counted yet is shown; commit is not "allowed" until the gates run on the current tree')
+{
+  const repo = setupRepo('s41-status-uncounted')
+  agentBashCC(repo, 'node build.mjs'); agentBashCC(repo, 'node --test')
+  const before = human(repo, 'status'), jb = JSON.parse(human(repo, 'status', '--json').out)
+  check('green gates on a counted tree: commit allowed, workingTreeCounted = true', /^commit\s+allowed$/m.test(before.out) && jb.workingTreeCounted === true && jb.workingTreeSnapshot === jb.snapshot, before.out)
+  writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => b + a\n') // outside any hook (a human edit, a background job)
+  const after = human(repo, 'status'), ja = JSON.parse(human(repo, 'status', '--json').out)
+  check('uncounted change: status names it and does not say commit allowed', !/^commit\s+allowed/m.test(after.out) &&
+    /working tree has uncounted changes since revision \d+/.test(after.out) && /^commit\s+blocked: uncommitted working-tree changes not yet counted/m.test(after.out), after.out)
+  check('status --json: workingTreeCounted = false, workingTreeSnapshot differs from snapshot, old fields kept', ja.workingTreeCounted === false &&
+    typeof ja.workingTreeSnapshot === 'string' && ja.workingTreeSnapshot !== ja.snapshot && ja.kernel?.treeRev === jb.kernel?.treeRev && 'secretRead' in ja && ja.version === jb.version, JSON.stringify({c: ja.workingTreeCounted}))
+  check('the next git commit is blocked (as status says)', agentBashCC(repo, 'git commit -q -am "x"').pre.code === 2)
+  keepEvents(repo, 's41-status-uncounted')
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

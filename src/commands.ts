@@ -166,15 +166,21 @@ export function secretReason(repo: Repo): {text: string; pattern?: string; path?
   return {text: `matched ${pattern} (${path}) in ${tool} at rev ${hit.treeRev}`, pattern, path, tool, revision: hit.treeRev}
 }
 
-function statusText(repo: Repo, cfg: Config, s: Saved): string {
+/** `now`: the working tree as it is now. A change no hook has counted yet (now.id !== s.snapshot) keeps a commit blocked
+ *  at the next hook (pre:commit-sync), so status never says `allowed` then. */
+function statusText(repo: Repo, cfg: Config, s: Saved, now: Snap): string {
   const v = decode(s.kernel)
   const yn = (b: boolean) => (b ? 'yes' : 'no')
   const ok = (rev: number) => (rev === v.treeRev ? `ok at revision ${rev}` : 'not at the current revision')
-  const commit = v.halted ? 'blocked: session halted' : v.buildOkRev === v.treeRev && v.testsOkRev === v.treeRev && !v.testsTainted ? 'allowed' : `blocked: ${whyBlocked(v, cfg)}`
+  const uncounted = now.id !== s.snapshot
+  const green = v.buildOkRev === v.treeRev && v.testsOkRev === v.treeRev && !v.testsTainted
+  const commit = v.halted ? 'blocked: session halted' : !green ? `blocked: ${whyBlocked(v, cfg)}`
+    : uncounted ? 'blocked: uncommitted working-tree changes not yet counted (run build and full tests on the current tree)' : 'allowed'
   const torn = readEvents(repo).torn.length
   return [
     `Stopbar ${VERSION}   repo ${repo.root}`,
     `revision   ${v.treeRev}   (tree ${s.snapshot.slice(0, 12)})${cfg.baseRef ? `   base ref ${cfg.baseRef}` : ''}`,
+    ...(uncounted ? [`           working tree has uncounted changes since revision ${v.treeRev}; gates will be re-checked on the next hook`] : []),
     `build      ${ok(v.buildOkRev)}      (${cfg.buildCmd})`,
     `full tests ${ok(v.testsOkRev)}      (${cfg.fullTestCmd})`,
     `tainted    ${yn(v.testsTainted)}   secret read ${v.secretTainted ? `yes (${secretReason(repo)?.text ?? 'reason not in the event log'})` : 'no'}   shell approval held ${yn(v.shellToken)}`,
@@ -200,8 +206,10 @@ export function human(cmd: string, o: Opts): Out {
     }
     const s = readState(repo)
     if (cmd === 'status') {
+      // the working tree now (read-only for state.json, as in attest: only the private snapshot index is refreshed)
+      const now = snapshot(repo)
       return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, stopGate: cfg.stopGate ?? 'block', ...(cfg.requireRun ? {requireRun: true} : {}), snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
-        secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null}, null, 1) : statusText(repo, cfg, s)}
+        secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null, workingTreeSnapshot: now.id, workingTreeCounted: now.id === s.snapshot}, null, 1) : statusText(repo, cfg, s, now)}
     }
     let res: Out
     if (cmd === 'approve-tests') {

@@ -169,12 +169,19 @@ function defaultWork(dir: string): string {
   return join(tmpdir(), `stopbar-probe-${process.pid}`)
 }
 
+/** A worker gets its share in a file in `work` (`--worker-file <path>`): the seeds as one argv JSON overflow the command
+ *  line (Windows ~32 KB, Linux 128 KB per argument) at large --runs or --mutant-runs. The file goes when the worker ends. */
+let workerFiles = 0
 function spawnWorker(p: Part): Promise<any[]> {
   return new Promise<any[]>((ok, bad) => {
-    const ch = spawn(process.execPath, [join(PKG_ROOT, 'bin', 'stopbar.mjs'), 'probe', '--worker', JSON.stringify(p)], {stdio: ['ignore', 'pipe', 'inherit']})
+    const file = join(p.work, `worker-${process.pid}-${++workerFiles}.json`)
+    writeFileSync(file, JSON.stringify(p))
+    const ch = spawn(process.execPath, [join(PKG_ROOT, 'bin', 'stopbar.mjs'), 'probe', '--worker-file', file], {stdio: ['ignore', 'pipe', 'inherit']})
     let s = ''
     ch.stdout.on('data', (d) => { s += d })
+    ch.on('error', (e) => { rmSync(file, {force: true}); bad(e) })
     ch.on('exit', (code) => {
+      rmSync(file, {force: true, maxRetries: 5})
       let v: any
       try { v = JSON.parse(s.trim().split('\n').pop()!) } catch { return bad(new Error(`probe worker exit ${code}: ${s.slice(0, 500)}`)) }
       if (v && !Array.isArray(v) && typeof v.error === 'string') bad(new ProbeError(v.error)); else ok(v)
@@ -219,7 +226,7 @@ async function probeWith(R: Resolved, o: ProbeOptions, log: (s: string) => void,
   const regs = regDir && existsSync(regDir) ? readdirSync(regDir).filter((f) => f.endsWith('.json')).sort().map((f) => join(regDir, f)).filter(isRegression) : []
   const seeds = o.regressionsOnly ? [] : Array.from({length: runs}, (_, i) => seed0 + i)
   mkdirSync(work, {recursive: true}); mkdirSync(out, {recursive: true})
-  for (const f of readdirSync(work)) if (/^(run|reg|mut)-/.test(f)) rmSync(join(work, f), {recursive: true, force: true, maxRetries: 5})
+  for (const f of readdirSync(work)) if (/^(run|reg|mut|worker)-/.test(f)) rmSync(join(work, f), {recursive: true, force: true, maxRetries: 5})
   // old reproductions go, unless they are the regressions of this run
   if (!regDir || resolve(regDir) !== resolve(out)) for (const f of readdirSync(out)) if (/^repro-\d+\.json$/.test(f)) rmSync(join(out, f))
   const targetPath = R.file ? relPath(repoDir, R.file) : t.name
@@ -268,7 +275,7 @@ async function probeWith(R: Resolved, o: ProbeOptions, log: (s: string) => void,
   writeFileSync(summaryFile, summaryText)
   log(`PROBE ${passOk ? 'PASS' : 'FAIL'}: ${summary.passed}/${seeds.length + regs.length} sequences (${summary.runs} random, ${summary.regressions} regression), ` +
     `${summary.steps} steps${summary.hookCalls ? `, ${summary.hookCalls} hook calls` : ''}, ${summary.seconds} s, ${jobs} jobs\n  coverage ${JSON.stringify(coverage)}\n  summary ${summaryFile}`)
-  for (const f of readdirSync(work)) if (/^(run|reg|mut)-/.test(f)) rmSync(join(work, f), {recursive: true, force: true, maxRetries: 5})
+  for (const f of readdirSync(work)) if (/^(run|reg|mut|worker)-/.test(f)) rmSync(join(work, f), {recursive: true, force: true, maxRetries: 5})
 
   const recorded = o.record === false ? null : record(repoDir, {target: t.name, targetPath, ...cmdField, targetSha256: R.sha256, runs: summary.runs, regressions: summary.regressions,
     passed: summary.passed, failed: summary.failed, steps: summary.steps, ok: passOk, mutants: mutants ? {killed: mutants.killed, total: mutants.total, survived: mutants.survived} : null,

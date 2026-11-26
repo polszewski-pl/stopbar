@@ -85,13 +85,16 @@ There is no proof for them.
   `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`, `.gemini/**/hooks.json`,
   `.agents/hooks.json`, at project and user level), or the Stopbar code that runs the hooks. A shell command may not
   name a `.git`, `.claude`, `.cursor`, `.codex`, `.gemini` or `.agents` directory, write git config (`git config`
-  without `--get` or `--list`), define a one-off git alias (`git -c alias.<name>=...`, `--config-env alias.*`,
-  `GIT_CONFIG_KEY_<n>=alias.*`), name the Stopbar code, use a `STOPBAR_*` variable, or run a human command
-  (`approve-tests`, `approve-shell`, `stopbar init/resume/reset`). Since 1.2.0 every text check runs on the command as
-  written and as bash joins the quoted parts of a word, so `.e""nv`, `.g''it` and `.cl''aude` count as `.env`, `.git`
-  and `.claude`. In Bash, the body of one single-quoted heredoc that is stdin data (`agy -p - <<'EOF'` … `EOF`) is
-  skipped by the human-only checks, so a prompt may mention `approve-tests`; this does not apply when the command line
-  pipes, redirects with `>`/`>>`, expands a variable, or names a shell, an interpreter, `xargs`, `at`, `tee` or
+  other than a read: `--get`, `--get-all`, `--get-regexp`, `--get-urlmatch`, `--list`, `-l`, or the subcommands `list`
+  and `get` right after `config`; a value such as `core.hooksPath list` is a write), define a one-off git alias
+  (`git -c alias.<name>=...`, `--config-env alias.*`, `GIT_CONFIG_KEY_<n>=alias.*`), name the Stopbar code, use a
+  `STOPBAR_*` variable, or run a human command (`approve-tests`, `approve-shell`, and `init`, `resume`, `reset`,
+  `upgrade`, `doctor --fix` right after the `stopbar` program word; `stopbar probe init` is allowed). Since 1.2.0
+  every text check runs on the command as written and as bash joins the quoted parts of a word, so `.e""nv`, `.g''it`,
+  `.cl''aude`, `'.cl'"aude"`, `.e"n"'v'` and `gi"t"` count as `.env`, `.git`, `.claude` and `git`. In Bash, the body
+  of one single-quoted heredoc that is stdin data (`agy -p - <<'EOF'` … `EOF`) is skipped by the human-only checks,
+  so a prompt may mention `approve-tests`; this does not apply when the command line pipes, redirects with `>`/`>>`,
+  expands a variable, or names a shell, an interpreter, `xargs`, `at`, `tee` or
   `stopbar`. `.git`, the agent settings directories and the Stopbar code stay protected inside the body.
 - **Halted sessions.** While halted, every tool is paused except the tools in `config.safeTools` (default: the local
   task-list, turn and session-message tools of Claude Desktop), so the agent can still ask a human for `stopbar resume`.
@@ -183,7 +186,8 @@ the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gi
 
 - A probe target is code you trust. `--target <file>` imports the file into the worker processes, and
   `--cmd "<command>"` runs the command in a shell, with the rights of the user who starts the probe. Do not probe
-  a file or a command that the agent wrote and that no human has read.
+  a file or a command from outside the session that no human has read. An agent may run a prober it wrote in the
+  current session (`skills/stopbar/SKILL.md`); a human reads it before its `probe:result` counts as evidence.
 - `probe:result` in `events.jsonl` is evidence, not a gate. It has no `req`, it is not a kernel step and it does not
   change `state.json`, so it can never allow a commit. It is appended under Stopbar's lock, like every other entry.
 - `stopbar attest` shows the latest `probe:result` per target since the last `init` or `reset`, with the sha256 of the
@@ -201,9 +205,9 @@ the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gi
   Edit, Write, Read, the shell and every tool outside the list stay paused.
 - `--require-run` decides by the event's source (`stopbar run` or an agent hook), not by what ran. Without it, the
   exact gate command from the agent's shell still counts, as before.
-- Quote splicing: only quotes inside a word are undone (`.e""nv`, `.e"n"v`). A path built at run time
-  (`g=.g; d=$g"it"`), a backslash escape, a variable or a script (`node /tmp/x.js`) passes the text checks; section 3
-  point 1. Only an OS sandbox closes this.
+- Quote splicing: only quotes inside a word are undone (`.e""nv`, `.e"n"v`, `'.cl'"aude"`, `gi"t"`). A path built at
+  run time (`g=.g; d=$g"it"`), a backslash escape, a variable or a script (`node /tmp/x.js`) passes the text checks;
+  section 3 point 1. Only an OS sandbox closes this.
 - The stdin heredoc exception trusts the command on the header line not to run its stdin. Stopbar knows the common
   shells and interpreters (and `xargs`, `at`, `tee`, `stopbar`); another program that executes stdin passes. The
   exception covers only `HUMAN_ONLY` and `STOPBAR_ADMIN`; every other check still reads the body.

@@ -124,7 +124,7 @@ EOF
 | `stopbar doctor [--json]` | human | Environment, config, state, hooks and a dry run. Exit 1 on a problem. |
 | `stopbar prove [--out f.json] [--lean f.lean]` | human, CI | PROVE: the inductive proof of the kernel and the 10 mutants. Exit 0 only if everything holds. `verify` is an alias. |
 | `stopbar probe [--target wrapper\|<file> \| --cmd "<command>" [--target-file <path>] [--cmd-timeout 300000]] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file, or of a program in any language over NDJSON (`--cmd`, see [PROBE for your project](#probe-for-your-project)). `--target` and `--cmd` exclude each other. A failure is shrunk to a minimal JSON reproduction. |
-| `stopbar probe init [--lang ts\|py] [--name sample] [--out probes] [--force] [--repo <dir>]` | human | Writes a starter target with 2 actions, 1 invariant and 2 mutants (`<name>.probe.ts` or `<name>_probe.py`) and prints the command that runs it. It does not overwrite a file without `--force`. |
+| `stopbar probe init [--lang ts\|py] [--name sample] [--out probes] [--force] [--repo <dir>]` | human, agent | Writes a starter target with 2 actions, 1 invariant and 2 mutants (`<name>.probe.ts` or `<name>_probe.py`) and prints the command that runs it. It does not overwrite a file without `--force`. |
 | `stopbar attest [--format json\|md]` | human, CI | ATTEST: the session attestation. The same state and log give the same output. Exit 1 if the state and the log disagree, exit 2 if a file is damaged. `probes` (Markdown: `## Probe evidence`) lists the latest `probe:result` per target since the last `init` or `reset`, with `atCurrentSnapshot`. |
 
 All commands take `--repo <dir>`. The agent cannot run the human commands: the hooks block them.
@@ -355,8 +355,8 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Python | Typecheck | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 62/62 | 439/439 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 62/62 | 439/439 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 70/70 | 443/443 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 70/70 | 443/443 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
 | Ubuntu, Windows, macOS (GitHub Actions) | 24 | runner | runner | CI | CI | CI | CI | – | CI (Ubuntu) | – |
 
 The last row is the CI workflow: it runs after a push, so its results are on the repository's Actions page, not here.

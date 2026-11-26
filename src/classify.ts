@@ -86,6 +86,32 @@ export function unsplice(cmd: string): string {
   return cmd.replace(/""|''/g, '').replace(/(?<=[\w.\-/\\~])["'](?=[\w.\-/\\~])/g, '')
 }
 
+/** The command text with the quote pairs of every word removed, as bash joins the parts of a word: `'.cl'"aude"` is
+ *  `.claude`, `.g"i"'t'` is `.git`, `gi"t"` is `git`. Separators (spaces, operators) and the spaces inside quotes stay as
+ *  they are, so words are never joined across whitespace. Inside "..." the escapes \" \\ \$ \` work; inside '...' nothing.
+ *  Outside quotes a backslash is kept as written (`g\it` is a known limit, SECURITY.md). An unterminated quote runs to the
+ *  end. For the text scans (self-protection, secrets, the git subcommand) only; give it the command without the data
+ *  bodies the caller skips (a plain `-m` message: commandForSelfProtect; a safe heredoc: its prefix). */
+export function unquoteShellWords(cmd: string): string {
+  let out = ''
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]
+    if (c === "'") {
+      const j = cmd.indexOf("'", i + 1)
+      out += j < 0 ? cmd.slice(i + 1) : cmd.slice(i + 1, j)
+      i = j < 0 ? cmd.length : j
+    } else if (c === '"') {
+      let j = i + 1
+      for (; j < cmd.length && cmd[j] !== '"'; j++) {
+        if (cmd[j] === '\\' && j + 1 < cmd.length && '"\\$`'.includes(cmd[j + 1])) j++
+        out += cmd[j]
+      }
+      i = j
+    } else if (c === '\\' && i + 1 < cmd.length) { out += c + cmd[i + 1]; i++ } else out += c
+  }
+  return out
+}
+
 // ---------------------------------------------------------------- risky / outbound shell
 const NET_TOOLS = /\b(curl|wget|nc|ncat|netcat|socat|ssh|scp|sftp|rsync|ftp|tftp|telnet)\b/i
 const PS_NET = /Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b|Start-BitsTransfer|Net\.WebClient|System\.Net\.|Net\.Sockets/i
@@ -101,18 +127,95 @@ export function isRiskyShell(cmd: string): boolean {
 }
 
 // ---------------------------------------------------------------- git commands
-// git global options before the subcommand: -c k=v, -C dir, --git-dir=..., --work-tree ..., --no-pager, -p (values may be quoted)
-const GIT_GLOBALS = String.raw`(?:\s+(?:-[cC]\s*(?:"[^"]*"|'[^']*'|\S+)|--(?:git-dir|work-tree|namespace|exec-path|config-env)(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)|--[\w-]+|-[A-Za-z]))*`
+// git global options before the subcommand: -c k=v, -C dir, --git-dir=..., --work-tree ..., --no-pager, -p (values may be
+// quoted). With a separate value (git 2.56 `git --help` and git.c): --git-dir, --work-tree, --namespace, --config-env,
+// --attr-source; --exec-path, --super-prefix (older git) and --list-cmds are listed too. Any other `--opt=value` is one word.
+const GV = String.raw`(?:"[^"]*"|'[^']*'|\S+)`
+const GIT_GLOBALS = String.raw`(?:\s+(?:-[cC]\s*${GV}|--(?:git-dir|work-tree|namespace|exec-path|config-env|attr-source|super-prefix|list-cmds)(?:=|\s+)${GV}|--[\w-]+=${GV}|--[\w-]+|-[A-Za-z]))*`
 const gitSub = (sub: string, flags = 'i') => new RegExp(String.raw`\bgit(?:\.exe)?${GIT_GLOBALS}\s+(?:${sub})\b`, flags)
-const COMMIT_RE = gitSub('commit|push'), PUSH_RE = gitSub('push'), CONFIG_RE = gitSub('config')
+const COMMIT_RE = gitSub('commit|push'), PUSH_RE = gitSub('push'), CONFIG_RE_G = gitSub('config', 'gi')
 const COMMIT_ONLY_RE = new RegExp(String.raw`^git(?:\.exe)?${GIT_GLOBALS}\s+commit\b`, 'i')
-const CONFIG_READ = /\s(--get|--get-all|--get-regexp|--list|-l|--show-origin|--show-scope|get|list)(\s|=|$)/i
 
-/** Text a commit/push decision is made on: for a safe heredoc commit only the prefix (the message is data). */
+/** Text a commit/push decision is made on: for a safe heredoc commit only the prefix (the message is data); as written
+ *  and with the quotes of each word removed (`gi"t" commit` is `git commit`). */
 const commandPart = (cmd: string) => parseSafeHeredocCommit(cmd)?.prefix ?? cmd
-export const isCommitCmd = (cmd: string) => COMMIT_RE.test(commandPart(cmd))
-export const isPushCmd = (cmd: string) => PUSH_RE.test(commandPart(cmd))
-export const isGitConfigWrite = (cmd: string) => CONFIG_RE.test(cmd) && !CONFIG_READ.test(cmd)
+const gitTexts = (part: string) => [part, unquoteShellWords(part)]
+export const isCommitCmd = (cmd: string) => gitTexts(commandPart(cmd)).some((t) => COMMIT_RE.test(t))
+export const isPushCmd = (cmd: string) => gitTexts(commandPart(cmd)).some((t) => PUSH_RE.test(t))
+
+// `git config` reads: only the tokens right after `config` decide, never a value at the end (`git config core.hooksPath
+// list` is a write). A read is the subcommand `list` (no argument) or `get <name>` as the first positional word, or one
+// of the options --get, --get-all, --get-regexp <name>, --get-urlmatch <name> <url>, --list / -l before the arguments;
+// scope and format flags may stand around them. A write flag, an unknown flag, an expansion or any other argument count
+// make it a write (fail closed).
+const CFG_WRITE = new Set(['--add', '--unset', '--unset-all', '--replace-all', '--rename-section', '--remove-section', '--edit', '-e'])
+const CFG_FLAG = new Set(['--local', '--global', '--system', '--worktree', '--includes', '--no-includes', '--show-origin', '--show-scope', '--null', '-z',
+  '--name-only', '--all', '--regexp', '--fixed-value', '--show-names', '--no-show-names', '--bool', '--int', '--bool-or-int', '--path', '--expiry-date', '--no-type'])
+const CFG_FLAG_ARG = new Set(['--file', '-f', '--blob', '--default', '--type', '--value', '--url'])
+const CFG_READ_OPT = new Map([['--get', 1], ['--get-all', 1], ['--get-regexp', 1], ['--get-urlmatch', 2], ['--list', 0], ['-l', 0]])
+const CFG_READ_SUB = new Map([['list', 0], ['get', 1]])
+
+/** The words of one simple command, quotes removed, up to the first operator outside quotes (`;`, `&`, `|`, `(`, `)`,
+ *  a newline, a redirection; a file descriptor number right before `<` / `>` is dropped). Null for an expansion ($, `)
+ *  outside single quotes: its value is unknown. */
+function simpleWords(s: string): string[] | null {
+  const words: string[] = []
+  let w = '', inWord = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (c === "'") { const j = s.indexOf("'", i + 1); w += j < 0 ? s.slice(i + 1) : s.slice(i + 1, j); inWord = true; i = j < 0 ? s.length : j; continue }
+    if (c === '"') {
+      let j = i + 1
+      for (; j < s.length && s[j] !== '"'; j++) {
+        if (s[j] === '\\' && j + 1 < s.length && '"\\$`'.includes(s[j + 1])) j++
+        else if (s[j] === '$' || s[j] === '`') return null
+        w += s[j]
+      }
+      inWord = true; i = j; continue
+    }
+    if (c === '$' || c === '`') return null
+    if (c === '\\') { w += s[i + 1] ?? ''; inWord = true; i++; continue }
+    if (c === ' ' || c === '\t') { if (inWord) words.push(w); w = ''; inWord = false; continue }
+    if (';&|()\r\n'.includes(c)) break
+    if (c === '<' || c === '>') { if (inWord && /^\d+$/.test(w)) inWord = false; break }
+    w += c; inWord = true
+  }
+  if (inWord) words.push(w)
+  return words
+}
+
+function configIsRead(args: string[]): boolean {
+  let mode: number | undefined
+  const pos: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a.length > 1 && a.startsWith('-')) {
+      const eq = a.startsWith('--') ? a.indexOf('=') : -1, name = eq < 0 ? a : a.slice(0, eq)
+      if (CFG_WRITE.has(name)) return false
+      if (CFG_READ_OPT.has(name)) {
+        if (eq >= 0 || pos.length || mode !== undefined) return false
+        mode = CFG_READ_OPT.get(name); continue
+      }
+      if (CFG_FLAG_ARG.has(name)) { if (eq < 0 && ++i >= args.length) return false; continue }
+      if (CFG_FLAG.has(name) && eq < 0) continue
+      return false
+    }
+    if (!pos.length && mode === undefined && CFG_READ_SUB.has(a)) { mode = CFG_READ_SUB.get(a); continue }
+    pos.push(a)
+  }
+  return mode !== undefined && pos.length === mode
+}
+
+/** Any `git config` in the text that is not a read (see above) is a write. */
+export function isGitConfigWrite(cmd: string): boolean {
+  for (const m of cmd.matchAll(CONFIG_RE_G)) {
+    const rest = cmd.slice(m.index + m[0].length)
+    if (rest && !/^[\s;&|()<>]/.test(rest)) return true
+    const args = simpleWords(rest)
+    if (!args || !configIsRead(args)) return true
+  }
+  return false
+}
 
 // A runner counts only as a command word: `cat pytest.ini` or `vim jest.config.js` is not a test run (fuzzer find, seed 12).
 const END = String.raw`(?![\w.\-/\\])`
@@ -136,7 +239,7 @@ export type SecretHit = {token: string; pattern: string}
 export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true): SecretHit | null {
   const words = (s: string) => s.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)
   // the words as written, then as bash joins them (`.e""nv` is `.env`)
-  for (const tok of new Set([...words(cmd), ...words(unsplice(cmd))])) {
+  for (const tok of new Set([...words(cmd), ...words(unsplice(cmd)), ...words(unquoteShellWords(cmd))])) {
     const hits = paths.secrets.filter((g) => matchesSecretGlob(tok, g))
     if (!hits.length) continue
     const strong = hits.find((g) => !EXT_ONLY.test(g))
@@ -157,7 +260,7 @@ export type BashKind =
 export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd' | 'paths'>, shell: 'bash' | 'powershell' = 'bash', exists?: (p: string) => boolean): BashKind {
   const c = cmd.trim()
   const scan: {chain: boolean; reason?: string; heredoc?: boolean} = shell === 'bash' ? scanShell(c) : scanPlain(c)
-  if (COMMIT_RE.test(scan.heredoc ? commandPart(c) : c)) {
+  if (gitTexts(scan.heredoc ? commandPart(c) : c).some((t) => COMMIT_RE.test(t))) {
     if (scan.chain) return {kind: 'commit-chained', reason: scan.reason ?? 'chain'}
     return {kind: 'commit', heredoc: !!scan.heredoc, push: isPushCmd(c)}
   }
@@ -229,7 +332,9 @@ const SEG = (name: string) => new RegExp(String.raw`(^|[^a-z0-9_.\-])${name.repl
 const DOT_GIT = SEG('.git')
 const AGENT_DIRS: [RegExp, string][] = [[SEG('.claude'), '.claude'], [SEG('.cursor'), '.cursor'], [SEG('.codex'), '.codex'], [SEG('.gemini'), '.gemini'], [SEG('.agents'), '.agents']]
 const HUMAN_ONLY = /\b(approve-tests|approve-shell)\b|\bSTOPBAR_[A-Z_]+/i
-const STOPBAR_ADMIN = /stopbar[^\n]*\b(init|resume|reset|upgrade|doctor\s+--fix)\b/i
+// an admin subcommand right after the program word (`stopbar`, `stopbar.mjs`, `stopbar@1.2.0`, `.../stopbar/dist/cli.js`,
+// quoted or not): `stopbar init` is human-only, `stopbar probe init` (a prober scaffold, SKILL.md) is the agent's
+const STOPBAR_ADMIN = /stopbar[^\s"'|;&]*["']?\s+(?:init|resume|reset|upgrade|doctor\b[^\n;&|]*?\s--fix)\b/i
 
 /** Command text inspected by self-protection. For a plain single-command `git commit` (chain-free, no substitution),
  *  strips the commit message (safe heredoc body or quoted `-m` / `--message` string) because git treats it as data. */
@@ -307,11 +412,12 @@ export function withoutStdinHeredoc(cmd: string): string | null {
 }
 
 /** Shell command text. Returns the reason for a block, or null. Text matching only: see SECURITY.md.
- *  Every check runs on the text as written and as bash joins quoted parts of a word (`.g""it`). For bash, the body of
+ *  Every check runs on the text as written and as bash joins quoted parts of a word (`.g""it`, `'.cl'"aude"`, `gi"t"`:
+ *  unsplice and unquoteShellWords). For bash, the body of
  *  one single-quoted heredoc that is plain stdin data (withoutStdinHeredoc) is skipped by the human-only checks only:
  *  .git, the agent settings directories and Stopbar code stay protected in it. */
 export function protectedCommand(cmd: string, pr: Protect, shell: 'bash' | 'powershell' = 'bash'): string | null {
-  const texts = [...new Set([cmd, unsplice(cmd)])]
+  const texts = [...new Set([cmd, unsplice(cmd), unquoteShellWords(cmd)])]
   for (const t of texts) {
     const c = norm(t).toLowerCase()
     if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
@@ -325,6 +431,6 @@ export function protectedCommand(cmd: string, pr: Protect, shell: 'bash' | 'powe
     for (const d of pr.codeDirs) if (c.includes(lc(d))) return `the command names Stopbar code (${d})`
   }
   const admin = (shell === 'bash' ? withoutStdinHeredoc(cmd) : null) ?? cmd
-  for (const t of new Set([admin, unsplice(admin)])) if (HUMAN_ONLY.test(t) || STOPBAR_ADMIN.test(t)) return 'human-only Stopbar command or setting'
+  for (const t of new Set([admin, unsplice(admin), unquoteShellWords(admin)])) if (HUMAN_ONLY.test(t) || STOPBAR_ADMIN.test(t)) return 'human-only Stopbar command or setting'
   return null
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
 import {classifyBash, classifyTreeChange, commandForSelfProtect, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath, unsplice, withoutStdinHeredoc} from '../../dist/classify.js'
+import * as CL from '../../dist/classify.js'
 import {makeConfig, PROFILES, validateConfig} from '../../dist/config.js'
 import {globToRegExp, matchAny} from '../../dist/glob.js'
 
@@ -278,4 +279,80 @@ test('single-quoted heredoc as stdin: a prompt that mentions approve-tests is da
     assert.ok(protectedCommand(c, pr, 'bash') && protectedCommand(c, pr, 'bash') !== HUMAN, c)
   // PowerShell has no heredoc: the whole text is checked
   assert.equal(protectedCommand(`agy -p - <<'EOF'\n${body}\nEOF`, pr, 'powershell'), HUMAN)
+})
+
+// ---------------------------------------------------------------- selftest 1.2.0 findings F1, F2, F3, F5, F6
+const PR = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+const CONFIG_BLOCK = /git config/
+const sp = (c: string) => protectedCommand(commandForSelfProtect(c, 'bash'), PR)
+
+test('F1 git config: only the tokens right after `config` decide a read; a value with the word list or get is a write', () => {
+  for (const c of ['git config core.hooksPath list', 'git config alias.ci "commit -m list -q"', 'git config user.name get', 'git config set core.hooksPath commit get',
+    'git config --local core.hooksPath get', 'git config --show-origin core.hooksPath list', 'git config --add core.hooksPath list', 'git config --list core.hooksPath x',
+    'git config --get user.name --unset', 'git config list --add x', 'git config get user.name x', 'git config --replace-all core.hooksPath --get', 'git config -e',
+    'git config --get user.name; git config core.hooksPath list', 'git config user.name']) {
+    assert.ok(CL.isGitConfigWrite(c), c)
+    assert.match(sp(c) ?? '', CONFIG_BLOCK, c)
+  }
+  for (const c of ['git config --get user.name', 'git config --list', 'git config -l', 'git config --local --get core.autocrlf', 'git config list', 'git config get user.name',
+    'git config --global --list --show-origin', 'git config get --all --show-origin user.name', 'git config --get user.name || true', 'git config --list | grep user',
+    'git config --get-regexp ^user', 'git config --file=x.cfg --get a.b', 'git config -f x.cfg --list', 'git config --type=bool --get core.bare', 'git config --null --name-only --list',
+    'git -C . config --get user.name']) {
+    assert.equal(CL.isGitConfigWrite(c), false, c)
+    assert.equal(sp(c), null, c)
+  }
+})
+
+test('F2 git global options with a value (--attr-source and any --opt=value) do not hide commit, push, config or -c alias', () => {
+  for (const c of ['git --attr-source=HEAD commit -m x', 'git --attr-source HEAD commit -m x', 'git --attr-source="HEAD" commit -m x', "git --attr-source 'HEAD' commit -m x",
+    'git --super-prefix=x/ commit -m x', 'git --list-cmds=main commit -m x', 'git --some-future-option=1 commit -m x']) {
+    assert.deepEqual(classifyBash(c, cfg), {kind: 'commit', heredoc: false, push: false}, c)
+    assert.ok(CL.isCommitCmd(c), c)
+  }
+  for (const c of ['git --attr-source=HEAD push origin main', 'git --attr-source HEAD push', 'git --attr-source=HEAD --no-pager push']) {
+    assert.deepEqual(classifyBash(c, cfg), {kind: 'commit', heredoc: false, push: true}, c)
+    assert.ok(CL.isPushCmd(c), c)
+  }
+  assert.ok(parseSafeHeredocCommit(HD('m', 'git --attr-source=HEAD commit')))
+  for (const c of ['git --attr-source=HEAD config core.hooksPath x', 'git --attr-source HEAD config core.hooksPath x']) assert.match(sp(c) ?? '', CONFIG_BLOCK, c)
+  for (const c of ['git --attr-source=HEAD -c alias.ci=commit ci', 'git --attr-source HEAD -c alias.ci=commit ci']) assert.match(sp(c) ?? '', /alias/, c)
+  assert.equal(sp('git --attr-source=HEAD config --get user.name'), null)
+})
+
+test('F3 STOPBAR_ADMIN: `stopbar probe init` is the agent\'s command; init, resume, reset, upgrade, doctor --fix right after stopbar stay human-only', () => {
+  for (const c of ['stopbar probe init --lang ts --name x', 'npx --no-install stopbar probe init --lang py', 'node bin/stopbar.mjs probe init', 'stopbar probe --target probes/q.probe.ts',
+    'stopbar status', 'stopbar doctor', 'stopbar attest --format md'])
+    assert.equal(sp(c), null, c)
+  for (const c of ['stopbar init --build b --test t', 'npx stopbar init --build b --test t', 'node bin/stopbar.mjs init --build b --test t', 'stopbar resume', 'stopbar reset',
+    'stopbar upgrade', 'stopbar doctor --fix', 'stopbar approve-tests', 'stopbar approve-shell', 'npx stopbar@1.2.0 init --build b', 'stopbar.cmd reset', 'node "x/stopbar.mjs" resume',
+    "'stopbar' reset", 'stopbar probe init && stopbar reset'])
+    assert.equal(sp(c), 'human-only Stopbar command or setting', c)
+})
+
+test('unquoteShellWords: drops quote pairs inside each word, keeps the separators and the literal spaces inside quotes', () => {
+  assert.equal(CL.unquoteShellWords(`cat '.cl'"aude"/settings.json`), 'cat .claude/settings.json')
+  assert.equal(CL.unquoteShellWords(`ls .g"i"'t'/hooks && cat .e"n"'v'`), 'ls .git/hooks && cat .env')
+  assert.equal(CL.unquoteShellWords(`gi"t" commit -m "a  b"`), 'git commit -m a  b')
+  assert.equal(CL.unquoteShellWords(`a  'b c';"d"`), 'a  b c;d')
+  assert.equal(CL.unquoteShellWords('echo "x\\"y" \'z\\\''), 'echo x"y z\\')
+  assert.equal(CL.unquoteShellWords('plain words stay'), 'plain words stay')
+})
+
+test('F5 mixed quote splicing (\'.cl\'"aude", .g"i"\'t\', .e"n"\'v\') is undone for self-protection and secrets', () => {
+  for (const c of [`cat '.cl'"aude"/settings.local.json`, `ls .g"i"'t'/hooks`, `rm -rf ".g"'it'`, `cat '.cu'"rsor"/hooks.json`]) assert.ok(sp(c), c)
+  for (const c of [`cat .e"n"'v'`, `cat '.e'"nv"`, `less '.e'"nv.local"`]) {
+    assert.equal(secretInCommand(c, P, () => false)?.pattern, '.env*', c)
+    const k = classifyBash(c, cfg, 'bash', () => false)
+    assert.ok(k.kind === 'shell' && k.secret?.pattern === '.env*', c)
+  }
+})
+
+test('F6 a quoted git word (gi"t", gi\'t\', g"i"\'t\') is still git for commit, push, config and -c alias', () => {
+  for (const c of [`gi"t" commit -m x`, `g"i"'t' commit -m x`, `"git" commit -m x`]) assert.deepEqual(classifyBash(c, cfg), {kind: 'commit', heredoc: false, push: false}, c)
+  for (const c of [`gi't' push`, `gi"t" push origin main`]) assert.deepEqual(classifyBash(c, cfg), {kind: 'commit', heredoc: false, push: true}, c)
+  for (const c of [`gi"t" config core.hooksPath x`, `gi't' config alias.ci commit`]) assert.match(sp(c) ?? '', CONFIG_BLOCK, c)
+  for (const c of [`gi"t" -c alias.ci=commit ci`, `g"i"'t' -c alias.p=push p`]) assert.match(sp(c) ?? '', /alias/, c)
+  // quoted words that bash does not join into git stay plain shell
+  assert.equal(classifyBash(`echo "gi t" commit`, cfg).kind, 'shell')
+  assert.equal(sp(`gi"t" config --get user.name`), null)
 })

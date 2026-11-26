@@ -7,6 +7,34 @@
 This release joins 1.2.0-rc.1 (PROBE for TS/JS) with PROBE for any language and `stopbar probe init`. No new runtime
 dependency: `gdp-wired` 0.60.0 is still the only one.
 
+Selftest fixes (8 findings of the 1.2.0 audit, each with a regression test):
+
+- **F1 (P1) `git config` with the word `list` or `get` in a value is a write.** Only the words right after `config`
+  decide a read: the subcommands `list` and `get <name>`, or `--get`, `--get-all`, `--get-regexp`, `--get-urlmatch`,
+  `--list`, `-l` before the arguments, with scope and format flags around them. `git config core.hooksPath list` and
+  `git config alias.ci "commit -m list -q"` were taken for reads and are now blocked.
+- **F2 (P1) git global options with a value.** `--attr-source <tree>` (also `=`), `--super-prefix`, `--list-cmds` and
+  any other `--opt=value` before the subcommand no longer hide `commit`, `push`, `config` or `-c alias.*`.
+- **F3 (P2) `stopbar probe init` is not blocked.** The human-only check now looks for `init`, `resume`, `reset`,
+  `upgrade` and `doctor --fix` right after the `stopbar` program word (`stopbar`, `stopbar.mjs`, `stopbar@<version>`,
+  quoted or not). `stopbar init` and `npx stopbar init` stay blocked.
+- **F4 (P2) `stopbar attest` with a long `events.jsonl`.** The last kernel step is found with a loop, not with
+  `Math.max(...events)`, which overflowed the stack at about 130 000 lines.
+- **F5, F6 (P2) mixed and word-final quotes.** New `unquoteShellWords`: the text checks also read each word with its
+  quote pairs removed, so `'.cl'"aude"`, `.g"i"'t'`, `.e"n"'v'` and `gi"t"` are `.claude`, `.git`, `.env` and `git`
+  for self-protection, the secret check and the commit and push classification.
+- **F7 (P2) `stopbar probe` with large `--runs` or `--mutant-runs`.** A worker gets its share in a file
+  (`--worker-file <path>` in the work directory, removed when the worker ends) instead of one JSON argument, which
+  failed with `spawn ENAMETOOLONG`. `--worker <json>` still works.
+- **F8 (P2) `stopbar status` on an uncounted working tree.** `status` compares the working tree with the counted
+  snapshot. After a change that no hook has counted, it says so on the `revision` line and shows `commit blocked:
+  uncommitted working-tree changes not yet counted` instead of `allowed`. `status --json` has the new fields
+  `workingTreeSnapshot` and `workingTreeCounted`.
+- `skills/stopbar/SKILL.md`: who runs which prober (agrees with SECURITY.md section 4), `--cmd-timeout` under CPU
+  load, what to do after the first finding, and when `--no-record` is allowed.
+- Tests: unit tests for F1–F7 (`classify`, `attestation` on 140 000 log lines, `probe()` with 40 000 mutant seeds) and
+  E2E scenario S41 (F8).
+
 Launch hardening:
 
 - **`stopbar probe --cmd` never hangs after a failed kill.** `taskkill` reports a failure (no rights, a sandbox, not on

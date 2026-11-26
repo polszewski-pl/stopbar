@@ -165,3 +165,18 @@ test('each of the 10 mutants has a concrete counterexample run: a law fails on i
     assert.equal(replay(k.kernel('none')), false, `${m}: the counterexample must not break the original`)
   }
 })
+
+test('F4 attestation: an events.jsonl with more than 130000 lines stays consistent (no spread into Math.max)', async () => {
+  const {init} = await import('../../dist/commands.js')
+  const {attestation} = await import('../../dist/attest.js')
+  const d = join(TMP, 'f4-attest-large')
+  rmSync(d, {recursive: true, force: true}); mkdirSync(d, {recursive: true})
+  g(d, 'init', '-q'); writeFileSync(join(d, 'a.txt'), 'a\n'); g(d, 'add', '-A'); g(d, 'commit', '-qm', 'base')
+  const o: Record<string, string> = {repo: d, build: 'node -v', test: 'npm -v', 'no-pin': ''}
+  const r = init({get: (k: string) => o[k], has: (k: string) => k in o, int: (k: string, def: number) => (k in o ? Number(o[k]) : def)})
+  assert.equal(r.code, 0, r.msg)
+  appendFileSync(join(d, '.git', 'stopbar', 'events.jsonl'), '{"ts":"2026-01-01T00:00:00.000Z","source":"hook-timing","event":"PreToolUse","tool":"Read","exit":0}\n'.repeat(140000))
+  const a = attestation(d)
+  assert.equal(a.consistent, true, JSON.stringify(a.checks))
+  assert.ok(a.log.entries > 140000)
+})

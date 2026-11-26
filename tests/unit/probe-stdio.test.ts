@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import {spawn, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
-import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import {dirname, join, resolve} from 'node:path'
 import {test} from 'node:test'
 import {fileURLToPath, pathToFileURL} from 'node:url'
@@ -186,4 +186,13 @@ test('probe init --lang ts|py: writes the template, refuses to overwrite without
   // --out is relative to --repo, else to the current directory
   const repo = join(TMP, 'init-repo'); mkdirSync(repo, {recursive: true})
   assert.equal(initProbe({repo, cwd: TMP}).file, join(repo, 'probes', 'sample.probe.ts'))
+})
+
+test('F7 probe(): a share of 40000 seeds reaches its worker through a file, not argv (no spawn ENAMETOOLONG); the file is removed', async () => {
+  const work = join(TMP, 'work-f7'), logs: string[] = []
+  rmSync(work, {recursive: true, force: true})
+  const r = await probe({target: join(ROOT, 'examples', 'bounded-queue.probe.ts'), runs: 1, jobs: 1, checkMutants: true, mutantRuns: 40000, work, record: false, log: (s) => logs.push(s)})
+  assert.ok(r.ok, logs.join('\n'))
+  assert.equal(r.summary.mutants?.killed, r.summary.mutants?.total)
+  assert.deepEqual(readdirSync(work).filter((f) => f.startsWith('worker-')), [])
 })

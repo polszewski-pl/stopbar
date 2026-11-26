@@ -38,7 +38,12 @@ export function attestation(repoDir: string) {
 
     // consistency: the state must be what the log says the last kernel step (or the last init/reset) left behind
     const checks: {name: string; ok: boolean; detail: string}[] = []
-    const lastIdx = Math.max(...events.map((x, i) => (x.e.req || x.e.source === 'human:init' || x.e.source === 'human:reset' ? i : -1)), -1)
+    // a loop from the end, not Math.max(...events): one argument per entry overflows the stack on a long log
+    let lastIdx = -1
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i].e
+      if (e.req || e.source === 'human:init' || e.source === 'human:reset') { lastIdx = i; break }
+    }
     if (lastIdx < 0) checks.push({name: 'log matches state', ok: false, detail: 'no kernel step and no init in events.jsonl'})
     else {
       const last = events[lastIdx]

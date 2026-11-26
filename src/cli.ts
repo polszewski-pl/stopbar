@@ -93,6 +93,8 @@ async function main(): Promise<{code: number; msg?: string}> {
   }
   if (cmd === 'probe') {
     const P = await import('./probe/index.ts')
+    // a worker share: --worker-file <path> (the runner), or --worker <json> (older runners)
+    if (o.has('worker-file')) { await P.worker(JSON.parse(readFileSync(o.get('worker-file')!, 'utf8'))); return {code: 0} }
     if (o.has('worker')) { await P.worker(JSON.parse(o.get('worker')!)); return {code: 0} }
     const num = (n: string) => (o.get(n) === undefined ? undefined : o.int(n, 0))
     try {

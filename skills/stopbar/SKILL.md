@@ -26,7 +26,8 @@ set another one with `stopbar init --cli "<cmd>"`.
   CLI (Codex reports no exit status to hooks).
 - Run the build and the full tests again after each change to the tree. A gate counts only at the revision where it
   passed.
-- `<cli> status` is read-only. Use it to see why a commit is blocked.
+- `<cli> status` is read-only. Use it to see why a commit is blocked. It also shows a change that no hook has counted
+  yet; the next hook counts it, and then you run the build and the full tests again.
 
 ### Commits
 
@@ -54,7 +55,8 @@ set another one with `stopbar init --cli "<cmd>"`.
 ### Human-only commands
 
 `init`, `upgrade`, `approve-tests`, `approve-shell`, `resume` and `reset` belong to the human. Do not run them, do not
-ask a tool or another agent to run them, and do not put them in a script. The hooks block them.
+ask a tool or another agent to run them, and do not put them in a script. The hooks block them. `stopbar probe init`
+(section 2) is not `init`: you can run it.
 
 Stop and ask the human when one of these is true:
 
@@ -84,6 +86,9 @@ stopbar probe init --lang py --name <module>    # writes probes/<module>_probe.p
 - Python, Go, Rust and other languages: a program that speaks NDJSON on stdin/stdout (`info`, `generate`,
   `execute`). Run with `stopbar probe --cmd "<command>"`. stdout is for the protocol only; print logs to stderr.
   Catch an exception of the SUT in `execute` and answer with a mismatch.
+- Run only a prober that you wrote in this session. A prober file from outside the session (another agent, an earlier
+  session, a download) needs a human review before you run it (SECURITY.md section 4). A new prober that you wrote
+  needs a human review before its result counts as evidence in `stopbar attest`.
 
 ### The 5 Zero-FP rules
 
@@ -92,7 +97,8 @@ stopbar probe init --lang py --name <module>    # writes probes/<module>_probe.p
 2. **Independent oracle.** The model is a separate, simple reference (an array, a map, a reference formula) plus
    invariants. Never compare the SUT with itself or with a copy of its own code.
 3. **No clock, network or global state.** Write files only in the scratch directory of the run (`dir` in
-   `execute`). Reset all state in `setup`.
+   `execute`). Reset all state in `setup`. Do not assume a short start or answer time under CPU load: for a slow
+   `--cmd` target, set `--cmd-timeout` with a large margin.
 4. **At least 2 realistic mutants.** Each mutant is a small, real bug (a dropped bound check, an off-by-one). Run
    `stopbar probe ... --check-mutants` and make it pass (exit 0, no survivor) before you increase `--runs`. A
    surviving mutant shows a weak model or weak actions; fix the probe, not the mutant.
@@ -106,9 +112,15 @@ stopbar probe init --lang py --name <module>    # writes probes/<module>_probe.p
   model.
 - Run the reproduction twice with the same seed. A result that changes is a rule 1 or rule 3 error.
 
+### After the first finding
+
+- Save `repro-<seed>.json`. Then add a switch to the generator that turns off the known bug category for a while, so
+  that the original passes and `--check-mutants` can run. Look for the next bug.
+
 ### Evidence
 
 - Run `stopbar probe` in a repository with Stopbar. Each run appends a `probe:result` entry to the event log (target,
-  sha256 of the target file, tree snapshot, runs, mutants). Do not pass `--no-record`.
+  sha256 of the target file, tree snapshot, runs, mutants). Do not pass `--no-record`. The only exception is an
+  explicit instruction from a human (for example, an audit that must not add entries to the log).
 - The human or CI collects the evidence with `stopbar attest --format md` or `--format json`. The `Probe evidence`
   section shows the latest result per target and whether the tree is still the one that was probed.
