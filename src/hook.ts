@@ -1,8 +1,10 @@
 // Claude Code hooks: PreToolUse, PostToolUse, PostToolUseFailure, Stop. JSON on stdin; exit 0 = allow,
 // exit 2 = block (stderr goes to the agent). Any wrapper error is exit 2 (fail closed).
+import {existsSync} from 'node:fs'
 import {resolve} from 'node:path'
 import * as K from './classify.ts'
-import type {Config} from './config.ts'
+import {type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
+import {matchAny} from './glob.ts'
 import {decode, kstep, type Req, type View} from './engine.ts'
 import {changesSinceHead, countedEntries, diffEntries, differsFromHead, FailClosed, findRepo, gitCalls, inHead, markCounted, type Repo, type Snap, snapshot} from './repo.ts'
 import {appendEvent, readConfig, readState, type Saved, withLock, writeState} from './store.ts'
@@ -16,7 +18,7 @@ const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS'])
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
 const OUTBOUND = (t: string) => t === 'WebFetch' || t === 'WebSearch' || t.startsWith('mcp__')
 
-function step(ctx: Ctx, req: Req, source: string): {before: View; after: View} {
+function step(ctx: Ctx, req: Req, source: string, extra: Record<string, unknown> = {}): {before: View; after: View} {
   const before = decode(ctx.s.kernel)
   ctx.s.kernel = kstep(ctx.s.params, ctx.s.kernel, req)
   ctx.dirty = true
@@ -24,7 +26,7 @@ function step(ctx: Ctx, req: Req, source: string): {before: View; after: View} {
   appendEvent(ctx.repo, {source, req, decision: after.decision, halted: after.halted, testsTainted: after.testsTainted,
     secretTainted: after.secretTainted, shellToken: after.shellToken, treeRev: after.treeRev, buildOkRev: after.buildOkRev,
     testsOkRev: after.testsOkRev, spent: after.spent, capNow: after.capNow, testFails: after.testFails, buildFails: after.buildFails,
-    commitExecuted: after.commitExecuted})
+    commitExecuted: after.commitExecuted, ...extra})
   return {before, after}
 }
 
@@ -87,13 +89,18 @@ function pre(ctx: Ctx, input: any): Out {
   const cost = cfg.costPerCall
   if (READ_TOOLS.has(tool)) {
     const ps = [ti.file_path, ti.path, ti.glob, ti.pattern, ...(Array.isArray(ti.file_paths) ? ti.file_paths : [])].filter((x) => typeof x === 'string' && x)
-    if (ps.some((p: string) => K.isSecretPath(p, cfg.paths))) step(ctx, {op: 'READ_SECRET', cost}, `pre:${tool}`)
+    for (const p of ps) {
+      const pattern = K.secretPattern(p, cfg.paths)
+      if (pattern) { step(ctx, {op: 'READ_SECRET', cost}, `pre:${tool}`, {secret: {pattern, path: p, tool}}); break }
+    }
     return {code: 0}
   }
   if (EDIT_TOOLS.has(tool)) return {code: 0} // cost and tree change are counted in PostToolUse
   if (SHELL_TOOLS.has(tool)) {
     const cmd = String(ti.command ?? '')
-    const k = K.classifyBash(cmd, cfg, tool === 'PowerShell' ? 'powershell' : 'bash')
+    const base = typeof input.cwd === 'string' && input.cwd ? input.cwd : repo.root
+    const exists = (t: string) => existsSync(resolve(base, t)) || existsSync(resolve(repo.root, t))
+    const k = K.classifyBash(cmd, cfg, tool === 'PowerShell' ? 'powershell' : 'bash', exists)
     if (k.kind === 'commit-chained') {
       appendEvent(repo, {source: 'pre', tool, wrapper: 'BLOCK', reason: `chained commit (${k.reason})`})
       return block(`run \`git commit\` / \`git push\` as a single command (${k.reason}): no &&, ;, |, redirections or $(...). ` +
@@ -114,7 +121,7 @@ function pre(ctx: Ctx, input: any): Out {
       }
       return {code: 0}
     }
-    if (k.secret) step(ctx, {op: 'READ_SECRET'}, `pre:${tool}:secret-mention`)
+    if (k.secret) step(ctx, {op: 'READ_SECRET'}, `pre:${tool}:secret-mention`, {secret: {pattern: k.secret.pattern, path: k.secret.token, tool}})
     const {after} = step(ctx, {op: 'SHELL', risky: k.risky, cost}, `pre:${tool}`)
     if (after.decision === 'PAUSE') {
       return {code: 2, msg: after.halted ? 'PAUSE (stopbar): budget reached; a human must run `stopbar resume --extra <n>`'
@@ -123,6 +130,7 @@ function pre(ctx: Ctx, input: any): Out {
     return {code: 0}
   }
   if (OUTBOUND(tool)) {
+    if (matchAny(tool, cfg.safeTools ?? DEFAULT_SAFE_TOOLS)) return {code: 0} // local tools listed in config.safeTools
     const {after} = step(ctx, {op: 'SHELL', risky: true, cost}, `pre:${tool}`)
     if (after.decision === 'PAUSE') return {code: 2, msg: `PAUSE (stopbar): ${tool} is outbound and a secret was read (or the budget is spent); a human runs \`stopbar approve-shell\` or \`stopbar resume\``}
   }

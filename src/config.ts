@@ -11,6 +11,8 @@ export type Config = {
   cap: number
   costPerCall: number
   paths: Paths
+  /** Tools that are local and never outbound (globs on the tool name); missing = DEFAULT_SAFE_TOOLS. */
+  safeTools?: string[]
 }
 
 const TEST_COMMON = ['**/tests/**', '**/test/**', '**/__tests__/**']
@@ -42,6 +44,8 @@ export const PROFILES: Record<string, Paths> = {
 }
 
 export const DEFAULTS = {maxRetries: 3, cap: 500, costPerCall: 1}
+// local UI tools of Claude Desktop (task list and turn summary): no network, no files
+export const DEFAULT_SAFE_TOOLS = ['mcp__ccd_turn__*']
 
 export class ConfigError extends Error {}
 
@@ -69,6 +73,12 @@ export function validateConfig(c: unknown): Config {
     }
   }
   if (typeof o.profile !== 'string') throw new ConfigError('config.profile must be a string')
+  if (o.safeTools !== undefined) {
+    if (!Array.isArray(o.safeTools) || !o.safeTools.every((x) => typeof x === 'string' && x.length > 0)) throw new ConfigError('config.safeTools must be a list of glob strings')
+    for (const g of o.safeTools as string[]) {
+      try { globToRegExp(g) } catch (e) { throw new ConfigError(`config.safeTools: ${(e as Error).message}`) }
+    }
+  }
   return o as unknown as Config
 }
 
@@ -80,5 +90,6 @@ export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: 
     version: 1, profile, buildCmd: a.buildCmd.trim(), fullTestCmd: a.fullTestCmd.trim(),
     maxRetries: a.maxRetries ?? DEFAULTS.maxRetries, cap: a.cap ?? DEFAULTS.cap, costPerCall: a.costPerCall ?? DEFAULTS.costPerCall,
     paths: {tests: [...paths.tests], testConfig: [...paths.testConfig], secrets: [...paths.secrets]},
+    safeTools: [...DEFAULT_SAFE_TOOLS],
   })
 }

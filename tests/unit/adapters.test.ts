@@ -47,6 +47,11 @@ test('normalisation: every client becomes the internal event with Claude Code to
   assert.equal(n('gemini', {...GEMINI, tool_name: 'mcp_db_query'}).event?.tool_name, 'mcp__db_query')
   assert.equal(n('antigravity', AGY).event?.tool_input?.command, 'ls')
   assert.deepEqual(n('antigravity', {...AGY, toolCall: {name: 'write_to_file', args: {TargetFile: '/r/x.ts', CodeContent: ''}}}).event?.tool_input, {file_path: '/r/x.ts', file_paths: ['/r/x.ts']})
+  // tool names from a live Antigravity CLI session
+  assert.deepEqual(n('antigravity', {...AGY, toolCall: {name: 'write_file', args: {Path: '/r/.agents/hooks.json'}}}).event?.tool_input, {file_path: '/r/.agents/hooks.json', file_paths: ['/r/.agents/hooks.json']})
+  assert.equal(n('antigravity', {...AGY, toolCall: {name: 'sed_file', args: {Path: '/r/a.ts'}}}).event?.tool_name, 'Write')
+  assert.equal(n('antigravity', {...AGY, toolCall: {name: 'call_mcp_tool', args: {ServerName: 'db', ToolName: 'q'}}}).event?.tool_name, 'mcp__db__q')
+  assert.equal(n('antigravity', {...AGY, toolCall: {name: 'list_dir', args: {DirectoryPath: '/r'}}}).event?.tool_name, 'Read')
   assert.equal(n('antigravity', {...AGY, hookEventName: 'PostToolUse', error: 'exit status 1'}).kind, 'post-tool-failure')
   assert.equal(n('antigravity', {...AGY, hookEventName: 'Stop', continuationActive: true}).event?.stop_hook_active, true)
   assert.equal(n('antigravity', {...AGY, hookEventName: 'PreInvocation'}).event, null)

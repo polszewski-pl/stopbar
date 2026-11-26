@@ -594,9 +594,9 @@ const CLIENTS: Client[] = [
   {
     name: 'antigravity',
     pre: (repo, tool, arg) => ({conversationId: 'c', workspacePaths: [repo], transcriptPath: 't', modelName: 'auto', hookEventName: 'PreToolUse', cwd: repo, stepIdx: 1,
-      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg, Cwd: repo}} : tool === 'write' ? {id: '1', name: 'write_to_file', args: {TargetFile: join(repo, arg), CodeContent: ''}} : {id: '1', name: 'view_file', args: {AbsolutePath: join(repo, arg)}}}),
+      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg, Cwd: repo}} : tool === 'write' ? {id: '1', name: 'write_file', args: {Path: join(repo, arg)}} : {id: '1', name: 'view_file', args: {AbsolutePath: join(repo, arg)}}}),
     post: (repo, tool, arg, exit) => ({conversationId: 'c', workspacePaths: [repo], hookEventName: 'PostToolUse', cwd: repo, stepIdx: 2,
-      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg}} : {id: '1', name: 'write_to_file', args: {TargetFile: join(repo, arg)}}, ...(exit ? {error: `exit status ${exit}`} : {})}),
+      toolCall: tool === 'shell' ? {id: '1', name: 'run_command', args: {CommandLine: arg}} : {id: '1', name: 'write_file', args: {Path: join(repo, arg)}}, ...(exit ? {error: `exit status ${exit}`} : {})}),
     stop: (repo) => ({conversationId: 'c', workspacePaths: [repo], hookEventName: 'Stop', cwd: repo, executionNum: 0, terminationReason: 'NO_TOOL_CALL', fullyIdle: true, continuationActive: false}),
     denied: (r) => r.code === 0 && J(r.out)?.decision === 'deny',
     allowed: (r) => r.code === 0 && r.out === '',
@@ -719,6 +719,48 @@ say('\nS26 init --hooks claude,cursor,codex,gemini,antigravity,git: merged confi
   check('doctor names a client config with missing events', d3.code === 1 && /\[FAIL\] hooks codex .*PostToolUse, Stop/.test(d3.out))
   check('unknown --hooks target fails before writing anything', human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude,vim').code === 2)
   keepEvents(repo, 's26-multi')
+}
+
+// ---------------------------------------------------------------- S27 secret reason, *.key on code, safeTools
+say('\nS27 why the secret gate is on, no *.key false alarm on code, safeTools for local UI tools')
+{
+  const repo = setupRepo('s27-secrets')
+  const py = agentBashCC(repo, 'node -e "const claim = {key: 1}; console.log(claim.key)"')
+  check('`claim.key` in inline code is not a secret read', py.pre.code === 0 && status(repo).secretTainted === false)
+  agentBashCC(repo, 'node -e "const self = {pem: 2}; console.log(self.pem)"')
+  check('`self.pem` in inline code is not a secret read either', status(repo).secretTainted === false)
+  writeFileSync(join(repo, 'server.key'), 'not a real key\n')
+  run('git rm -q --cached --ignore-unmatch server.key', repo); writeFileSync(join(repo, '.gitignore'), '.env\nserver.key\n'); run('git add .gitignore', repo); run('git commit -q -m ignore', repo)
+  human(repo, 'reset')
+  hook(repo, 'PreToolUse', 'Bash', {command: 'cat server.key'})
+  const st = human(repo, 'status')
+  check('`cat server.key` with an existing file sets the secret gate', status(repo).secretTainted === true)
+  check('status names the reason: pattern, token, tool and revision', /secret read yes \(matched \*\.key \(server\.key\) in Bash at rev \d+\)/.test(st.out), st.out.split('\n').find((l) => /secret/.test(l)))
+  const js = JSON.parse(human(repo, 'status', '--json').out)
+  check('status --json has secretRead {pattern, path, tool}', js.secretRead?.pattern === '*.key' && js.secretRead?.path === 'server.key' && js.secretRead?.tool === 'Bash')
+  const ev = events(repo).find((e) => e.req?.op === 'READ_SECRET')
+  check('events.jsonl records the matched pattern and the token, not the file content', ev?.secret?.pattern === '*.key' && ev?.secret?.path === 'server.key' && !JSON.stringify(ev).includes('not a real key'))
+  const att = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
+  check('attest gives the reason too', /matched \*\.key \(server\.key\) in Bash/.test(att.gates.secretReadBy ?? ''))
+  human(repo, 'reset')
+  hook(repo, 'PreToolUse', 'Bash', {command: 'cat certs/server.key'})
+  check('`cat certs/server.key` counts even when the file does not exist', status(repo).secretTainted === true)
+  human(repo, 'reset')
+  agentRead(repo, '.env')
+  check('Read .env: reason names the Read tool', /matched \.env\* \(.*\.env\) in Read at rev/.test(human(repo, 'status').out))
+  const n0 = events(repo).filter((e) => e.req?.op === 'SHELL').length
+  const ui = hook(repo, 'PreToolUse', 'mcp__ccd_turn__update_plan', {items: []})
+  check('safeTools: mcp__ccd_turn__* after a secret read is allowed and is no outbound step', ui.code === 0 && events(repo).filter((e) => e.req?.op === 'SHELL').length === n0)
+  const gh = hook(repo, 'PreToolUse', 'mcp__github__create_issue', {title: 'x'})
+  check('other MCP tools after a secret read stay outbound (PAUSE)', gh.code === 2 && /^PAUSE/.test(gh.msg))
+  const cf = join(stateDir(repo), 'config.json')
+  const c = JSON.parse(readFileSync(cf, 'utf8')); c.safeTools = ['mcp__ccd_turn__*', 'mcp__github__get_*']; writeFileSync(cf, JSON.stringify(c, null, 2))
+  check('a human can add globs to safeTools in config.json', hook(repo, 'PreToolUse', 'mcp__github__get_issue', {}).code === 0 && hook(repo, 'PreToolUse', 'mcp__github__create_issue', {}).code === 2)
+  check('doctor shows safeTools', /safeTools \["mcp__ccd_turn__\*","mcp__github__get_\*"\]/.test(human(repo, 'doctor').out))
+  c.safeTools = ['a**b']; writeFileSync(cf, JSON.stringify(c, null, 2))
+  const bad = hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, 'src', 'sum.mjs')})
+  check('an invalid safeTools glob fails closed', bad.code === 2 && /safeTools/.test(bad.msg))
+  keepEvents(repo, 's27-secrets')
 }
 
 // ---------------------------------------------------------------- S12 (last: over all hook calls)

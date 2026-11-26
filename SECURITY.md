@@ -84,7 +84,11 @@ that tries to defeat it:
 2. **Gate commands run arbitrary code.** `buildCmd` and `fullTestCmd` run the repository's code. A new test file is
    trusted. It can read secrets, use the network or weaken other checks at run time.
 3. **Secrets by file name only.** Secrets in environment variables, in files with ordinary names, or found with Grep in
-   ordinary files are not seen. The exfiltration gate works on command text only.
+   ordinary files are not seen. The exfiltration gate works on command text only. In a shell command, a bare token
+   that matches only an extension pattern such as `*.key` counts only if that file exists (a field access like
+   `claim.key` is not a file); a command that names a `.key` file which does not exist yet is therefore not a read.
+   Tools listed in `config.safeTools` (default: Claude Desktop's `mcp__ccd_turn__*` UI tools) are not treated as
+   outbound; a human who adds a glob there vouches that those tools send nothing out.
 4. **Weak new tests.** A new test file is not suspicious. A mock of the system under test or an empty assertion in a
    new file passes. Hard-coded answers in production code are an ordinary code edit.
 5. **Ignored files.** Files ignored by `.gitignore` are invisible to the snapshot (for example patches in
@@ -101,12 +105,14 @@ that tries to defeat it:
       cursor` sets it. `afterShellExecution` carries no exit code, so a gate command seen only there never passes; the
       config written by `init` uses `preToolUse` and `postToolUse`.
     - Codex CLI: there is no failure event. A build or full test run passes only when an exit code 0 is found in the
-      tool result. Codex asks the user to review and trust project hooks; until then they do not run.
+      tool result. Codex loads `.codex/` (config and hooks) only in a trusted project, and asks the user to review and trust project
+      hooks; until then they do not run (a live run in an untrusted folder loaded none).
     - Gemini CLI: an exit other than 0 and 2 is only a warning, and invalid JSON output counts as "allow". Stopbar exits
       2 for every block and internal error, but a crash before Stopbar's own handler (for example a missing Node.js)
       fails open. Gemini CLI warns when a project hook changes and treats it as untrusted.
     - Antigravity CLI: hooks of a workspace load only after the folder is trusted. A message after a tool call
-      (PostToolUse) cannot reach the agent; it sees the reason at its next blocked call.
+      (PostToolUse) cannot reach the agent; it sees the reason at its next blocked call. An allowed call returns an
+      empty answer, so Antigravity's own permission rules still apply on top of Stopbar (checked live).
     - Git fallback: git hooks see only commits and pushes, not reads or shell commands, so the secret gate needs an agent
       hook to record the read. `git commit --no-verify` and `git push --no-verify` skip git hooks.
 

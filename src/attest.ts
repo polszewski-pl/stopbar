@@ -4,6 +4,7 @@
 import {createHash} from 'node:crypto'
 import {existsSync, readFileSync} from 'node:fs'
 import {decode, initKernel, MACHINE, type View} from './engine.ts'
+import {secretReason} from './commands.ts'
 import {whyBlocked} from './hook.ts'
 import {findRepo, git, snapshot} from './repo.ts'
 import {paths, readConfig, readState, VERSION, withLock} from './store.ts'
@@ -54,6 +55,7 @@ export function attestation(repoDir: string) {
       repository: {head, headTree, snapshot: s.snapshot, workingTreeSnapshot: now.id, treeRevision: v.treeRev},
       config: {profile: cfg.profile, buildCmd: cfg.buildCmd, fullTestCmd: cfg.fullTestCmd, maxRetries: cfg.maxRetries, cap: cfg.cap, costPerCall: cfg.costPerCall},
       gates: {build: v.buildOkRev === v.treeRev, fullTests: v.testsOkRev === v.treeRev, tainted: v.testsTainted, secretRead: v.secretTainted,
+        ...(v.secretTainted ? {secretReadBy: secretReason(repo)?.text ?? 'not in the event log'} : {}),
         shellApprovalHeld: v.shellToken, halted: v.halted, commitAllowedNow: commitNow, ...(commitNow ? {} : {why: v.halted ? 'session halted' : whyBlocked(v, cfg)}),
         budget: {spent: v.spent, cap: v.capNow}, failures: {tests: v.testFails, builds: v.buildFails}},
       humanActions: approvals,
@@ -75,7 +77,7 @@ export function attestMarkdown(a: ReturnType<typeof attestation>): string {
     `| HEAD | \`${a.repository.head ?? '(none)'}\` |`, `| HEAD tree | \`${a.repository.headTree ?? '(none)'}\` |`,
     `| Counted snapshot | \`${a.repository.snapshot}\` (revision ${a.repository.treeRevision}) |`,
     `| Build gate | ${yn(g.build)} (\`${a.config.buildCmd}\`) |`, `| Full test gate | ${yn(g.fullTests)} (\`${a.config.fullTestCmd}\`) |`,
-    `| Tests tainted | ${yn(g.tainted)} |`, `| Secret read | ${yn(g.secretRead)} |`, `| Halted | ${yn(g.halted)} |`,
+    `| Tests tainted | ${yn(g.tainted)} |`, `| Secret read | ${g.secretRead ? `yes: ${g.secretReadBy}` : 'no'} |`, `| Halted | ${yn(g.halted)} |`,
     `| Commit allowed now | ${yn(g.commitAllowedNow)}${g.why ? `: ${g.why}` : ''} |`,
     `| Budget | ${g.budget.spent}/${g.budget.cap} |`,
     `| events.jsonl sha256 | \`${a.log.sha256}\` (${a.log.bytes} bytes, ${a.log.entries} entries, torn lines: ${a.log.tornLines.length ? a.log.tornLines.join(', ') : 'none'}) |`,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {classifyBash, classifyTreeChange, hasChain, looksLikeTests, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath} from '../../dist/classify.js'
+import {classifyBash, classifyTreeChange, hasChain, looksLikeTests, secretInCommand, secretPattern, isSecretPath, isTestConfigPath, isTestPath, parseSafeHeredocCommit, protectedCommand, protectedPath} from '../../dist/classify.js'
 import {makeConfig, PROFILES, validateConfig} from '../../dist/config.js'
 import {globToRegExp, matchAny} from '../../dist/glob.js'
 
@@ -103,4 +103,27 @@ test('looksLikeTests: runners as command words only (regression: a command that 
     'pytest -q', 'uv run pytest', 'python -I -X utf8 -m pytest tests', 'python3 -m unittest', 'go test ./...', 'cargo test', 'npx playwright test']) assert.ok(looksLikeTests(c), c)
   for (const c of ['cat pytest.ini', "node -e \"require('fs').writeFileSync('pytest.ini', 'x')\"", 'vim jest.config.js', 'cat vitest.config.ts', 'rm -f tests/x.test.mjs',
     'ls node_modules/mocha', 'echo testing', 'npm run tester']) assert.ok(!looksLikeTests(c), c)
+})
+
+test('secret mentions: *.key on a code field is not a file, a real or slashed path is (regression: claim.key)', () => {
+  const none = () => false, only = (f: string) => (p: string) => p === f
+  assert.equal(secretInCommand('python -c "print(claim.key)"', P, none), null)
+  assert.equal(secretInCommand('node -e "console.log(self.key, cfg.pem)"', P, none), null)
+  assert.deepEqual(secretInCommand('cat server.key', P, only('server.key')), {token: 'server.key', pattern: '*.key'})
+  assert.deepEqual(secretInCommand('cat certs/server.key', P, none), {token: 'certs/server.key', pattern: '*.key'})
+  assert.deepEqual(secretInCommand('cat .env', P, none), {token: '.env', pattern: '.env*'})
+  assert.deepEqual(secretInCommand('type secrets\\db.txt', P, none), {token: 'secrets\\db.txt', pattern: '**/secrets/**'})
+  assert.equal(secretInCommand('cat id_rsa', P, none)?.pattern, 'id_rsa*')
+  assert.equal(secretPattern('C:/x/server.key', P), '*.key')
+  const k = classifyBash('python -c "print(claim.key)"', cfg, 'bash', none)
+  assert.ok(k.kind === 'shell' && k.secret === null)
+})
+
+test('config: safeTools defaults to the Claude Desktop turn tools and is validated', () => {
+  assert.deepEqual(cfg.safeTools, ['mcp__ccd_turn__*'])
+  assert.ok(matchAny('mcp__ccd_turn__update_plan', cfg.safeTools!))
+  assert.ok(!matchAny('mcp__github__create_issue', cfg.safeTools!))
+  assert.ok(validateConfig({...cfg, safeTools: undefined}))
+  assert.throws(() => validateConfig({...cfg, safeTools: 'x'}), /safeTools must be a list/)
+  assert.throws(() => validateConfig({...cfg, safeTools: ['a**']}), /safeTools/)
 })

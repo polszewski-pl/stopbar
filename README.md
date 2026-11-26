@@ -20,9 +20,9 @@ hook payload into one internal event and renders the decision in the client's ow
 |---|---|---|---|---|
 | Claude Code | `claude`: `.claude/settings.local.json` (`claude-project`: `.claude/settings.json`) | PreToolUse, PostToolUse, PostToolUseFailure, Stop | exit 2, reason on stderr | live-verified (Claude Code 2.1.326) |
 | Cursor | `cursor`: `.cursor/hooks.json` (`failClosed: true`) | preToolUse, postToolUse, postToolUseFailure, stop (also beforeShellExecution, beforeMCPExecution, beforeReadFile, afterFileEdit, afterShellExecution) | exit 2 and `{"permission": "deny"}`; stop: `followup_message` | spec-tested (Cursor hooks reference) |
-| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | spec-tested (command hook schemas of Codex CLI 0.172.0) |
+| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | spec-tested (command hook schemas of Codex CLI 0.172.0); Codex loads project hooks only in a trusted folder |
 | Gemini CLI | `gemini`: `.gemini/settings.json` | BeforeTool, AfterTool, AfterAgent | exit 2, reason on stderr; AfterAgent: `decision: "block"` | spec-tested (Gemini CLI hooks reference) |
-| Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | spec-tested (hooks spec of Antigravity CLI 1.5.18) |
+| Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | live-verified for PreToolUse deny and allow and PostToolUse (Antigravity CLI 1.5.18); Stop spec-tested |
 | Any tool, via git | `git`: `.git/hooks/pre-commit`, `.git/hooks/pre-push` | commit, push | exit 1 aborts git | tested with real git (E2E) |
 
 `live-verified` means a live agent session passed through the hooks; `spec-tested` means the adapter follows the
@@ -96,7 +96,7 @@ EOF
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
 | `stopbar run build\|test` | human, agent, CI | Runs the configured gate command and records its real exit status. |
-| `stopbar status [--json]` | human | Revision, gates, taint, budget, and why a commit is blocked. |
+| `stopbar status [--json]` | human | Revision, gates, taint, budget, why a commit is blocked, and which file or token turned the secret gate on. |
 | `stopbar approve-tests [--rev N]` | human | You reviewed the changed tests or test config up to revision N (default: the current one). |
 | `stopbar approve-shell` | human | Allows **one** risky or outbound call after a secret read. |
 | `stopbar resume --extra N` | human | Lifts a halt (retry limit or budget) and adds N to the budget. |
@@ -124,12 +124,24 @@ private snapshot index and the pinned runtime. They are outside the working tree
     "tests": ["**/tests/**", "**/*.test.*", "**/test_*.py"],
     "testConfig": ["package.json", "pyproject.toml", ".github/workflows/**"],
     "secrets": [".env*", "*.pem", "**/secrets/**"]
-  }
+  },
+  "safeTools": ["mcp__ccd_turn__*"]
 }
 ```
 
 A pattern without `/` matches the file name anywhere. `**` is a whole path segment. Matching ignores case. Change a
-profile by editing the lists: no code change is necessary. A damaged or empty `config.json` or `state.json` blocks every
+profile by editing the lists: no code change is necessary.
+
+- **Secrets in shell commands.** A token in a command counts as a secret read when it matches a secret pattern. For an
+  extension-only pattern such as `*.key` or `*.pem`, a bare token (`claim.key`, `self.pem`) counts only when that file
+  exists, because it is usually a field access in code; a token with a path separator (`certs/server.key`) and every
+  other pattern (`.env*`, `id_rsa*`) count always. `stopbar status` says why the secret gate is on, for example
+  `secret read yes (matched *.key (server.key) in Bash at rev 3)`; `events.jsonl` keeps the pattern and the token,
+  never the file content.
+- **`safeTools`** (optional) lists glob patterns of tool names that are local and never outbound. The default is
+  `["mcp__ccd_turn__*"]`, the task-list and turn-summary tools of Claude Desktop. It only exempts tools from the
+  outbound gate (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before, and a halted
+  session still blocks every tool. A damaged or empty `config.json` or `state.json` blocks every
 tool call (exit 2) with a message that says how to repair it.
 
 ## Local use
@@ -184,8 +196,8 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 26/26 | 221/221 | 201/201 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 26/26 | 221/221 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 28/28 | 235/235 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 28/28 | 235/235 | 201/201 sequences | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 1 regression on both platforms, with the same 5007 steps

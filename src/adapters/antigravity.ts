@@ -4,17 +4,18 @@
 // {"decision": "continue", "reason"} keeps the agent working. Tool names are the lower-cased step types.
 import {type Adapter, byName, commandText, edit, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
 
-const EDIT = new Set(['write_to_file', 'replace_file_content', 'multi_replace_file_content', 'code_action', 'file_change', 'propose_code',
-  'write_blob', 'edit_notebook', 'delete_directory', 'move'])
-const READ = new Set(['view_file', 'view_file_outline', 'view_code_item', 'view_content_chunk', 'read_notebook', 'list_directory', 'find', 'code_search'])
-const OUT = new Set(['read_url_content', 'search_web', 'open_browser_url', 'read_browser_page', 'mcp_tool'])
+// names seen in a live Antigravity CLI 1.5.18 session (write_file with Path) plus the step types of its hooks spec
+const EDIT = new Set(['write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file', 'notebook_edit', 'code_action',
+  'file_change', 'propose_code', 'write_blob', 'edit_notebook', 'delete_directory', 'move'])
+const READ = new Set(['view_file', 'view_file_outline', 'view_code_item', 'view_content_chunk', 'read_notebook', 'list_directory', 'list_dir', 'find', 'find_by_name', 'code_search', 'read_resource'])
+const OUT = new Set(['read_url_content', 'search_web', 'open_browser_url', 'read_browser_page', 'execute_browser_javascript', 'click_browser_pixel', 'mcp_tool', 'call_mcp_tool'])
 
 function tool(name: string, args: Record<string, any>): ToolClass {
-  if (name === 'run_command' || name === 'shell_exec' || name === 'send_command_input') return shell(commandText(args.CommandLine ?? args.Command ?? args.command ?? args.Input ?? ''))
+  if (name === 'run_command' || name === 'shell_exec' || name === 'send_command_input' || name === 'notebook_execution') return shell(commandText(args.CommandLine ?? args.Command ?? args.command ?? args.Input ?? ''))
   if (EDIT.has(name)) return edit(pathsOf(args))
   if (READ.has(name)) return read(pathsOf(args))
   if (name === 'grep_search') return {tool_name: 'Grep', tool_input: {pattern: args.Query ?? args.query, path: args.SearchPath ?? args.SearchDirectory}}
-  if (OUT.has(name) || name.startsWith('browser_')) return outbound(name === 'mcp_tool' ? `mcp__${args.ServerName ?? args.serverName ?? 'server'}__${args.ToolName ?? args.toolName ?? 'tool'}` : name)
+  if (OUT.has(name) || name.startsWith('browser_') || name.startsWith('capture_browser_')) return outbound(name === 'mcp_tool' || name === 'call_mcp_tool' ? `mcp__${args.ServerName ?? args.serverName ?? 'server'}__${args.ToolName ?? args.toolName ?? 'tool'}` : name)
   return byName(name, args, args.CommandLine)
 }
 

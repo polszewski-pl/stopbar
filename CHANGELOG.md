@@ -13,6 +13,12 @@
 - Self-protection also covers `.cursor/hooks.json`, `.codex/hooks.json`, `.codex/config.toml`, `.gemini/*settings*.json`,
   `.gemini/**/hooks.json` and `.agents/hooks.json`.
 - `stopbar doctor` checks the hooks of every client it finds and the git hooks.
+- `stopbar status`, `status --json` and `stopbar attest` say why the secret gate is on (pattern, file or token, tool,
+  revision); `events.jsonl` records the pattern and the token of every secret read, never the content.
+- No secret false alarm on code: a bare token that matches only an extension pattern (`*.key`, `*.pem`) counts only if
+  the file exists (`claim.key` in inline code is not a read; `cat server.key` and `cat certs/server.key` are).
+- `safeTools` in `config.json` (default `["mcp__ccd_turn__*"]`): local tools that are not treated as outbound.
+- Antigravity CLI tool names from a live session (`write_file`, `sed_file`, `call_mcp_tool`, `list_dir`, ...).
 - Package metadata: repository, homepage and bugs links.
 
 ## 1.0.0 (2026-11-26)

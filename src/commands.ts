@@ -79,6 +79,18 @@ export function init(o: Opts): Out {
   })
 }
 
+/** Why the secret gate is on: the first secret read since the last init or reset, from the event log. */
+export function secretReason(repo: Repo): {text: string; pattern?: string; path?: string; tool?: string; revision?: number} | null {
+  const ev = readEvents(repo).events
+  let start = 0
+  ev.forEach((e, i) => { if (e.source === 'human:init' || e.source === 'human:reset') start = i + 1 })
+  const hit = ev.slice(start).find((e) => e.req?.op === 'READ_SECRET' && e.secretTainted === true)
+  if (!hit) return null
+  if (!hit.secret) return {text: `${hit.source} at rev ${hit.treeRev} (pattern not recorded)`, revision: hit.treeRev}
+  const {pattern, path, tool} = hit.secret
+  return {text: `matched ${pattern} (${path}) in ${tool} at rev ${hit.treeRev}`, pattern, path, tool, revision: hit.treeRev}
+}
+
 function statusText(repo: Repo, cfg: Config, s: Saved): string {
   const v = decode(s.kernel)
   const yn = (b: boolean) => (b ? 'yes' : 'no')
@@ -90,7 +102,7 @@ function statusText(repo: Repo, cfg: Config, s: Saved): string {
     `revision   ${v.treeRev}   (tree ${s.snapshot.slice(0, 12)})`,
     `build      ${ok(v.buildOkRev)}      (${cfg.buildCmd})`,
     `full tests ${ok(v.testsOkRev)}      (${cfg.fullTestCmd})`,
-    `tainted    ${yn(v.testsTainted)}   secret read ${yn(v.secretTainted)}   shell approval held ${yn(v.shellToken)}`,
+    `tainted    ${yn(v.testsTainted)}   secret read ${v.secretTainted ? `yes (${secretReason(repo)?.text ?? 'reason not in the event log'})` : 'no'}   shell approval held ${yn(v.shellToken)}`,
     `session    ${v.halted ? 'HALTED' : 'running'}   spent ${v.spent}/${v.capNow}   test failures ${v.testFails}/${s.params.maxRetries}   build failures ${v.buildFails}/${s.params.maxRetries}`,
     `commit     ${commit}`,
     ...(torn ? [`event log  ${torn} torn line(s) kept as they are (see stopbar doctor)`] : []),
@@ -108,7 +120,8 @@ export function human(cmd: string, o: Opts): Out {
     }
     const s = readState(repo)
     if (cmd === 'status') {
-      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel)}, null, 1) : statusText(repo, cfg, s)}
+      return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
+        secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null}, null, 1) : statusText(repo, cfg, s)}
     }
     let res: Out
     if (cmd === 'approve-tests') {

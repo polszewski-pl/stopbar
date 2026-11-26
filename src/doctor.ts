@@ -5,7 +5,7 @@ import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:f
 import {isAbsolute, join} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
-import {makeConfig} from './config.ts'
+import {DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
 import {decode, MACHINE} from './engine.ts'
 import {runHook} from './hook.ts'
 import {PKG_ROOT} from './pkg.ts'
@@ -156,7 +156,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     try {
       const cfg = readConfig(repo); cfgOk = true
       add('OK', 'config.json', `profile ${cfg.profile}; build \`${cfg.buildCmd}\`; full tests \`${cfg.fullTestCmd}\`; maxRetries ${cfg.maxRetries}; cap ${cfg.cap}; ` +
-        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns`)
+        `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}`)
       for (const [k, v] of [['buildCmd', cfg.buildCmd], ['fullTestCmd', cfg.fullTestCmd]]) if (hasChain(v)) add('FAIL', 'config.json', `${k} has shell operators: it can never pass as a gate`)
       try {
         const s = readState(repo), v = decode(s.kernel)

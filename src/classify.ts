@@ -8,7 +8,12 @@ const norm = (p: string) => p.replace(/\\/g, '/')
 export const isTestPath = (p: string, paths: Paths) => matchAny(norm(p), paths.tests)
 export const isTestConfigPath = (p: string, paths: Paths) => matchAny(norm(p), paths.testConfig)
 /** Secret by file name. Absolute paths match too (a pattern may match any suffix of the path). */
-export const isSecretPath = (p: string, paths: Paths) => matchAnySuffix(norm(p), paths.secrets)
+/** The first secret pattern a path matches, or null. Absolute paths match too (a pattern may match any suffix). */
+export function secretPattern(p: string, paths: Paths): string | null {
+  for (const g of paths.secrets) if (matchAnySuffix(norm(p), [g])) return g
+  return null
+}
+export const isSecretPath = (p: string, paths: Paths) => secretPattern(p, paths) !== null
 
 // ---------------------------------------------------------------- safe heredoc commit
 // The one form of command substitution the wrapper lets through, the way Claude Code writes commit messages:
@@ -103,19 +108,33 @@ const TEST_RUNNER = new RegExp([
 ].join('|'), 'i')
 export const looksLikeTests = (cmd: string) => TEST_RUNNER.test(cmd)
 
-/** Secret paths named in a command (e.g. `cat .env`, `type secrets\\db.txt`). */
-export function mentionsSecret(cmd: string, paths: Paths): boolean {
-  return cmd.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean).some((tok) => isSecretPath(tok, paths))
+// Extension-only patterns such as *.key or *.pem: a bare token like `claim.key` or `self.key` is usually code (a field
+// access), not a file. Such a token counts only when the file exists; a token with a path separator (`certs/a.key`)
+// and every other pattern (`.env*`, `id_rsa*`, `auth.json`, `**/secrets/**`) count always.
+const EXT_ONLY = /^\*\.[^/*?{}\[\]]+$/
+export type SecretHit = {token: string; pattern: string}
+
+/** The first secret path named in a command (e.g. `cat .env`, `type secrets\\db.txt`), with the pattern it matched. */
+export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true): SecretHit | null {
+  for (const tok of cmd.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)) {
+    const hits = paths.secrets.filter((g) => matchAnySuffix(norm(tok), [g]))
+    if (!hits.length) continue
+    const strong = hits.find((g) => !EXT_ONLY.test(g))
+    if (strong) return {token: tok, pattern: strong}
+    if (/[\\/]/.test(tok) || exists(tok)) return {token: tok, pattern: hits[0]}
+  }
+  return null
 }
+export const mentionsSecret = (cmd: string, paths: Paths, exists?: (p: string) => boolean) => secretInCommand(cmd, paths, exists) !== null
 
 export type BashKind =
   | {kind: 'build'} | {kind: 'fulltest'}
   | {kind: 'commit'; heredoc: boolean; push: boolean} | {kind: 'commit-chained'; reason: string}
   | {kind: 'gate-chained'; gate: string; reason: string}
-  | {kind: 'shell'; risky: boolean; partialTests: boolean; secret: boolean}
+  | {kind: 'shell'; risky: boolean; partialTests: boolean; secret: SecretHit | null}
 
 /** Exact match of gate commands: no chain operators, no extra arguments. `shell` is 'bash' or 'powershell'. */
-export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd' | 'paths'>, shell: 'bash' | 'powershell' = 'bash'): BashKind {
+export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd' | 'paths'>, shell: 'bash' | 'powershell' = 'bash', exists?: (p: string) => boolean): BashKind {
   const c = cmd.trim()
   const scan = shell === 'bash' ? scanShell(c) : scanPlain(c)
   if (COMMIT_RE.test(scan.heredoc ? commandPart(c) : c)) {
@@ -129,7 +148,7 @@ export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTe
     if (c === cfg.buildCmd.trim()) return {kind: 'build'}
     if (c === cfg.fullTestCmd.trim()) return {kind: 'fulltest'}
   }
-  return {kind: 'shell', risky: isRiskyShell(c), partialTests: looksLikeTests(c), secret: mentionsSecret(c, cfg.paths)}
+  return {kind: 'shell', risky: isRiskyShell(c), partialTests: looksLikeTests(c), secret: secretInCommand(c, cfg.paths, exists)}
 }
 
 /** Kind of a tree change from a list of (status, path) and a test for "the path exists in HEAD". */
