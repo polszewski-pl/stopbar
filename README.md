@@ -20,9 +20,9 @@ hook payload into one internal event and renders the decision in the client's ow
 |---|---|---|---|---|
 | Claude Code | `claude`: `.claude/settings.local.json` (`claude-project`: `.claude/settings.json`) | PreToolUse, PostToolUse, PostToolUseFailure, Stop | exit 2, reason on stderr | live-verified (Claude Code 2.1.326) |
 | Cursor | `cursor`: `.cursor/hooks.json` (`failClosed: true`) | preToolUse, postToolUse, postToolUseFailure, stop (also beforeShellExecution, beforeMCPExecution, beforeReadFile, afterFileEdit, afterShellExecution) | exit 2 and `{"permission": "deny"}`; stop: `followup_message` | spec-tested (Cursor hooks reference) |
-| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | spec-tested (command hook schemas of Codex CLI 0.172.0); Codex loads project hooks only in a trusted folder |
+| Codex CLI | `codex`: `.codex/hooks.json` | PreToolUse, PostToolUse, Stop | `hookSpecificOutput.permissionDecision: "deny"`; stop: `decision: "block"` | live-verified (Codex CLI 0.172.0): denied commit and config write, tree changes, Stop. Run the gates as `npx stopbar run build` / `npx stopbar run test`, because Codex reports no exit status to hooks. Codex loads project hooks only in a trusted folder |
 | Gemini CLI | `gemini`: `.gemini/settings.json` | BeforeTool, AfterTool, AfterAgent | exit 2, reason on stderr; AfterAgent: `decision: "block"` | spec-tested (Gemini CLI hooks reference) |
-| Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | live-verified for PreToolUse deny and allow and PostToolUse (Antigravity CLI 1.5.18); Stop spec-tested |
+| Antigravity CLI | `antigravity` (alias `agy`): `.agents/hooks.json` | PreToolUse, PostToolUse, Stop | `{"decision": "deny"}`; stop: `decision: "continue"` | live-verified (Antigravity CLI 1.5.18): denied early commit and config write, build and full tests recorded, honest commit allowed, Stop |
 | Any tool, via git | `git`: `.git/hooks/pre-commit`, `.git/hooks/pre-push` | commit, push | exit 1 aborts git | tested with real git (E2E) |
 
 `live-verified` means a live agent session passed through the hooks; `spec-tested` means the adapter follows the
@@ -196,8 +196,8 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Unit | E2E | `stopbar probe` | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 28/28 | 235/235 | 201/201 sequences | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 28/28 | 235/235 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 28/28 | 237/237 | 201/201 sequences | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 28/28 | 237/237 | 201/201 sequences | proven, 10/10 mutants | OK |
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 1 regression on both platforms, with the same 5007 steps

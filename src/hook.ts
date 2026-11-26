@@ -32,8 +32,8 @@ function step(ctx: Ctx, req: Req, source: string, extra: Record<string, unknown>
 
 export function whyBlocked(v: View, cfg: Pick<Config, 'buildCmd' | 'fullTestCmd'>): string {
   const r: string[] = []
-  if (v.buildOkRev !== v.treeRev) r.push(`no passing build at revision ${v.treeRev} (run \`${cfg.buildCmd}\` exactly, alone)`)
-  if (v.testsOkRev !== v.treeRev) r.push(`no passing FULL test suite at revision ${v.treeRev} (run \`${cfg.fullTestCmd}\` exactly, alone)`)
+  if (v.buildOkRev !== v.treeRev) r.push(`no passing build at revision ${v.treeRev} (run \`${cfg.buildCmd}\` exactly, alone, or \`npx stopbar run build\`)`)
+  if (v.testsOkRev !== v.treeRev) r.push(`no passing FULL test suite at revision ${v.treeRev} (run \`${cfg.fullTestCmd}\` exactly, alone, or \`npx stopbar run test\`)`)
   if (v.testsTainted) r.push(`existing tests or test config changed: a human must review and run \`stopbar approve-tests --rev ${v.treeRev}\``)
   return r.join('; ') || 'kernel decision'
 }
@@ -165,6 +165,10 @@ function post(ctx: Ctx, input: any, failure: boolean): Out {
     if (failure && input.is_interrupt === true) {
       // Ctrl+C by the user: not a failed gate and not a retry; the tree is still checked below
       appendEvent(repo, {source: 'post:user-interrupt', tool, kind: k.kind})
+    } else if (!failure && unknown && (k.kind === 'build' || k.kind === 'fulltest' || (k.kind === 'shell' && k.partialTests))) {
+      // no exit status in the client's post event: neither a pass nor a failure is recorded (no evidence either way)
+      appendEvent(repo, {source: 'post:gate-without-exit-code', tool, kind: k.kind})
+      if (k.kind !== 'shell') msgs.push(`NOTE (stopbar): this client does not report the exit status of \`${k.kind === 'build' ? cfg.buildCmd : cfg.fullTestCmd}\`, so the run is not recorded. Run \`npx stopbar run ${k.kind === 'build' ? 'build' : 'test'}\` instead: it runs the same command and records its real exit status.`)
     } else if (k.kind === 'build') {
       step(ctx, {op: 'RUN_BUILD', passed, cost: cfg.costPerCall}, `post:build${note}`)
     } else if (k.kind === 'fulltest') {

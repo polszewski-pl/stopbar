@@ -552,6 +552,8 @@ type Client = {
   denied: (r: {code: number; out: string; err: string}) => boolean
   allowed: (r: {code: number; out: string; err: string}) => boolean
   stopBlocked: (r: {code: number; out: string; err: string}) => boolean
+  /** the client's post event carries no exit status: gates go through `stopbar run` */
+  noExit?: boolean
 }
 const J = (s: string) => { try { return JSON.parse(s) } catch { return null } }
 const CLIENTS: Client[] = [
@@ -573,11 +575,12 @@ const CLIENTS: Client[] = [
     pre: (repo, tool, arg) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'PreToolUse', model: 'm', permission_mode: 'default', turn_id: 't', tool_use_id: 'u',
       ...(tool === 'shell' ? {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', arg]}} : tool === 'write' ? {tool_name: 'apply_patch', tool_input: {input: `*** Begin Patch\n*** Update File: ${arg}\n*** End Patch`}} : {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', `cat ${arg}`]}})}),
     post: (repo, tool, arg, exit) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'PostToolUse', model: 'm', permission_mode: 'default', turn_id: 't', tool_use_id: 'u',
-      ...(tool === 'shell' ? {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', arg]}, tool_response: `Exit code: ${exit}\nWall time: 1s\nOutput:\n`} : {tool_name: 'apply_patch', tool_input: {input: `*** Begin Patch\n*** Update File: ${arg}\n*** End Patch`}, tool_response: 'Success'})}),
+      ...(tool === 'shell' ? {tool_name: 'exec_command', tool_input: {command: ['bash', '-lc', arg]}, tool_response: exit === 0 ? 'build ok\n' : 'not ok 1 - sum\n'} : {tool_name: 'apply_patch', tool_input: {input: `*** Begin Patch\n*** Update File: ${arg}\n*** End Patch`}, tool_response: 'Success'})}),
     stop: (repo) => ({session_id: 's', transcript_path: null, cwd: repo, hook_event_name: 'Stop', model: 'm', permission_mode: 'default', turn_id: 't', stop_hook_active: false, last_assistant_message: 'done'}),
     denied: (r) => r.code === 0 && J(r.out)?.hookSpecificOutput?.permissionDecision === 'deny',
     allowed: (r) => r.code === 0 && r.out === '',
     stopBlocked: (r) => r.code === 0 && J(r.out)?.decision === 'block' && /Not done/.test(J(r.out)?.reason ?? ''),
+    noExit: true,
   },
   {
     name: 'gemini',
@@ -631,9 +634,22 @@ for (const c of CLIENTS) {
   check(`${c.name}: auto detection writes the adapter into events.jsonl`, writeStep('src/sum.mjs', 'export const sum = (a, b) => a + b // ' + c.name + '\n').pre && events(repo).some((e) => e.source === 'hook-timing' && e.adapter === c.name))
   const early = shellStep('git commit -q -m "too early"')
   check(`${c.name}: commit before build and tests is denied in the client format`, !early.ran && c.denied(early.pre), early.pre.out || early.pre.err)
-  check(`${c.name}: failing full tests are counted as a failure`, (() => { writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => a - b\n'); const t = shellStep('node --test'); return t.exit !== 0 && status(repo).testFails === 1 })(), `testFails=${status(repo).testFails}`)
+  const gate = (which: 'build' | 'test') => spawnSync(process.execPath, [CLI, 'run', which, '--repo', repo], {encoding: 'utf8', cwd: repo})
+  if (c.noExit) {
+    writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => a - b\n')
+    const pre = clientHook(c, c.pre(repo, 'shell', 'node --test'), false)
+    const r = run('node --test', repo)
+    const post = clientHook(c, c.post(repo, 'shell', 'node --test', r.code), false)
+    check(`${c.name}: a gate run without an exit status is neither a pass nor a failure, and the agent is told to use stopbar run`,
+      c.allowed(pre) && r.code !== 0 && status(repo).testFails === 0 && /npx stopbar run test/.test(J(post.out)?.reason ?? ''), post.out.slice(0, 160))
+    check(`${c.name}: \`stopbar run test\` from the agent's shell is allowed`, c.allowed(clientHook(c, c.pre(repo, 'shell', 'npx stopbar run test'), false)))
+    check(`${c.name}: failing full tests through stopbar run are counted as a failure`, gate('test').status !== 0 && status(repo).testFails === 1, `testFails=${status(repo).testFails}`)
+  } else {
+    check(`${c.name}: failing full tests are counted as a failure`, (() => { writeFileSync(join(repo, 'src', 'sum.mjs'), 'export const sum = (a, b) => a - b\n'); const t = shellStep('node --test'); return t.exit !== 0 && status(repo).testFails === 1 })(), `testFails=${status(repo).testFails}`)
+  }
   writeStep('src/sum.mjs', 'export const sum = (a, b) => a + b // fixed\n')
-  const b = shellStep('node build.mjs', true), t = shellStep('node --test', true)
+  const b = c.noExit ? {exit: gate('build').status} : shellStep('node build.mjs', true)
+  const t = c.noExit ? {exit: gate('test').status} : shellStep('node --test', true)
   const v = status(repo)
   check(`${c.name}: passing build and full tests are recorded (--adapter ${c.name})`, b.exit === 0 && t.exit === 0 && v.buildOkRev === v.treeRev && v.testsOkRev === v.treeRev && v.testFails === 0, `build ${v.buildOkRev} tests ${v.testsOkRev} rev ${v.treeRev}`)
   run('git add -A', repo)

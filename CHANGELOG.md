@@ -19,6 +19,8 @@
   the file exists (`claim.key` in inline code is not a read; `cat server.key` and `cat certs/server.key` are).
 - `safeTools` in `config.json` (default `["mcp__ccd_turn__*"]`): local tools that are not treated as outbound.
 - Antigravity CLI tool names from a live session (`write_file`, `sed_file`, `call_mcp_tool`, `list_dir`, ...).
+- A gate command whose post event carries no exit status (Codex CLI) is recorded neither as a pass nor as a failure,
+  and the agent is told to use `stopbar run build|test`; blocked commits name `stopbar run` as the other way.
 - Package metadata: repository, homepage and bugs links.
 
 ## 1.0.0 (2026-11-26)

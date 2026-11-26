@@ -104,9 +104,11 @@ that tries to defeat it:
     - Cursor: a hook exit other than 0 and 2 is fail-open unless the entry sets `failClosed: true`; `init --hooks
       cursor` sets it. `afterShellExecution` carries no exit code, so a gate command seen only there never passes; the
       config written by `init` uses `preToolUse` and `postToolUse`.
-    - Codex CLI: there is no failure event. A build or full test run passes only when an exit code 0 is found in the
-      tool result. Codex loads `.codex/` (config and hooks) only in a trusted project, and asks the user to review and trust project
-      hooks; until then they do not run (a live run in an untrusted folder loaded none).
+    - Codex CLI: there is no failure event, and the tool result of a shell call is the plain output without the exit
+      status (seen live in 0.172.0). A gate command seen there is recorded neither as a pass nor as a failure; the agent
+      is told to run `stopbar run build|test`, which runs the command and records its real exit status. Codex loads
+      `.codex/` (config and hooks) only in a trusted project and asks the user to review and trust project hooks; until
+      then they do not run (a live run in an untrusted folder loaded none).
     - Gemini CLI: an exit other than 0 and 2 is only a warning, and invalid JSON output counts as "allow". Stopbar exits
       2 for every block and internal error, but a crash before Stopbar's own handler (for example a missing Node.js)
       fails open. Gemini CLI warns when a project hook changes and treats it as untrusted.
