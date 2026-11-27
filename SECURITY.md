@@ -299,6 +299,19 @@ Other limits:
 - Adapters: Cursor, Codex CLI, Gemini CLI and Antigravity CLI are spec-tested; a client can change its hook schema.
 - Hook latency: Windows starts a process in 50–70 ms, so a hook with one git process takes about 120–200 ms in all.
 
+## Fixed vulnerabilities
+
+- **`stopbar doctor` with `GIT_DIR` wrote into the repository under check. Affected: 1.0.0 to 1.2.2 (every release
+  with the doctor dry run). Fixed in 1.2.3.** When `GIT_DIR` (or another `GIT_*` variable that points git at a
+  repository, such as `GIT_WORK_TREE` or `GIT_INDEX_FILE`) pointed at the repository under check, for example when
+  doctor ran inside a git hook or a script that exports it, the dry run inherited it. Its `git init`, `git add -A` and
+  `git commit` then ran on that repository, and its scratch config and state went into that repository's Stopbar
+  directory. Seen in reproductions on 1.0.0 and 1.2.2: `core.bare` set to `true` (the working tree no longer usable),
+  the index replaced by the scratch files, a commit `base` with the scratch files, and a rewritten `events.jsonl` and
+  `state.json`; which of these happens depends on the state of the repository and its git hooks. Since 1.2.3 the dry
+  run drops every `GIT_*` variable and refuses a scratch directory that git resolves to another repository. Check a
+  repository where doctor ran with `GIT_DIR` set: `git config --get core.bare`, `git log`, `git status`.
+
 ## Reporting a vulnerability
 
 Send a private report to the maintainers before you publish it. Include the Stopbar version, `stopbar doctor --json`

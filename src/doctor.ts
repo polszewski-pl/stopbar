@@ -1,7 +1,7 @@
 // `stopbar doctor`: environment, configuration, state, hooks, and a dry run of the real hook pipeline on a scratch repo.
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
-import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
 import {isAbsolute, join, relative} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
@@ -172,19 +172,46 @@ function checkWslBash(cmds: string[], add: (s: Check['status'], n: string, d: st
   if (w) add('WARN', 'gate shell', w)
 }
 
-/** The real hook pipeline (in process) on a scratch repository inside <git-dir>/stopbar/doctor-run. */
-function dryRun(base: string, add: (s: Check['status'], n: string, d: string) => void) {
-  const dir = join(base, 'doctor-run')
-  rmSync(dir, {recursive: true, force: true})
-  mkdirSync(join(dir, 'src'), {recursive: true}); mkdirSync(join(dir, 'tests'), {recursive: true})
-  const g = (...a: string[]) => execFileSync('git', ['-c', 'user.name=stopbar-doctor', '-c', 'user.email=doctor@stopbar.invalid', '-c', 'commit.gpgsign=false', ...a], {cwd: dir, stdio: 'ignore'})
-  try {
+// Variables that point git at another repository (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...), set for example when
+// doctor runs inside a git hook. With them, the scratch repository's git init, add and commit and its Stopbar state went
+// into the repository under check (1.0.0-1.2.2). The scratch repository never sees them.
+const GIT_ENV = /^GIT_/i
+/** process.env without the GIT_* variables, for a child process that works on a scratch repository. */
+const scratchEnv = (): NodeJS.ProcessEnv => Object.fromEntries(Object.entries(process.env).filter(([k]) => !GIT_ENV.test(k)))
+/** Runs `f` with the GIT_* variables removed from process.env (in-process git calls inherit it), then puts them back. */
+function withoutGitEnv<T>(f: () => T): T {
+  const saved = Object.entries(process.env).filter(([k]) => GIT_ENV.test(k))
+  for (const [k] of saved) delete process.env[k]
+  try { return f() } finally { for (const [k, v] of saved) process.env[k] = v }
+}
+
+/** A scratch Stopbar repository in `dir` (one base commit, fresh config and state), built without the GIT_* variables.
+ *  Refuses a directory that git does not resolve to itself, so no Stopbar state is written into another repository. */
+function scratchRepo(dir: string): Repo {
+  return withoutGitEnv(() => {
+    mkdirSync(join(dir, 'src'), {recursive: true}); mkdirSync(join(dir, 'tests'), {recursive: true})
+    const g = (...a: string[]) => execFileSync('git', ['-c', 'user.name=stopbar-doctor', '-c', 'user.email=doctor@stopbar.invalid', '-c', 'commit.gpgsign=false', ...a],
+      {cwd: dir, stdio: 'ignore', env: scratchEnv()})
     writeFileSync(join(dir, 'src', 'a.mjs'), 'export const a = 1\n')
     writeFileSync(join(dir, 'tests', 'a.test.mjs'), 'export {}\n')
     g('init', '-q'); g('add', '-A'); g('commit', '-q', '-m', 'base')
     const repo: Repo = findRepo(dir)
+    // the temp dir may be a link (macOS /var -> /private/var): compare real paths, without case on Windows
+    const real = (p: string) => { const r = realpathSync.native(p); return process.platform === 'win32' ? r.toLowerCase() : r }
+    if (real(repo.root) !== real(dir)) throw new FailClosed(`scratch repository ${dir} resolves to ${repo.root}; not writing a Stopbar state there`)
     const cfg = makeConfig({buildCmd: 'node build.mjs', fullTestCmd: 'node --test'})
     writeConfig(repo, cfg); writeState(repo, fresh(repo, cfg))
+    return repo
+  })
+}
+
+/** The real hook pipeline (in process) on a scratch repository inside <git-dir>/stopbar/doctor-run, without the GIT_*
+ *  variables (see scratchRepo). */
+function dryRun(base: string, add: (s: Check['status'], n: string, d: string) => void) {
+  const dir = join(base, 'doctor-run')
+  rmSync(dir, {recursive: true, force: true})
+  try {
+    const repo = scratchRepo(dir)
     const hook = (ev: string, tool: string, ti: object, extra: object = {}) => runHook(JSON.stringify({hook_event_name: ev, tool_name: tool, tool_input: ti, cwd: dir, ...extra}))
     const steps: [string, () => boolean][] = [
       ['edit code is allowed', () => { const p = hook('PreToolUse', 'Write', {file_path: join(dir, 'src', 'a.mjs')}).code === 0; writeFileSync(join(dir, 'src', 'a.mjs'), 'export const a = 2\n'); return p && hook('PostToolUse', 'Write', {file_path: join(dir, 'src', 'a.mjs')}).code === 0 }],
@@ -264,7 +291,8 @@ export async function doctor(o: {repo?: string; json?: boolean; strict?: boolean
     const named = ev.events.filter((e) => (e.source === 'human:init' || e.source === 'human:upgrade') && Array.isArray(e.hooks)).at(-1)?.hooks as unknown[] | undefined
     const wantClaude = !!named?.some((t) => t === 'claude' || t === 'claude-project')
     if (claudeHas || (others.clients === 0 && (others.git === 0 || wantClaude))) checkHooks(repo.root, add)
-    try { dryRun(repo.stateDir, add) } catch (e) { add('FAIL', 'dry run', String(e)) }
+    const stateDir = repo.stateDir
+    try { withoutGitEnv(() => dryRun(stateDir, add)) } catch (e) { add('FAIL', 'dry run', String(e)) }
   }
   const fails = checks.filter((c) => c.status === 'FAIL').length, warns = checks.filter((c) => c.status === 'WARN').length
   const strictFail = o.strict === true && warns > 0

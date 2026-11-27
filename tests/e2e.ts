@@ -1709,6 +1709,26 @@ say("\nS45 stopbar run: the gate command does not inherit PWD on Windows; a .pro
   keepEvents(repo, 's45-run-pwd')
 }
 
+// ---------------------------------------------------------------- S46 doctor inside a git hook (GIT_DIR) is read-only
+say('\nS46 doctor with GIT_DIR set to the repository under check (as inside a git hook) writes nothing into it')
+for (const [name, init] of [['no-git-hooks', ['--hooks', 'local', '--no-git-hooks']], ['git-hooks', ['--hooks', 'local']]] as const) {
+  const repo = setupRepo(`s46-doctor-git-dir-${name}`, 3, false, [...init])
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => a + b // s46\n')
+  agentBash(repo, 'node build.mjs')
+  const ef = join(stateDir(repo), 'events.jsonl'), stf = join(stateDir(repo), 'state.json')
+  const fp = (f: string) => (existsSync(f) ? `${readFileSync(f).length}:${sha(f)}` : 'missing')
+  const before = [fp(ef), fp(stf)], head0 = run('git rev-parse HEAD', repo).stdout.trim(), st0 = run('git status --porcelain', repo).stdout
+  const d = spawnSync(process.execPath, [CLI, 'doctor', '--repo', repo], {encoding: 'utf8', cwd: TMP, env: {...process.env, GIT_DIR: join(repo, '.git')}})
+  const after = [fp(ef), fp(stf)]
+  check(`${name}: doctor with GIT_DIR: events.jsonl and state.json have the same size and sha256`,
+    before[0] !== 'missing' && before[1] !== 'missing' && after[0] === before[0] && after[1] === before[1], JSON.stringify({before, after}))
+  check(`${name}: doctor with GIT_DIR: git rev-parse HEAD and the working tree unchanged`,
+    run('git rev-parse HEAD', repo).stdout.trim() === head0 && run('git status --porcelain', repo).stdout === st0, `${head0} -> ${run('git rev-parse HEAD', repo).stdout.trim()}`)
+  check(`${name}: doctor with GIT_DIR: the dry run runs on its own scratch repository (no [FAIL] dry run)`, d.status === 0 && !/\[FAIL\] dry run/.test(d.stdout) && (d.stdout.match(/\[OK {2}\] dry run/g) ?? []).length === 9,
+    `exit ${d.status}; ${d.stdout.split('\n').filter((l) => /FAIL/.test(l)).join(' | ').slice(0, 300)}`)
+  keepEvents(repo, `s46-doctor-git-dir-${name}`)
+}
+
 // ---------------------------------------------------------------- S12 (last: over all hook calls)
 say('\nS12 block protocol: BLOCK/PAUSE = exit 2 with the reason on stderr; never exit 1')
 {

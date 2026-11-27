@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.3] (unreleased)
+
+`src/kernel.ts` is unchanged; no new dependency. `PreToolUse` still starts no git process.
+
+- **Security fix: `stopbar doctor` with `GIT_DIR` no longer writes into the repository under check (affected:
+  1.0.0–1.2.2).** With `GIT_DIR` or another `GIT_*` variable pointing at that repository (for example inside a git
+  hook), the dry run's `git init`, `git add -A` and `git commit` ran on it and its scratch config and state went into
+  its Stopbar directory: `core.bare` could be set to `true`, the index replaced, a commit `base` with the scratch files
+  added, and `events.jsonl` and `state.json` rewritten. The dry run now runs without the `GIT_*` variables and refuses
+  a scratch directory that git resolves to another repository. Details in SECURITY.md (Fixed vulnerabilities).
+
 ## [1.2.2] (2026-11-27)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.2.1. No new dependency.
