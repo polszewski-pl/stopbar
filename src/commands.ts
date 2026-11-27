@@ -168,7 +168,7 @@ export function secretReason(repo: Repo): {text: string; pattern?: string; path?
 
 /** `now`: the working tree as it is now. A change no hook has counted yet (now.id !== s.snapshot) keeps a commit blocked
  *  at the next hook (pre:commit-sync), so status never says `allowed` then. */
-function statusText(repo: Repo, cfg: Config, s: Saved, now: Snap): string {
+function statusText(repo: Repo, cfg: Config, s: Saved, now: Snap, differs: boolean | null): string {
   const v = decode(s.kernel)
   const yn = (b: boolean) => (b ? 'yes' : 'no')
   const ok = (rev: number) => (rev === v.treeRev ? `ok at revision ${rev}` : 'not at the current revision')
@@ -184,6 +184,7 @@ function statusText(repo: Repo, cfg: Config, s: Saved, now: Snap): string {
     `build      ${ok(v.buildOkRev)}      (${cfg.buildCmd})`,
     `full tests ${ok(v.testsOkRev)}      (${cfg.fullTestCmd})`,
     `tainted    ${yn(v.testsTainted)}   secret read ${v.secretTainted ? `yes (${secretReason(repo)?.text ?? 'reason not in the event log'})` : 'no'}   shell approval held ${yn(v.shellToken)}`,
+    ...(differs === false ? [`note: no existing test or test-config file currently differs from ${cfg.baseRef}; if ${cfg.baseRef} advanced after the previous task, a human can run \`stopbar reset\` (or \`stopbar approve-tests\`)`] : []),
     `session    ${v.halted ? 'HALTED' : 'running'}   spent ${v.spent}/${v.capNow}   test failures ${v.testFails}/${s.params.maxRetries}   build failures ${v.buildFails}/${s.params.maxRetries}`,
     `commit     ${commit}`,
     `stop gate  ${cfg.stopGate ?? 'block'}${cfg.stopGate === 'warn' ? '   (Stop only warns; git commit and git push stay blocked until the gates pass)' : ''}`,
@@ -208,8 +209,12 @@ export function human(cmd: string, o: Opts): Out {
     if (cmd === 'status') {
       // the working tree now (read-only for state.json, as in attest: only the private snapshot index is refreshed)
       const now = snapshot(repo)
+      // testsTainted with a baseRef: does the tree still change an existing test or test config against it? A hint for
+      // the human only (e.g. baseRef absorbed the change); the taint itself stays until reset or approve-tests (L2.2).
+      // Read-only; a baseRef that no longer resolves fails closed, as in the hooks.
+      const differs = decode(s.kernel).testsTainted && cfg.baseRef && cfg.baseRef !== 'HEAD' ? dirtyTests(repo, cfg, now).suspicious : null
       return {code: 0, msg: o.has('json') ? JSON.stringify({version: VERSION, repo: repo.root, stateDir: repo.stateDir, config: cfg, stopGate: cfg.stopGate ?? 'block', ...(cfg.requireRun ? {requireRun: true} : {}), snapshot: s.snapshot, params: s.params, kernel: decode(s.kernel),
-        secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null, workingTreeSnapshot: now.id, workingTreeCounted: now.id === s.snapshot}, null, 1) : statusText(repo, cfg, s, now)}
+        secretRead: decode(s.kernel).secretTainted ? secretReason(repo) : null, workingTreeSnapshot: now.id, workingTreeCounted: now.id === s.snapshot, taintedDiffersFromBaseRef: differs}, null, 1) : statusText(repo, cfg, s, now, differs)}
     }
     let res: Out
     if (cmd === 'approve-tests') {

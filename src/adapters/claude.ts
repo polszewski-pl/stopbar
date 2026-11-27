@@ -8,7 +8,7 @@ export const claude: Adapter = {
   name: 'claude',
   detect: (i) => typeof i.hook_event_name === 'string',
   normalize(i) {
-    const kind = KIND[i.hook_event_name] ?? 'other'
+    const kind = KIND[String(i.hook_event_name)] ?? 'other'
     return {kind, event: kind === 'other' ? null : (i as Internal)}
   },
   render(_kind, out) {

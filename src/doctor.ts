@@ -2,12 +2,13 @@
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
-import {isAbsolute, join} from 'node:path'
+import {join} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
 import {cliOf, DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
 import {decode, MACHINE} from './engine.ts'
 import {runHook} from './hook.ts'
+import {gitHooksDir} from './integrations.ts'
 import {PKG_ROOT} from './pkg.ts'
 import {FailClosed, findRepo, hasRefTree, type Repo} from './repo.ts'
 import {paths, readConfig, readEvents, readState, VERSION, writeConfig, writeState} from './store.ts'
@@ -15,9 +16,12 @@ import {paths, readConfig, readEvents, readState, VERSION, writeConfig, writeSta
 type Check = {status: 'OK' | 'WARN' | 'FAIL'; name: string; detail: string}
 const sha = (f: string) => createHash('sha256').update(readFileSync(f)).digest('hex')
 
-function hooksIn(file: string): Record<string, any[]> | null {
+type Obj = Record<string, unknown>
+const isObj = (x: unknown): x is Obj => !!x && typeof x === 'object' && !Array.isArray(x)
+
+function hooksIn(file: string): Obj | null {
   if (!existsSync(file)) return null
-  try { return JSON.parse(readFileSync(file, 'utf8')).hooks ?? {} } catch { return {__invalid: []} }
+  try { const j: unknown = JSON.parse(readFileSync(file, 'utf8')); return isObj(j) && isObj(j.hooks) ? j.hooks : {} } catch { return {__invalid: []} }
 }
 
 function checkHooks(root: string, add: (s: Check['status'], n: string, d: string) => void) {
@@ -29,8 +33,11 @@ function checkHooks(root: string, add: (s: Check['status'], n: string, d: string
     if ('__invalid' in h) { add('FAIL', 'hooks', `${f} is not valid JSON: Claude Code will not load the hooks`); continue }
     for (const [ev, entries] of Object.entries(h)) {
       for (const e of Array.isArray(entries) ? entries : []) {
-        for (const x of Array.isArray(e?.hooks) ? e.hooks : []) {
-          if (typeof x?.command === 'string' && /stopbar(\.mjs)?"?\s+hook\b/.test(x.command)) (merged[ev] ??= []).push({matcher: e.matcher, command: x.command, file: f})
+        if (!isObj(e)) continue
+        for (const x of Array.isArray(e.hooks) ? e.hooks : []) {
+          if (isObj(x) && typeof x.command === 'string' && /stopbar(\.mjs)?"?\s+hook\b/.test(x.command)) {
+            (merged[ev] ??= []).push({matcher: typeof e.matcher === 'string' ? e.matcher : undefined, command: x.command, file: f})
+          }
         }
       }
     }
@@ -50,10 +57,13 @@ function checkHooks(root: string, add: (s: Check['status'], n: string, d: string
 
 const STOPBAR = /stopbar(\.mjs)?"?\s+(hook|git-hook)\b/
 const scriptOf = (cmd: string) => /node\s+"?([^"]+?stopbar\.mjs)"?\s+(?:git-)?hook/.exec(cmd)?.[1]
-function readJsonOrInvalid(f: string): any | null | 'invalid' {
-  if (!existsSync(f)) return null
-  try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return 'invalid' }
+const INVALID = Symbol('invalid JSON')
+/** undefined: no file; INVALID: not JSON; else the parsed value. */
+function readJsonOrInvalid(f: string): unknown {
+  if (!existsSync(f)) return undefined
+  try { return JSON.parse(readFileSync(f, 'utf8')) as unknown } catch { return INVALID }
 }
+const hooksOf = (j: unknown) => (isObj(j) && isObj(j.hooks) ? j.hooks : undefined)
 /** Commands of Stopbar hooks per event, from any nesting of {command} objects under each event. */
 function stopbarCommands(events: Record<string, unknown> | undefined): Record<string, string[]> {
   const out: Record<string, string[]> = {}
@@ -71,16 +81,16 @@ function stopbarCommands(events: Record<string, unknown> | undefined): Record<st
 /** Other clients and the git fallback. Returns how many clients have Stopbar hooks, and how many Stopbar git hooks exist. */
 function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: string) => void): {clients: number; git: number} {
   let found = 0
-  const clients: [string, string, (j: any) => Record<string, unknown> | undefined, string[]][] = [
-    ['cursor', join(repo.root, '.cursor', 'hooks.json'), (j) => j.hooks, ['preToolUse', 'postToolUse', 'postToolUseFailure', 'stop']],
-    ['codex', join(repo.root, '.codex', 'hooks.json'), (j) => j.hooks, ['PreToolUse', 'PostToolUse', 'Stop']],
-    ['gemini', join(repo.root, '.gemini', 'settings.json'), (j) => j.hooks, ['BeforeTool', 'AfterTool', 'AfterAgent']],
-    ['antigravity', join(repo.root, '.agents', 'hooks.json'), (j) => Object.assign({}, ...Object.values(j).filter((v) => v && typeof v === 'object' && (v as any).enabled !== false)), ['PreToolUse', 'PostToolUse', 'Stop']],
+  const clients: [string, string, (j: unknown) => Obj | undefined, string[]][] = [
+    ['cursor', join(repo.root, '.cursor', 'hooks.json'), hooksOf, ['preToolUse', 'postToolUse', 'postToolUseFailure', 'stop']],
+    ['codex', join(repo.root, '.codex', 'hooks.json'), hooksOf, ['PreToolUse', 'PostToolUse', 'Stop']],
+    ['gemini', join(repo.root, '.gemini', 'settings.json'), hooksOf, ['BeforeTool', 'AfterTool', 'AfterAgent']],
+    ['antigravity', join(repo.root, '.agents', 'hooks.json'), (j) => (isObj(j) ? Object.assign({}, ...Object.values(j).filter((v) => isObj(v) && v.enabled !== false)) : undefined), ['PreToolUse', 'PostToolUse', 'Stop']],
   ]
   for (const [name, f, events, need] of clients) {
     const j = readJsonOrInvalid(f)
-    if (j === null) continue
-    if (j === 'invalid') { add('FAIL', `hooks ${name}`, `${f} is not valid JSON`); found++; continue }
+    if (j === undefined) continue
+    if (j === INVALID) { add('FAIL', `hooks ${name}`, `${f} is not valid JSON`); found++; continue }
     const cmds = stopbarCommands(events(j))
     if (!Object.keys(cmds).length) continue
     found++
@@ -88,15 +98,29 @@ function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: s
     const script = scriptOf(Object.values(cmds)[0][0])
     if (missing.length) add('FAIL', `hooks ${name}`, `${f}: no Stopbar hook for ${missing.join(', ')}`)
     else if (script && !existsSync(script)) add('FAIL', `hooks ${name}`, `script not found: ${script}`)
-    else if (name === 'cursor' && JSON.stringify(j.hooks).includes('"failClosed":false')) add('WARN', `hooks ${name}`, `${f}: failClosed is false, so a crash of the hook lets the action run`)
+    else if (name === 'cursor' && JSON.stringify(hooksOf(j) ?? {}).includes('"failClosed":false')) add('WARN', `hooks ${name}`, `${f}: failClosed is false, so a crash of the hook lets the action run`)
     else add('OK', `hooks ${name}`, `${need.join(', ')} (${f.replace(/\\/g, '/').split('/').slice(-2).join('/')})`)
   }
-  let dir = join(repo.gitDir, 'hooks')
-  try { const rel = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], {cwd: repo.root, encoding: 'utf8'}).trim(); dir = isAbsolute(rel) ? rel : join(repo.root, rel) } catch { /* default */ }
-  const gh = ['pre-commit', 'pre-push'].filter((n) => existsSync(join(dir, n)) && readFileSync(join(dir, n), 'utf8').includes('stopbar.mjs" git-hook'))
+  let hd: {dir: string; customHooksPath: string | null} = {dir: join(repo.gitDir, 'hooks'), customHooksPath: null}
+  try { hd = gitHooksDir(repo) } catch { /* default */ }
+  const {dir} = hd
+  // a Stopbar line that is not a comment: the hook init writes, or `stopbar git-hook <name>` chained by hand (Husky, Lefthook)
+  const calls = (n: string) => new RegExp(`^[^#\\n]*stopbar(\\.mjs)?"?\\s+git-hook\\s+${n}\\b`, 'm')
+  const gh = ['pre-commit', 'pre-push'].filter((n) => existsSync(join(dir, n)) && calls(n).test(readFileSync(join(dir, n), 'utf8')))
   const lacking = ['pre-commit', 'pre-push'].filter((n) => !gh.includes(n))
   // the git hooks close what an agent hook cannot see: git aliases, and on pre-push merge, cherry-pick, am and commit-tree
   if (!lacking.length) add('OK', 'hooks git', `pre-commit, pre-push in ${dir}`)
+  else if (hd.customHooksPath !== null) {
+    // the exact line for the existing hook manager (Husky, Lefthook, a shared directory): the pinned runtime, else this copy
+    const rt = existsSync(join(repo.stateDir, 'runtime', 'bin', 'stopbar.mjs')) ? join(repo.stateDir, 'runtime') : PKG_ROOT
+    const bin = join(rt, 'bin', 'stopbar.mjs').replace(/\\/g, '/')
+    let cli = cliOf({})
+    try { cli = cliOf(readConfig(repo)) } catch { /* reported by the config.json check */ }
+    add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in the custom core.hooksPath (${dir}): git ${lacking.map((n) => (n === 'pre-commit' ? 'commit' : 'push')).join(' and git ')} ` +
+      `${lacking.length > 1 ? 'are' : 'is'} NOT gated by Stopbar in this repository. Stopbar does not write shared or tracked hooks; a human adds one line to each hook of the existing hook manager: ` +
+      lacking.map((n) => `${n}: node "${bin}" git-hook ${n}`).join('; ') + ` (or \`${cli} git-hook pre-commit|pre-push\`); ` +
+      'or runs `stopbar upgrade --hooks git --force-hooks` to write them there, keeping a .stopbar-backup')
+  }
   else add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in ${dir}: the git hooks close git aliases, and on pre-push merge, cherry-pick, am and commit-tree, which an agent hook does not see; a human runs \`stopbar upgrade --hooks git\``)
   return {clients: found, git: gh.length}
 }
@@ -151,7 +175,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     try {
       const {checkGenerated} = await import('./verify.ts')
       const g = await checkGenerated(500)
-      add(g.ok ? 'OK' : 'FAIL', 'kernel link', `compileJs(kernel.ts) == dist/kernel.gen.js: ${g.sameMachine}; kernel.ts hash: ${g.sameSource}; ${(g.differential as any).steps} steps vs interpreter, ${(g.differential as any).mismatches} mismatches`)
+      add(g.ok ? 'OK' : 'FAIL', 'kernel link', `compileJs(kernel.ts) == dist/kernel.gen.js: ${g.sameMachine}; kernel.ts hash: ${g.sameSource}; ${g.differential.steps} steps vs interpreter, ${g.differential.mismatches} mismatches`)
     } catch (e) { add('WARN', 'kernel link', `not checked: ${(e as Error).message}`) }
   } else add('WARN', 'kernel link', 'gdp-wired cannot be resolved from this copy (a pinned runtime has no node_modules): run `stopbar prove` in the package')
 
@@ -163,7 +187,8 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
       const cfg = readConfig(repo); cfgOk = true
       add('OK', 'config.json', `profile ${cfg.profile}; build \`${cfg.buildCmd}\`; full tests \`${cfg.fullTestCmd}\`; maxRetries ${cfg.maxRetries}; cap ${cfg.cap}; ` +
         `${cfg.paths.tests.length}/${cfg.paths.testConfig.length}/${cfg.paths.secrets.length} test/config/secret patterns; safeTools ${JSON.stringify(cfg.safeTools ?? DEFAULT_SAFE_TOOLS)}${cfg.baseRef ? `; baseRef ${cfg.baseRef}` : ''}; ` +
-        `stopGate ${cfg.stopGate ?? 'block'}; cli ${cliOf(cfg)}${cfg.requireRun ? '; requireRun: true' : ''}`)
+        `stopGate ${cfg.stopGate ?? 'block'}; cli ${cliOf(cfg)}${cfg.requireRun ? '; requireRun: true' : ''}; ` +
+        (cfg.requireRun ? 'gates: stopbar run only (--require-run)' : 'gates: hook command text (use --require-run for exit-code-only gates)'))
       if (cfg.stopGate === 'warn') add('WARN', 'stopGate', 'warn: Stop does not block a turn with unverified changes (logged as stop:warn); git commit and git push stay blocked until the gates pass')
       const safe = cfg.safeTools ?? DEFAULT_SAFE_TOOLS
       const missing = DEFAULT_SAFE_TOOLS.filter((t) => !safe.includes(t))

@@ -26,9 +26,9 @@ export interface Adapter {
   name: AdapterName
   /** Deterministic test on the parsed payload. */
   detect(input: Record<string, unknown>): boolean
-  normalize(input: Record<string, any>): Normalized
+  normalize(input: Record<string, unknown>): Normalized
   /** Output for a decision; `kind` is 'pre-tool' when the payload could not be read at all (fail closed). */
-  render(kind: Kind, out: Out, input: Record<string, any> | null): Rendered
+  render(kind: Kind, out: Out, input: Record<string, unknown> | null): Rendered
 }
 
 // ---------------------------------------------------------------- shared tool mapping
@@ -72,14 +72,14 @@ export function pathsOf(args: Record<string, unknown> | undefined): string[] {
 /** Fallback by name for tools a client adds later: shell, edit, read or outbound by keyword, else other. */
 export function byName(name: string, args: Record<string, unknown> | undefined, command?: unknown): ToolClass {
   const n = name.toLowerCase()
-  if (/shell|terminal|command|exec|bash|run_/.test(n)) return shell(commandText(command ?? (args as any)?.command ?? (args as any)?.CommandLine ?? ''))
+  if (/shell|terminal|command|exec|bash|run_/.test(n)) return shell(commandText(command ?? args?.command ?? args?.CommandLine ?? ''))
   if (/write|edit|delete|replace|patch|create|move|rename|remove|change|propose|blob/.test(n)) return edit(pathsOf(args))
   if (/read|view|open_file|cat|grep|search_file|find|glob|list/.test(n)) return read(pathsOf(args))
   if (/fetch|web|browser|http|url|mcp/.test(n)) return outbound(n.startsWith('mcp') ? `mcp__${name}` : name)
   return other(name)
 }
 
-export function make(adapter: AdapterName, raw: Record<string, any>, event: string, base: Partial<Internal> & {hook_event_name: Internal['hook_event_name']}, extra: Partial<Internal['stopbar']> = {}): Internal {
+export function make(adapter: AdapterName, raw: Record<string, unknown>, event: string, base: Partial<Internal> & {hook_event_name: Internal['hook_event_name']}, extra: Partial<Internal['stopbar']> = {}): Internal {
   return {...base, stopbar: {adapter, rawKeys: Object.keys(raw), event, ...extra}} as Internal
 }
 
@@ -100,3 +100,6 @@ export function exitCodeIn(r: unknown, depth = 0): number | undefined {
 }
 
 export const json = (o: unknown) => JSON.stringify(o)
+
+/** A payload field that must be a string; anything else counts as absent. */
+export const str = (x: unknown): string | undefined => (typeof x === 'string' ? x : undefined)

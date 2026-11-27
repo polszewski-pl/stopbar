@@ -130,7 +130,7 @@ async function execute(run: Run, dir: string): Promise<Outcome> {
   let st = IT.init(P)
   let modelSteps = 0
   let head = new Map(work), counted = new Map(work), countedCopy = true
-  const view = () => R.decode(st) as Record<string, any>
+  const view = () => R.decode(st) as {decision: string; halted: boolean; treeRev: number; testsTainted: boolean; secretTainted: boolean; shellToken: boolean}
   const kstep = (req: Record<string, unknown>) => {
     st = IT.step(P, st, R.encodeInput({op: 'EDIT_CODE', cost: 0, passed: false, fullSuite: false, suspicious: false, risky: false, treeChanged: false, approveRev: 0, extra: 0, ...req}, {maxRetries, cap}))
     modelSteps++

@@ -1,11 +1,11 @@
 // Gemini CLI (.gemini/settings.json "hooks"). Events BeforeTool, AfterTool and AfterAgent (the end of a turn). Exit 2 is
 // a system block with the reason on stderr; any other non-zero exit is only a warning and the call proceeds, and
 // invalid JSON on stdout counts as "allow". Stopbar exits 2 for every block and fail-closed error.
-import {type Adapter, byName, commandText, edit, exitCodeIn, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
+import {type Adapter, str, byName, commandText, edit, exitCodeIn, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
 
 const UNIQUE = new Set(['BeforeTool', 'AfterTool', 'BeforeAgent', 'AfterAgent', 'BeforeModel', 'AfterModel', 'BeforeToolSelection', 'PreCompress', 'Notification'])
 
-function tool(name: string, ti: Record<string, any>): ToolClass {
+function tool(name: string, ti: Record<string, unknown>): ToolClass {
   switch (name) {
     case 'run_shell_command': return shell(commandText(ti.command), ti.is_background === true || ti.run_in_background === true)
     case 'write_file': case 'replace': return edit(pathsOf(ti))
@@ -23,16 +23,16 @@ export const gemini: Adapter = {
   name: 'gemini',
   detect: (i) => typeof i.hook_event_name === 'string' && (UNIQUE.has(i.hook_event_name) || (typeof i.timestamp === 'string' && /^Session(Start|End)$/.test(i.hook_event_name))),
   normalize(i) {
-    const ev = String(i.hook_event_name), ti = (i.tool_input && typeof i.tool_input === 'object' ? i.tool_input : {}) as Record<string, any>
-    if (ev === 'BeforeTool') return {kind: 'pre-tool', event: make('gemini', i, ev, {hook_event_name: 'PreToolUse', cwd: i.cwd, ...tool(String(i.tool_name ?? ''), ti)}, {tool: i.tool_name})}
+    const ev = String(i.hook_event_name), ti = (i.tool_input && typeof i.tool_input === 'object' ? i.tool_input : {}) as Record<string, unknown>
+    if (ev === 'BeforeTool') return {kind: 'pre-tool', event: make('gemini', i, ev, {hook_event_name: 'PreToolUse', cwd: str(i.cwd), ...tool(String(i.tool_name ?? ''), ti)}, {tool: str(i.tool_name)})}
     if (ev === 'AfterTool') {
       const r = (i.tool_response ?? {}) as Record<string, unknown>
       const code = exitCodeIn(r)
       const failed = !!r.error || (code !== undefined && code !== 0)
-      return {kind: failed ? 'post-tool-failure' : 'post-tool', event: make('gemini', i, ev, {hook_event_name: failed ? 'PostToolUseFailure' : 'PostToolUse', cwd: i.cwd,
-        ...tool(String(i.tool_name ?? ''), ti), tool_response: code === undefined ? r : {exitCode: code}}, {tool: i.tool_name})}
+      return {kind: failed ? 'post-tool-failure' : 'post-tool', event: make('gemini', i, ev, {hook_event_name: failed ? 'PostToolUseFailure' : 'PostToolUse', cwd: str(i.cwd),
+        ...tool(String(i.tool_name ?? ''), ti), tool_response: code === undefined ? r : {exitCode: code}}, {tool: str(i.tool_name)})}
     }
-    if (ev === 'AfterAgent') return {kind: 'stop', event: make('gemini', i, ev, {hook_event_name: 'Stop', cwd: i.cwd, stop_hook_active: i.stop_hook_active === true})}
+    if (ev === 'AfterAgent') return {kind: 'stop', event: make('gemini', i, ev, {hook_event_name: 'Stop', cwd: str(i.cwd), stop_hook_active: i.stop_hook_active === true})}
     return {kind: 'other', event: null}
   },
   render(kind, out) {

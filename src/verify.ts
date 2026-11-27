@@ -28,14 +28,20 @@ export async function loadKernel() {
   return {k, gw, machine}
 }
 
+export type Generated = {
+  machineName: string; machineSha256: string; regeneratedSha256: string; sameMachine: boolean
+  kernelSourceSha256: string; kernelSourceNow: string | null; sameSource: boolean | null
+  differential: {steps: number; refused: number; mismatches: number}; ok: boolean
+}
+
 /** The generated step function is the compileJs output of the unmutated kernel, and it agrees with the interpreter. */
-export async function checkGenerated(steps = 3000) {
+export async function checkGenerated(steps = 3000): Promise<Generated> {
   const {k, machine} = await loadKernel()
   const R = k.kernel('none')
   const js = machine.compileJs(R.machine)
   const src = join(PKG_ROOT, 'src', 'kernel.ts')
   const kernelSha = existsSync(src) ? sha(readFileSync(src)) : null
-  const res: Record<string, unknown> = {
+  const head = {
     machineName: G.MACHINE_NAME, machineSha256: G.MACHINE_SHA256, regeneratedSha256: sha(js),
     sameMachine: sha(js) === G.MACHINE_SHA256 && G.MACHINE_NAME === R.machine.name,
     kernelSourceSha256: G.KERNEL_SOURCE_SHA256, kernelSourceNow: kernelSha, sameSource: kernelSha === null ? null : kernelSha === G.KERNEL_SOURCE_SHA256,
@@ -47,7 +53,7 @@ export async function checkGenerated(steps = 3000) {
   for (let run = 0; done < steps; run++) {
     const params = {maxRetries: 1 + Math.floor(rnd() * 3), cap: 1 + Math.floor(rnd() * 12)}
     const P = R.encodeParams(params)
-    let a = IT.init(P), b: any = G.init(params)
+    let a = IT.init(P), b = G.init(params)
     for (let i = 0; i < 25 && done < steps; i++, done++) {
       const req = randomRequest(rnd)
       const enc = R.encodeInput(req, params)
@@ -58,9 +64,7 @@ export async function checkGenerated(steps = 3000) {
       if (JSON.stringify(a.scalars) !== JSON.stringify(b.scalars)) { mismatches++; break }
     }
   }
-  res.differential = {steps: done, refused, mismatches}
-  res.ok = res.sameMachine === true && res.sameSource !== false && mismatches === 0
-  return res
+  return {...head, differential: {steps: done, refused, mismatches}, ok: head.sameMachine && head.sameSource !== false && mismatches === 0}
 }
 
 // A concrete counterexample run for each mutant (each one found by the prover). verify
@@ -79,6 +83,7 @@ export const KNOWN_RUNS: Record<string, {params: {maxRetries: number; cap: numbe
   M6: {params: {maxRetries: 1, cap: 1}, trace: [{op: 'SHELL', suspicious: true, treeChanged: true}, {op: 'RUN_TESTS', passed: true, fullSuite: true}, {op: 'APPROVE_TESTS', approveRev: 0}, {op: 'RUN_BUILD', passed: true}, {op: 'COMMIT'}]},
   M7: {params: {maxRetries: 2, cap: 3}, trace: [{op: 'RUN_BUILD', cost: 3, passed: true}, {op: 'APPROVE_SHELL'}]},
 }
+type Named = {name: string}
 const show = (q: Record<string, unknown>) => {
   const flags = Object.entries(q).filter(([k, x]) => k !== 'op' && x).map(([k, x]) => `${k}=${x}`)
   return flags.length ? `${q.op}(${flags.join(',')})` : String(q.op)
@@ -89,64 +94,67 @@ export async function verify(o: {out?: string; lean?: string; log?: (s: string) 
   const {k, gw} = await loadKernel()
   const {kernel, laws, lemmas, MUTANTS} = k
   const OPT = {search: {ms: 60000}}
-  const out: Record<string, any> = {gdpWired: '0.60.0', node: process.version, platform: `${process.platform} ${process.arch}`}
+  const head = {gdpWired: '0.60.0', node: process.version, platform: `${process.platform} ${process.arch}`}
 
   log('1. generated step function vs the proven rule')
-  out.generated = await checkGenerated()
-  log(`   machine ${out.generated.machineName}: same compileJs output=${out.generated.sameMachine}, kernel.ts hash matches=${out.generated.sameSource}, ` +
-    `differential ${out.generated.differential.steps} steps, mismatches=${out.generated.differential.mismatches}`)
+  const generated = await checkGenerated()
+  log(`   machine ${generated.machineName}: same compileJs output=${generated.sameMachine}, kernel.ts hash matches=${generated.sameSource}, ` +
+    `differential ${generated.differential.steps} steps, mismatches=${generated.differential.mismatches}`)
 
   log('2. inductive proof of the original kernel (laws + lemmas I1-I5)')
+  let original: {proven: unknown; checked: unknown; stuck: unknown; goal: unknown; why: unknown; ms: number; laws: string[]; stepLaws: string[]}
   {
     const r = kernel('none'), {laws: L, stepLaws: S} = laws(r)
     const t = Date.now()
     const v = gw.proveSteps(r, [...L, ...lemmas(r)], S, OPT)
-    out.original = {proven: v.proven, checked: v.checked, stuck: v.stuck, goal: v.goal, why: v.why, ms: Date.now() - t,
-      laws: [...L, ...lemmas(r)].map((l: any) => l.name), stepLaws: S.map((l: any) => l.name)}
+    original = {proven: v.proven, checked: v.checked, stuck: v.stuck, goal: v.goal, why: v.why, ms: Date.now() - t,
+      laws: [...L, ...lemmas(r)].map((l: Named) => l.name), stepLaws: S.map((l: Named) => l.name)}
     log(`   proven=${v.proven} checked=${v.checked} ${Date.now() - t} ms${v.goal ? ' goal=' + v.goal : ''}`)
   }
 
   log('3. mutants: each must fall with a counterexample run')
-  out.mutants = {}
+  const mutants: Record<string, {killed: boolean} & Record<string, unknown>> = {}
   for (const m of MUTANTS.filter((x: string) => x !== 'none')) {
     const r = kernel(m), {laws: L, stepLaws: S} = laws(r)
     const t = Date.now()
     const v = gw.proveSteps(r, L, S, OPT)
-    const failed: any = [...L, ...S].find((l: any) => v.goal?.startsWith(l.name))
+    const failed = [...L, ...S].find((l: Named) => v.goal?.startsWith(l.name))
     let minimized = false
     if (v.run && failed) { try { v.run = gw.minimizeRun(r, failed, v.run); minimized = true } catch { /* keep the unminimised run */ } }
-    const trace = (v.run?.trace ?? []).map((q: any) => {
-      const op = typeof q.op === 'number' ? OPS[q.op] : q.op
+    const trace = (v.run?.trace ?? []).map((q: Record<string, unknown>) => {
+      const op = typeof q.op === 'number' ? OPS[q.op] : String(q.op)
       const flags = Object.entries(q).filter(([kk, x]) => kk !== 'op' && x).map(([kk, x]) => `${kk}=${x}`)
       return flags.length ? `${op}(${flags.join(',')})` : op
     })
     // deterministic replay of the known counterexample: a law fails on the mutant and every law holds on the original
     const known = KNOWN_RUNS[m]
     const r0 = kernel('none'), l0 = laws(r0)
-    const enc = (rule: any) => known.trace.map((q) => rule.encodeInput({...REQ0, ...q}, known.params))
+    const enc = (rule: typeof r) => known.trace.map((q) => rule.encodeInput({...REQ0, ...q}, known.params))
     const onMutant = gw.replayRefutation(r, L, S, r.encodeParams(known.params), enc(r), 1000)
     const onOriginal = gw.replayRefutation(r0, l0.laws, l0.stepLaws, r0.encodeParams(known.params), enc(r0), 1000)
     const killed = v.proven === false && onMutant === true && onOriginal === false
-    out.mutants[m] = {killed, proven: v.proven, goal: v.goal, ms: Date.now() - t, minimized, proverRun: v.run ? {params: v.run.params, trace} : null,
+    mutants[m] = {killed, proven: v.proven, goal: v.goal, ms: Date.now() - t, minimized, proverRun: v.run ? {params: v.run.params, trace} : null,
       proverWitness: v.run ? undefined : v.witness, counterexample: {params: known.params, trace: known.trace.map(show), breaksMutant: onMutant, breaksOriginal: onOriginal}}
     log(`   ${m.padEnd(4)} ${killed ? 'KILLED' : 'SURVIVED'} by ${v.goal ?? '-'} (${Date.now() - t} ms)` +
       `\n        counterexample ${known.trace.map(show).join(' -> ')} ${JSON.stringify(known.params)}: breaks the mutant=${onMutant}, breaks the original=${onOriginal}` +
       (trace.length ? `\n        prover run (minimized=${minimized}): ${trace.join(' -> ')}` : '\n        prover: inductive witness only (no run within the search budget)'))
   }
 
+  let lean: {file: string; lines: number; theorems: number; sorry: number; leanChecked: false} | undefined
   if (o.lean) {
     const {toLean} = await import('gdp-wired/lean')
     const r = kernel('none'), {laws: L, stepLaws: S} = laws(r)
-    const lean = toLean([{id: 'stopbar_kernel', machine: r.machine, laws: [...L, ...lemmas(r)], stepLaws: S}], {title: 'Stopbar kernel (gdp-wired 0.60.0)'})
-    writeFileSync(o.lean, lean)
-    out.lean = {file: o.lean, lines: lean.split('\n').length, theorems: (lean.match(/^\s*theorem\s/gm) ?? []).length, sorry: (lean.match(/\bsorry\b/g) ?? []).length, leanChecked: false}
-    log(`4. Lean export ${o.lean}: ${out.lean.lines} lines, ${out.lean.theorems} theorems, ${out.lean.sorry} sorry (not checked by Lean here)`)
+    const text = toLean([{id: 'stopbar_kernel', machine: r.machine, laws: [...L, ...lemmas(r)], stepLaws: S}], {title: 'Stopbar kernel (gdp-wired 0.60.0)'})
+    writeFileSync(o.lean, text)
+    lean = {file: o.lean, lines: text.split('\n').length, theorems: (text.match(/^\s*theorem\s/gm) ?? []).length, sorry: (text.match(/\bsorry\b/g) ?? []).length, leanChecked: false}
+    log(`4. Lean export ${o.lean}: ${lean.lines} lines, ${lean.theorems} theorems, ${lean.sorry} sorry (not checked by Lean here)`)
   }
 
-  const killed = Object.values(out.mutants).filter((x: any) => x.killed).length
-  const total = Object.keys(out.mutants).length
-  out.ok = out.generated.ok && out.original.proven === true && out.original.checked === true && killed === total && total === 10
-  out.summary = `original proven=${out.original.proven} checked=${out.original.checked}; mutants killed ${killed}/${total}; generated step ok=${out.generated.ok}`
+  const killed = Object.values(mutants).filter((x) => x.killed).length
+  const total = Object.keys(mutants).length
+  const ok = generated.ok && original.proven === true && original.checked === true && killed === total && total === 10
+  const summary = `original proven=${original.proven} checked=${original.checked}; mutants killed ${killed}/${total}; generated step ok=${generated.ok}`
+  const out = {...head, generated, original, mutants, ...(lean ? {lean} : {}), ok, summary}
   log(`RESULT: ${out.ok ? 'PASS' : 'FAIL'}: ${out.summary}`)
   if (o.out) writeFileSync(o.out, JSON.stringify(out, null, 1) + '\n')
   return out

@@ -1,6 +1,6 @@
 {
   "name": "stopbar",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "A formally proven execution gate for AI coding agents: hooks for Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, plus git hooks. No commit without a passing build and full test suite, no silent test weakening, no exfiltration after a secret read.",
   "author": "Paweł Olszewski <kontakt@polszewski.com>",
   "license": "MIT",
@@ -49,7 +49,7 @@
     "verify:lean": "node scripts/build.ts && node scripts/verify-lean.ts",
     "probe": "node scripts/build.ts && node bin/stopbar.mjs probe",
     "bench": "node bench/hook-latency.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "node scripts/build.ts && tsc --noEmit",
     "prepack": "node scripts/build.ts"
   },
   "keywords": [

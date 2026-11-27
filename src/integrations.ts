@@ -104,14 +104,46 @@ function antigravityFile(root: string, command: string) {
   return f
 }
 
-/** A foreign pre-commit or pre-push hook: 'fail' (git named in --hooks), 'backup' (--force-hooks: kept as
- *  <name>.stopbar-backup, then replaced) or 'keep' (git added by default: the foreign hook stays, with a warning). */
-type Foreign = 'fail' | 'backup' | 'keep'
-function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: string) => void): string[] {
+/** Where git runs the hooks of this repository (`git rev-parse --git-path hooks`). `customHooksPath`: the
+ *  `core.hooksPath` value when it points outside the default <git-common-dir>/hooks (Husky, Lefthook, a shared or tracked
+ *  hooks directory), else null. No core.hooksPath entry is no error; any other git config error fails closed. */
+export function gitHooksDir(repo: Repo): {dir: string; customHooksPath: string | null} {
+  let configured: string | null = null
+  try { configured = git(repo.root, ['config', '--get', 'core.hooksPath']) || null } catch (e) {
+    if ((e as {status?: number}).status !== 1) throw new FailClosed(`git config --get core.hooksPath failed in ${repo.root}: ${(e as Error).message.split('\n')[0]}`)
+  }
   const rel = git(repo.root, ['rev-parse', '--git-path', 'hooks'])
   const dir = isAbsolute(rel) ? rel : resolve(repo.root, rel)
+  if (configured === null) return {dir, customHooksPath: null}
+  const common = git(repo.root, ['rev-parse', '--git-common-dir'])
+  const def = resolve(isAbsolute(common) ? common : resolve(repo.root, common), 'hooks')
+  const same = process.platform === 'win32' ? resolve(dir).toLowerCase() === def.toLowerCase() : resolve(dir) === def
+  return {dir, customHooksPath: same ? null : configured}
+}
+type HooksDir = ReturnType<typeof gitHooksDir>
+
+const hookBin = (runtimeRoot: string) => join(runtimeRoot, 'bin', 'stopbar.mjs').replace(/\\/g, '/')
+const manualHooks = (hd: HooksDir, bin: string) =>
+  `add \`node "${bin}" git-hook pre-commit\` to ${join(hd.dir, 'pre-commit')} and \`node "${bin}" git-hook pre-push\` to ${join(hd.dir, 'pre-push')}`
+function customHooksRefusal(hd: HooksDir, runtimeRoot: string) {
+  return new FailClosed(`core.hooksPath (${hd.customHooksPath}) points git hooks outside .git/hooks, to ${hd.dir}; not writing shared or tracked hooks there`,
+    `chain them by hand: ${manualHooks(hd, hookBin(runtimeRoot))}; or run again with --force-hooks to write them there (a foreign hook is kept as <name>.stopbar-backup)`)
+}
+
+/** A foreign pre-commit or pre-push hook: 'fail' (git named in --hooks), 'backup' (--force-hooks: kept as
+ *  <name>.stopbar-backup, then replaced) or 'keep' (git added by default: the foreign hook stays, with a warning).
+ *  A custom core.hooksPath (shared or tracked hooks) is written only with 'backup'; 'keep' writes nothing there and
+ *  warns, 'fail' refuses. */
+type Foreign = 'fail' | 'backup' | 'keep'
+function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: string) => void, hd: HooksDir = gitHooksDir(repo)): string[] {
+  const {dir} = hd
+  const bin = hookBin(runtimeRoot)
+  if (hd.customHooksPath !== null && foreign !== 'backup') {
+    if (foreign === 'fail') throw customHooksRefusal(hd, runtimeRoot)
+    warn(`WARN: this repository uses a custom core.hooksPath (${hd.customHooksPath} -> ${dir}); Stopbar did not touch those shared or tracked hooks, so git commit and git push are not gated by Stopbar here. To chain them by hand, ${manualHooks(hd, bin)}; to write them there directly (a foreign hook is kept as <name>.stopbar-backup): stopbar upgrade --hooks git --force-hooks`)
+    return []
+  }
   mkdirSync(dir, {recursive: true})
-  const bin = join(runtimeRoot, 'bin', 'stopbar.mjs').replace(/\\/g, '/')
   const out: string[] = []
   for (const name of ['pre-commit', 'pre-push']) {
     const f = join(dir, name)
@@ -136,6 +168,9 @@ function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: s
 export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string, force: boolean, o: {gitByDefault?: boolean; warn?: (s: string) => void} = {}): string[] {
   const lines: string[] = []
   const foreign: Foreign = force ? 'backup' : o.gitByDefault ? 'keep' : 'fail'
+  const hd = targets.includes('git') ? gitHooksDir(repo) : null
+  // a refusal (explicit --hooks git into a custom core.hooksPath) comes before any client file is written
+  if (hd && foreign === 'fail' && hd.customHooksPath !== null) throw customHooksRefusal(hd, runtimeRoot)
   for (const t of targets) {
     if (t === 'claude') lines.push(`claude: ${claudeFile(repo.root, 'settings.local.json', hookCommand(runtimeRoot))}`)
     else if (t === 'claude-project') lines.push(`claude: ${claudeFile(repo.root, 'settings.json', hookCommand(runtimeRoot))}`)
@@ -143,7 +178,7 @@ export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string,
     else if (t === 'codex') lines.push(`codex: ${codexFile(repo.root, hookCommand(runtimeRoot, 'codex'))}`)
     else if (t === 'gemini') lines.push(`gemini: ${geminiFile(repo.root, hookCommand(runtimeRoot, 'gemini'))}`)
     else if (t === 'antigravity') lines.push(`antigravity: ${antigravityFile(repo.root, hookCommand(runtimeRoot, 'antigravity'))}`)
-    else if (t === 'git') for (const f of gitHooks(repo, runtimeRoot, foreign, o.warn ?? (() => {}))) lines.push(`git: ${f}`)
+    else if (t === 'git') for (const f of gitHooks(repo, runtimeRoot, foreign, o.warn ?? (() => {}), hd ?? undefined)) lines.push(`git: ${f}`)
   }
   return lines
 }

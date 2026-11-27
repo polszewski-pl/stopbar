@@ -1,0 +1,33 @@
+name: release
+
+# Publishes to npm with provenance when a version tag (v*) is pushed. npm Trusted Publishing (OIDC): no npm token in the
+# repository. The owner connects the Trusted Publisher once on npmjs.com (package stopbar -> repository
+# polszewski-pl/stopbar -> workflow release.yml).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Tag matches package.json version
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version ($want)" >&2
+            exit 1
+          fi
+      - run: npm publish --provenance --access public

@@ -30,9 +30,10 @@ const failClosed = (why: string): Out => ({code: 2, msg: `STOPBAR FAIL-CLOSED: $
 export function handle(raw: string, which = 'auto', t0 = performance.now()): Rendered {
   const explicit = which === 'auto' ? null : adapterByName(which)
   if (which !== 'auto' && !explicit) return claude.render('pre-tool', failClosed(`unknown adapter ${JSON.stringify(which)}; known: auto, ${ADAPTERS.join(', ')}`), null)
-  let input: any
-  try { input = JSON.parse(raw) } catch (e) { return (explicit ?? claude).render('pre-tool', failClosed(`hook input is not JSON (${(e as Error).message})`), null) }
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return (explicit ?? claude).render('pre-tool', failClosed('hook input must be a JSON object'), null)
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch (e) { return (explicit ?? claude).render('pre-tool', failClosed(`hook input is not JSON (${(e as Error).message})`), null) }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return (explicit ?? claude).render('pre-tool', failClosed('hook input must be a JSON object'), null)
+  const input = parsed as Record<string, unknown>
   const a = explicit ?? detect(input)
   if (!a) return claude.render('pre-tool', failClosed('unknown hook payload: no adapter recognises it (use --adapter)'), null)
   let n

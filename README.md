@@ -1,10 +1,17 @@
 # Stopbar
 
-Stopbar is an execution gate for AI coding agents in two parts: a **formally proven decision kernel**
-(`src/kernel.ts`, about 160 lines, its laws proven by induction and checked again by `lake build` in Lean 4.34.0) and
-a **tested wrapper** around it: the hooks of Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, and git
-hooks for any other tool. The wrapper reads tool calls and command text and asks the kernel; it is covered by unit and
-E2E tests and stateful probing, not by the proof.
+[![CI](https://github.com/polszewski-pl/stopbar/actions/workflows/ci.yml/badge.svg)](https://github.com/polszewski-pl/stopbar/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/stopbar)](https://www.npmjs.com/package/stopbar)
+
+Stopbar is an execution gate for AI coding agents in three parts: a **formally proven decision kernel**
+(`src/kernel.ts`, about 160 lines, its laws proven by induction and checked again by `lake build` in Lean 4.34.0), a
+**tested wrapper** around it (the hooks of Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, and git
+hooks for any other tool), and an **attestation** of the session (`stopbar attest`). The wrapper reads tool calls and
+command text and asks the kernel; it is covered by unit and E2E tests and stateful probing, not by the proof.
+
+| Proven (Lean 4.34.0) | Tested (wrapper + E2E + PROBE) | Not covered without OS sandbox |
+|---|---|---|
+| The decision rule `src/kernel.ts`: no commit without a passing build and full suite at the current revision (L1); test taint until a human approval (L2.x); pause of risky and outbound calls after a secret read (L3.x); halt on budget and retries (L4.x). 10 mutants each fall with a counterexample. | How tool calls become kernel requests: exact gate commands, content snapshots of the tree, test and secret path patterns, self-protection of `.git`, agent settings and the Stopbar code, the client adapters, the git hooks. | A path or name built at run time (`f=.e; cat ${f}nv`), a script the agent wrote and runs (`node /tmp/x.js`), code that the gate commands run, secrets in files with ordinary names. See [SECURITY.md](SECURITY.md) section 3. |
 
 **Without an OS sandbox, Stopbar stops shortcuts and mistakes of an agent; it is not a security boundary against a
 hostile agent.** A command can build a path at run time or hide it in a script that the text rules do not see. See
@@ -43,15 +50,6 @@ working. An unknown or damaged payload fails closed (exit 2). The configs writte
 **Git fallback.** For a tool without hooks, run the gates through Stopbar so their real exit status counts:
 `stopbar run build` and `stopbar run test`. The git hooks then allow a commit only after both passed at the
 current tree, block it after an unapproved test change, and block a push after a secret read without approval.
-
-## Four pillars
-
-| Pillar | Command | What it gives you |
-|---|---|---|
-| PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
-| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also your own project: a TS/JS model written with `defineModel` from `stopbar/probe`, or a program in any language (Python, Go, Rust, ...) that speaks NDJSON on stdin/stdout (`--cmd`), with mutants that must be caught. |
-| GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
-| ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions, probe evidence and the sha256 of the event log. |
 
 ## Set up in 3 steps
 
@@ -131,6 +129,21 @@ All commands take `--repo <dir>`. The agent cannot run the human commands: the h
 
 State, configuration and the event log are in `<repo>/.git/stopbar/`: `config.json`, `state.json`, `events.jsonl`, the
 private snapshot index and the pinned runtime. They are outside the working tree, so they never change the tree hash.
+
+## Parts of the package
+
+The gate (GATE, with PROVE and ATTEST) is the product. PROBE is a test tool that ships in the same package.
+
+| Part | Command | What it gives you |
+|---|---|---|
+| PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
+| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also your own project: a TS/JS model written with `defineModel` from `stopbar/probe`, or a program in any language (Python, Go, Rust, ...) that speaks NDJSON on stdin/stdout (`--cmd`), with mutants that must be caught. |
+| GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
+| ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions, probe evidence and the sha256 of the event log. |
+
+**Probe evidence** in `stopbar attest` is the recorded result of one probe run, tied to the tree snapshot and to the
+sha256 of the prober file. It says what the prober saw on that tree. It is no proof against a hostile agent without an
+OS sandbox: an agent that can write `events.jsonl` can also write a false entry ([SECURITY.md](SECURITY.md) section 4).
 
 ## PROBE for your project
 
@@ -273,7 +286,10 @@ profile by editing the lists: no code change is necessary.
   Claude Desktop and its tools for messages between local sessions. It only exempts tools from the outbound gate
   (WebFetch, WebSearch, MCP tools); shell commands, edits and reads are gated as before. Since 1.2.0 these tools also
   pass while the session is halted, so the agent can still ask a human for `stopbar resume`; they never take a kernel
-  step. Every other tool stays paused while halted. A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
+  step. Every other tool stays paused while halted. Edit, Write, Read and the shell tools stay gated even if a glob in
+  `safeTools` matches them (also `["*"]`). **Keep the globs narrow**: with a broad glob such as `mcp__*`, every MCP tool
+  is treated as local, passes the outbound gate after a secret read and keeps working while the session is halted.
+  A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
   `PAUSE`s on the session tools after a secret read, add `"mcp__ccd_session_mgmt__*"` to `safeTools` or write the file
   again with `stopbar init --force ...`. `stopbar doctor` shows a `[WARN] safeTools` while a default entry is missing.
 - **`cliCmd`** (optional, set via `stopbar init --cli "<cmd>"`) is the command that starts Stopbar in the hints shown to
@@ -294,6 +310,48 @@ profile by editing the lists: no code change is necessary.
 
 A damaged or empty `config.json` or `state.json` blocks every tool call (exit 2) with a message that says how to
 repair it.
+
+`stopbar doctor` shows the gate mode on the `config.json` line: `gates: hook command text (use --require-run for
+exit-code-only gates)` by default, `gates: stopbar run only (--require-run)` with `requireRun`.
+
+**Custom `core.hooksPath`** (Husky, Lefthook, a shared hooks directory): since 1.2.1 Stopbar does not write into it.
+`init --hooks <client>` then writes no git hook and prints a `WARN`; `init --hooks git` fails closed (exit 2);
+`stopbar doctor` reports `[WARN] hooks git`: git commit and git push are not gated by Stopbar until a human adds one
+line to each hook of the hook manager, `node "<runtime>/bin/stopbar.mjs" git-hook pre-commit` and `... git-hook
+pre-push` (doctor prints the exact lines), or runs `stopbar upgrade --hooks git --force-hooks`.
+
+## Hardening: OS sandbox + client deny rules
+
+Stopbar reads command text. To stop an agent that tries to get around it, add two layers that do not depend on text.
+
+1. **Client deny rules.** The agent's own permission rules refuse a tool call before any hook. For Claude Code, in
+   `.claude/settings.json` (check the rule syntax against your client's documentation):
+
+   ```json
+   {
+     "permissions": {
+       "deny": [
+         "Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)",
+         "Edit(./.git/**)", "Edit(./.claude/**)",
+         "Bash(curl:*)", "Bash(wget:*)", "Bash(printenv:*)",
+         "WebFetch"
+       ]
+     }
+   }
+   ```
+
+2. **OS sandbox.** Run the agent in a container, a VM or a sandbox runtime (for example Anthropic's `sandbox-runtime`
+   or Claude Code's Bash sandbox) without network, with only the repository writable:
+
+   ```sh
+   docker run --rm -it --network none -v "$PWD:/work" -v "$PWD/.claude:/work/.claude:ro" \
+     -v "$PWD/.git/hooks:/work/.git/hooks:ro" -w /work <agent-image>
+   ```
+
+   The hooks write `.git/stopbar/`. When the whole agent runs in the container, the hooks run there too, so
+   `.git/stopbar/` must stay writable, and the agent's shell can write it as well. A sandbox that wraps only the
+   agent's shell (the hooks run outside it) can deny writes to `.git/stopbar/` inside the sandbox. Run the human
+   commands (`approve-tests`, `approve-shell`, `resume`, `reset`) outside the sandbox.
 
 ## Local use
 
@@ -355,11 +413,16 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Python | Typecheck | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 70/70 | 443/443 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 70/70 | 443/443 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| Ubuntu, Windows, macOS (GitHub Actions) | 24 | runner | runner | CI | CI | CI | CI | – | CI (Ubuntu) | – |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 74/74 | 460/460 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 74/74 | 460/460 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| macOS 26.7.2 arm64 (`macos-latest`, GitHub Actions, CI of 1.2.0) | 24.22.3 | 2.56.1 | – | 0 errors | pass | 443/443 | 202/202 sequences | – | – | – |
+| Ubuntu, Windows (GitHub Actions) | 24 | runner | runner | CI | CI | CI | CI | – | CI (Ubuntu) | – |
 
-The last row is the CI workflow: it runs after a push, so its results are on the repository's Actions page, not here.
+The first two rows are runs of 1.2.1 on our machines; both also pass `stopbar probe --target
+examples/bounded-queue.probe.ts --runs 50 --check-mutants` (50/50, mutants 2/2). The macOS row is the CI run of 1.2.0
+(commit `8bfd8cb`, workflow `.github/workflows/ci.yml`): build, typecheck, `npm test` (unit with the dot reporter, so no
+count in the log) and the same `bounded-queue` probe (50/50, mutants 2/2). The `prove` job of CI runs on Ubuntu only.
+CI runs after a push; the results of 1.2.1 will be on the repository's Actions page (see the CI badge).
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5020 steps
@@ -368,7 +431,7 @@ The `--cmd` column is `stopbar probe --cmd "<python> examples/bounded_queue_prob
 (3970 steps on both platforms). E2E scenario S37 runs `--cmd` with a Node target everywhere, and the Python example
 and the `--lang py` template only where `python3` or `python` is found.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry` (run on the same
-`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 does not change). `node scripts/verify-lean.ts --local`
+`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 and 1.2.1 do not change). `node scripts/verify-lean.ts --local`
 gives the same result with Lean 4.34.0 on `PATH` (checked in a Debian 13 container with the toolchain of that image).
 
 ## License

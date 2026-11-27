@@ -118,7 +118,7 @@ export type ActionSpec<S> = {
   weight?: number
   /** Arguments of one step: pure data that survives JSON (saved in reproductions and regressions). */
   gen(r: Rng): unknown
-  run(state: S, args: any, check: Check): Awaitable<void>
+  run(state: S, args: unknown, check: Check): Awaitable<void>
 }
 export type Invariant<S> = ((state: S, check: Check) => Awaitable<void>) | {name: string; check(state: S, check: Check): Awaitable<void>}
 export type MutantSpec<S> = ((ctx: {seed: number; dir: string}) => Awaitable<S>) | {description?: string; setup(ctx: {seed: number; dir: string}): Awaitable<S>}
@@ -203,7 +203,7 @@ export function defineModel<S>(spec: ModelSpec<S>): ProbeTarget<ModelRun> & {mut
       }
       let out: Outcome
       try {
-        let setup: (c: any) => Awaitable<S> = spec.setup
+        let setup: (c: Ctx) => Awaitable<S> = spec.setup
         if (mutant !== undefined) {
           const m = mutants.get(mutant)
           if (!m) throw new MismatchError('unknown mutant', [...mutants.keys()], mutant)

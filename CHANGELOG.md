@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.1 (2026-11-27)
+
+`src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.2.0. No new dependency.
+A `config.json` and a `state.json` from 1.0.0–1.2.0 work without migration.
+
+- **Custom `core.hooksPath` is not written.** When `core.hooksPath` points outside `.git/hooks` (Husky, Lefthook, a
+  shared or tracked hooks directory), `init --hooks <client>` writes no git hook there and prints a `WARN` with the
+  manual `node "<runtime>/bin/stopbar.mjs" git-hook pre-commit|pre-push` lines; explicit `--hooks git` without
+  `--force-hooks` fails closed (exit 2) before any hook file is written; `--force-hooks` writes the hooks and keeps a foreign
+  one as `<name>.stopbar-backup`. `stopbar doctor` reports `[WARN] hooks git`: it says that git commit and git push are
+  not gated, and prints the exact line for each missing hook. A `stopbar git-hook <name>` line chained by hand counts.
+- **`stopbar status` after `baseRef` advanced.** With `testsTainted` and a non-`HEAD` `baseRef`, `status` prints
+  `note: no existing test or test-config file currently differs from <baseRef>; ...` when that is so, and
+  `status --json` has `taintedDiffersFromBaseRef` (`true`, `false`, or `null` when untainted or without `baseRef`).
+  The taint stays (L2.2): `status` never writes `state.json`.
+- **`stopbar probe --cmd`: no silent exit.** A target that printed a banner or a non-JSON answer to `info` ended the
+  CLI with exit 0 (and `await probe()` with exit 13) on Linux: `close()` waited for an `exit` event of a killed,
+  unref'd child against an unref'd timer. `close()` now returns at once for a killed or exited process, and its timers
+  hold the event loop and are cleared. Regression test: banner, non-JSON and crash on `info` give exit 1 from the CLI
+  and a `ProbeError` from `probe()` and `loadCmd()`; exit 0 comes only with `PROBE PASS`.
+- **Four bypasses closed in `src/classify.ts`.** `printenv`, a bare `env`, `Get-ChildItem Env:` and
+  `/proc/self/environ` are a secret read (`env VAR=1 cmd` and `set` are not). Tokens with `..` are normalised
+  (`cat src/../.env`), and a live wildcard that reaches a secret name is a read (`cat .en*`, `cat .en?`). `rm`, `mv`,
+  `del`, `Remove-Item` and the like with a wildcard on `.git` or an agent settings directory are blocked (`rm -rf .g*`,
+  `rm -rf .cl*`), and so is a wildcard followed by a path inside (`cp x .g*/hooks/pre-commit`). A git subcommand from
+  an expansion is blocked (`git $f -m x`, `p=push; git $p --no-verify`, `git "${cmd}"`). Unit tests also record the
+  known limits (`cat $(echo .e)nv`, `f=.e; cat ${f}nv`, `node /tmp/x.js`).
+- **`stopbar doctor` names the gate mode** on the `config.json` line: `gates: hook command text (use --require-run for
+  exit-code-only gates)` or `gates: stopbar run only (--require-run)`. `--require-run` stays optional.
+- **Tests:** HALT with `safeTools: ["*"]` still pauses Bash, Edit, Write and Read; the heredoc exceptions hold only
+  for `<<'EOF'` (not `<<EOF`, `<<"EOF"`, `bash -s <<'EOF'` or `sh <<'EOF'`).
+- **Types:** no `any` left in `src/hook.ts`, `src/verify.ts`, `src/doctor.ts`, `src/probe/` and `src/adapters/`.
+  In the probe SDK, `ActionSpec.run` takes `args: unknown` (was `any`); destructured arguments such as
+  `run: (s, {x}, check)` still compile. `npm run typecheck` builds first, so it works on a fresh clone.
+- **Release:** `.github/workflows/release.yml` publishes to npm with provenance (Trusted Publishing, OIDC) when a `v*`
+  tag that matches `package.json` is pushed.
+- **Docs:** README and SECURITY open with what is proven, what is tested and what needs an OS sandbox, add
+  "Hardening: OS sandbox + client deny rules", list the default `safeTools` with a warning about broad globs, and say
+  what probe evidence in `attest` is. SECURITY has one "Known limits of 1.2.1" section.
+
 ## 1.2.0 (2026-11-26)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.1.3. A `config.json` and a

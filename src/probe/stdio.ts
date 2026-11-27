@@ -44,8 +44,9 @@ export function commandFile(cmd: string, cwd = process.cwd()): string | null {
   return null
 }
 
-const NAT = (n: unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
-const isObj = (x: unknown): x is Record<string, any> => !!x && typeof x === 'object' && !Array.isArray(x)
+const NAT = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
+const INT = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n)
+const isObj = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x)
 
 /** One long-lived process of a --cmd target. Requests go one at a time; `close` ends stdin and kills it if needed. */
 export class CmdClient {
@@ -54,6 +55,7 @@ export class CmdClient {
   private buf = ''
   private err = ''
   private exited: string | null = null
+  private killed = false // set by kill(): its 'exit' may never arrive (the child is unref'd)
   private waiting: {op: string; ok: (v: unknown) => void; bad: (e: Error) => void; timer?: ReturnType<typeof setTimeout>} | null = null
   private chain: Promise<unknown> = Promise.resolve()
   private readonly cwd: string
@@ -76,8 +78,8 @@ export class CmdClient {
   }
 
   private start(): ChildProcess {
-    if (this.ch && this.exited === null) return this.ch
-    this.buf = ''; this.err = ''; this.exited = null
+    if (this.ch && this.exited === null && !this.killed) return this.ch
+    this.buf = ''; this.err = ''; this.exited = null; this.killed = false
     // a shell, so the command line works as typed (python, py -3, npx tsx, a script with a #!)
     const ch = spawn(this.cmd, {cwd: this.cwd, shell: true, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32'})
     this.ch = ch
@@ -127,7 +129,7 @@ export class CmdClient {
     return p
   }
 
-  private async ask(msg: Record<string, unknown>): Promise<Record<string, any>> {
+  private async ask(msg: Record<string, unknown>): Promise<Record<string, unknown>> {
     const v = await this.request(msg)
     if (isObj(v) && typeof v.error === 'string') throw new ProbeError(`probe command ${JSON.stringify(this.cmd)} answered ${msg.op} with an error: ${v.error}${this.stderrTail()}`)
     if (!isObj(v)) throw new ProbeError(`probe command ${JSON.stringify(this.cmd)}: the answer to ${msg.op} is not a JSON object: ${JSON.stringify(v)?.slice(0, 200)}`)
@@ -159,11 +161,11 @@ export class CmdClient {
       if (!NAT(v.steps)) this.bad('execute', 'steps must be an integer >= 0', v)
       const cov = v.cov ?? {}
       if (!isObj(cov) || !Object.values(cov).every(NAT)) this.bad('execute', 'cov must map names to integers >= 0', v)
-      return {ok: true, steps: v.steps, cov}
+      return {ok: true, steps: v.steps, cov: cov as Record<string, number>}
     }
     if (v.ok === false) {
       const m = v.mismatch
-      if (!isObj(m) || !Number.isSafeInteger(m.step) || m.step < -1 || typeof m.what !== 'string' || !m.what) this.bad('execute', 'mismatch needs step (integer >= -1) and what (non-empty string)', v)
+      if (!isObj(m) || !INT(m.step) || m.step < -1 || typeof m.what !== 'string' || !m.what) this.bad('execute', 'mismatch needs step (integer >= -1) and what (non-empty string)', v)
       return {ok: false, mismatch: {step: m.step, action: m.action ?? null, what: m.what, expected: m.expected ?? null, actual: m.actual ?? null}}
     }
     return this.bad('execute', 'ok must be true or false', v)
@@ -175,6 +177,7 @@ export class CmdClient {
   private kill() {
     const ch = this.ch
     if (!ch) return
+    this.killed = true
     if (ch.pid !== undefined && this.exited === null) {
       let treeKilled = false
       try {
@@ -189,18 +192,27 @@ export class CmdClient {
     ch.unref()
   }
 
-  /** Ends stdin (a well-behaved target exits on EOF); kills the process tree after `graceMs`. */
+  /** Ends stdin (a well-behaved target exits on EOF); kills the process tree after `graceMs`. Returns at once for a
+   *  process that has exited or was killed. The timers here hold the event loop and are cleared when the wait ends: an
+   *  unref'd timer racing an 'exit' that never comes would let Node end with the caller's error unthrown (exit 0 from
+   *  the CLI, exit 13 from `await probe()`). */
   async close(graceMs = 2000): Promise<void> {
     const ch = this.ch
-    if (!ch || this.exited !== null) return
+    const done = () => this.killed || this.exited !== null || ch!.exitCode !== null || ch!.signalCode !== null
+    if (!ch || done()) return
     await this.chain
-    if (this.exited !== null) return
+    if (done()) return
     const gone = new Promise<void>((ok) => ch.once('exit', () => ok()))
     try { ch.stdin!.end() } catch { /* already closed */ }
-    const timer = new Promise<'late'>((ok) => { const t = setTimeout(() => ok('late'), graceMs); t.unref?.() })
-    if (await Promise.race([gone.then(() => 'gone' as const), timer]) === 'late') {
+    if (await settle(gone, graceMs) === 'late') {
       this.kill() // destroys the pipes and unrefs the child even when the kill itself fails
-      await Promise.race([gone, new Promise((ok) => { const t = setTimeout(ok, 1000); t.unref?.() })])
+      await settle(gone, 1000)
     }
   }
+}
+
+/** 'gone' when `p` settles first, else 'late' after `ms`; the timer is cleared either way. */
+async function settle(p: Promise<void>, ms: number): Promise<'gone' | 'late'> {
+  let t: ReturnType<typeof setTimeout> | undefined
+  try { return await Promise.race([p.then(() => 'gone' as const), new Promise<'late'>((ok) => { t = setTimeout(() => ok('late'), ms) })]) } finally { clearTimeout(t) }
 }

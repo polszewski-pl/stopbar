@@ -356,3 +356,53 @@ test('F6 a quoted git word (gi"t", gi\'t\', g"i"\'t\') is still git for commit, 
   assert.equal(classifyBash(`echo "gi t" commit`, cfg).kind, 'shell')
   assert.equal(sp(`gi"t" config --get user.name`), null)
 })
+
+test('1.2.1 closed bypasses: environment dumps, `..` and wildcards to secrets, wildcards to .git/agent dirs, dynamic git subcommand', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  const none = () => false
+  // printenv / Get-ChildItem Env: print every token in the environment: READ_SECRET
+  for (const c of ['printenv', 'printenv GITHUB_TOKEN', 'Get-ChildItem Env:', 'gci env:', 'env', 'env | grep KEY', 'cat /proc/self/environ', 'print""env']) {
+    assert.match(secretInCommand(c, P, none)?.pattern ?? '', /^env:/, c)
+    const k = classifyBash(c, cfg)
+    assert.ok(k.kind === 'shell' && k.secret, c)
+  }
+  for (const c of ['env VAR=1 node x.js', 'env NODE_ENV=test npm test', 'set', 'set -e', 'echo environment', 'npm run env-check']) assert.equal(secretInCommand(c, P, none), null, c)
+  // `..` segments and live wildcards that reach .env*
+  for (const c of ['cat src/../.en*', 'cat .en?', 'cat .env*', 'cat src/../.env', 'cat .e""n*', 'type .en*', 'cat .npmr?']) assert.ok(secretInCommand(c, P, none), c)
+  assert.equal(secretInCommand('cat src/../.en*', P, none)?.pattern, '.env*')
+  // quoted or escaped wildcards do not expand in bash; wildcards that reach no secret name stay allowed
+  for (const c of ["cat '.en*'", 'cat .en\\*', "grep '.*' a.txt", 'grep -E a.*b x', 'rm *.log', 'ls src/*.ts', 'sed s/.*//']) assert.equal(secretInCommand(c, P, none), null, c)
+  assert.ok(secretInCommand("Get-Content '.en*'", P, none, 'powershell'), 'PowerShell -Path expands quoted wildcards')
+  // destructive commands with a wildcard on .git or an agent settings directory
+  for (const c of ['rm -rf .g*', 'rm -rf .gi?', 'rm -rf .cl*', 'rm -rf .cu* .co*', 'mv .g* /tmp/x', 'del .g*', 'Remove-Item -Recurse .g*', 'Move-Item .ag* x', 'rm -rf .*', 'rm -rf .[g]it',
+    'cp evil .g*/hooks/pre-commit', 'cp x .cl*/settings.local.json']) assert.match(protectedCommand(c, pr) ?? '', /wildcard that reaches the \.(git|claude|cursor|codex|agents) directory/, c)
+  for (const c of ['rm -rf dist/*', 'rm *.log', 'rm -rf ".g*"', 'ls .g*', 'grep -r ".*" src', 'mv src/*.ts lib/', 'rm -f .eslintcache']) assert.equal(protectedCommand(c, pr), null, c)
+  // a git subcommand from an expansion hides commit/push from the gates
+  for (const c of ['git $f -m x', 'p=push; git $p --no-verify', 'git "${cmd}" origin', 'git `echo push`', 'git $(echo commit) -m x', 'git -C . $sub', 'gi""t $p', 'git.exe $p']) assert.match(protectedCommand(c, pr) ?? '', /git subcommand comes from an expansion/, c)
+  for (const c of ['git -C $dir status', 'git -c $kv status', 'git commit -m "$msg"', 'echo "git $x"', 'git log --format=$fmt', 'git status']) assert.equal(protectedCommand(c, pr), null, c)
+})
+
+test('1.2.1 known limits without an OS sandbox (documented in SECURITY.md): text matching cannot see these', () => {
+  // the secret name is built at run time (command substitution, a variable); the hook sees only `.e` and `nv`
+  for (const c of ['cat $(echo .e)nv', 'f=.e; cat ${f}nv']) assert.equal(secretInCommand(c, P, () => false), null, c)
+  // a script the agent wrote outside the repository runs code the wrapper never reads
+  assert.equal(secretInCommand('node /tmp/x.js', P, () => false), null)
+  assert.equal(protectedCommand('node /tmp/x.js', {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: []}), null)
+})
+
+test('1.2.1 heredoc exceptions hold only for a single-quoted delimiter <<\'EOF\', never for <<EOF, <<"EOF", bash -s or sh', () => {
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist']}
+  // the safe commit heredoc
+  assert.ok(parseSafeHeredocCommit(HD('Fix x')))
+  for (const c of ['git commit -m "$(cat <<EOF\nFix x\nEOF\n)"', 'git commit -m "$(cat <<"EOF"\nFix x\nEOF\n)"']) {
+    assert.equal(parseSafeHeredocCommit(c), null, c)
+    assert.equal(classifyBash(c, cfg).kind, 'commit-chained', c)
+  }
+  // a heredoc as plain stdin data: its body is skipped by the human-only checks only with <<'EOF' and a data command
+  const body = 'stopbar approve-tests'
+  assert.ok(withoutStdinHeredoc(`agy -p - <<'EOF'\n${body}\nEOF`) !== null)
+  for (const c of [`agy -p - <<EOF\n${body}\nEOF`, `agy -p - <<"EOF"\n${body}\nEOF`, `bash -s <<'EOF'\n${body}\nEOF`, `sh <<'EOF'\n${body}\nEOF`]) {
+    assert.equal(withoutStdinHeredoc(c), null, c)
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr, 'bash'), 'human-only Stopbar command or setting', c)
+  }
+})

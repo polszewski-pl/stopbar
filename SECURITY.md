@@ -7,6 +7,10 @@ is proven (section 1), what the wrapper enforces and how it is tested (section 2
 without an operating-system sandbox (section 3). Without an OS sandbox, Stopbar stops shortcuts and mistakes of an
 agent; it is not a security boundary against a hostile agent.
 
+| Proven (Lean 4.34.0) | Tested (wrapper + E2E + PROBE) | Not covered without OS sandbox |
+|---|---|---|
+| The decision rule `src/kernel.ts`: laws L1, L2.1, L2.2, L3.1–L3.3, L4.1–L4.4 (section 1), with 10 mutants that each fall with a counterexample. | How tool calls become kernel requests (section 2): gate commands, tree snapshots, path patterns, self-protection, client adapters, git hooks. | Names built at run time, scripts the agent runs, code that the gates run, secrets in ordinary files, a writable state directory (section 3). |
+
 ## 1. What is proven
 
 The decision rule is `src/kernel.ts`, written in the gdp-wired 0.60.0 DSL. `stopbar prove` runs an inductive proof of
@@ -96,10 +100,21 @@ There is no proof for them.
   so a prompt may mention `approve-tests`; this does not apply when the command line pipes, redirects with `>`/`>>`,
   expands a variable, or names a shell, an interpreter, `xargs`, `at`, `tee` or
   `stopbar`. `.git`, the agent settings directories and the Stopbar code stay protected inside the body.
-- **Halted sessions.** While halted, every tool is paused except the tools in `config.safeTools` (default: the local
-  task-list, turn and session-message tools of Claude Desktop), so the agent can still ask a human for `stopbar resume`.
-  These tools never take a kernel step, so they cannot change the state that laws L4.1 and L4.4 speak about. Edit,
-  Write, Read, Bash, WebFetch and every other MCP tool stay paused.
+- **Since 1.2.1, wildcards and expansions.** A wildcard that reaches `.git` or an agent settings directory is blocked
+  for `rm`, `rmdir`, `unlink`, `shred`, `mv`, `del`, `erase`, `rd`, `move`, `Remove-Item` and `Move-Item` (`rm -rf
+  .g*`, `mv .cl* x`, `rm -rf .*`), and for any command when a path inside follows (`cp x .g*/hooks/pre-commit`). In
+  Bash a quoted or escaped wildcard does not expand and does not count. A git subcommand that comes from an expansion
+  (`git $f -m x`, `p=push; git $p`, `git "${cmd}"`, ``git `echo push` ``) is blocked, because the commit and push gates
+  cannot see it. A secret read is also: a command that prints the environment (`printenv`, a bare `env`,
+  `Get-ChildItem Env:`, `/proc/self/environ`); a path with `..` segments (`cat src/../.env`); a live wildcard that
+  reaches a secret name (`cat .en*`, `cat .en?`, `cat src/../.en*`). `env VAR=1 cmd` and `set` are not a read.
+- **Halted sessions.** While halted, every tool is paused except the tools in `config.safeTools` (default:
+  `mcp__ccd_turn__*` and `mcp__ccd_session_mgmt__*`, the local task-list, turn and session-message tools of Claude
+  Desktop), so the agent can still ask a human for `stopbar resume`. These tools never take a kernel step, so they
+  cannot change the state that laws L4.1 and L4.4 speak about. Edit, Write, Read, Bash, WebFetch and every other MCP
+  tool stay paused. Edit, Write, Read and the shell tools stay paused even when a `safeTools` glob matches them (the
+  E2E suite checks `safeTools: ["*"]`). Keep the globs narrow: a broad glob such as `mcp__*` lets every MCP tool
+  through while halted and after a secret read.
 - **`requireRun`.** With `config.requireRun: true`, a build or full test run counts only through `stopbar run
   build|test`; the same command from the agent's shell is recorded neither as a pass nor as a failure.
 - **One kernel for every agent.** An adapter per client (Claude Code, Cursor, Codex CLI, Gemini CLI, Antigravity CLI)
@@ -125,8 +140,9 @@ that tries to defeat it:
    test "known limits without an OS sandbox" keeps these cases visible.
 2. **Gate commands run arbitrary code.** `buildCmd` and `fullTestCmd` run the repository's code. A new test file is
    trusted. It can read secrets, use the network or weaken other checks at run time.
-3. **Secrets by file name only.** Secrets in environment variables, in files with ordinary names, or found with Grep in
-   ordinary files are not seen. The exfiltration gate works on command text only. In a shell command, a bare token
+3. **Secrets by file name only.** Secrets in files with ordinary names, or found with Grep in ordinary files, are not
+   seen. A command that prints the whole environment counts as a secret read since 1.2.1; one variable in a command
+   (`echo $TOKEN`) or a dump through another program (`export -p`, `node -e "console.log(process.env)"`) is not seen. The exfiltration gate works on command text only. In a shell command, a bare token
    that matches only an extension pattern such as `*.key` counts only if that file exists (a field access like
    `claim.key` is not a file); a command that names a `.key` file which does not exist yet is therefore not a read.
    Tools listed in `config.safeTools` (default: Claude Desktop's `mcp__ccd_turn__*` UI tools and its
@@ -176,9 +192,19 @@ that tries to defeat it:
     - Git fallback: git hooks see only commits and pushes, not reads or shell commands, so the secret gate needs an agent
       hook to record the read. `git commit --no-verify` and `git push --no-verify` skip git hooks.
 
-For a hostile-agent threat model, run the agent in a container or VM: no network by default, the repository mounted
-read-write, `.git/stopbar` and `.claude` mounted read-only or owned by another user, and the human commands run outside
-the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the boundary.
+**Hardening: OS sandbox + client deny rules.** For a hostile-agent threat model, add two layers that do not read
+command text:
+
+- Client deny rules refuse a tool call before any hook. Claude Code example in `.claude/settings.json` (check the rule
+  syntax against your client's documentation):
+  `{"permissions": {"deny": ["Read(./.env)", "Read(./.env.*)", "Read(./secrets/**)", "Edit(./.git/**)", "Edit(./.claude/**)", "Bash(curl:*)", "Bash(wget:*)", "Bash(printenv:*)", "WebFetch"]}}`.
+- Run the agent in a container, a VM or a sandbox runtime (for example Anthropic's `sandbox-runtime` or Claude Code's
+  Bash sandbox): no network by default, the repository writable, `.claude/` and `.git/hooks/` read-only, for example
+  `docker run --rm -it --network none -v "$PWD:/work" -v "$PWD/.claude:/work/.claude:ro" -v "$PWD/.git/hooks:/work/.git/hooks:ro" -w /work <agent-image>`.
+  The hooks write `.git/stopbar/`: when they run inside the same sandbox as the agent's shell, the shell can write it
+  too. A sandbox that wraps only the agent's shell (the hooks run outside it) can deny writes to `.git/stopbar/`. Run
+  the human commands outside the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gives the
+  boundary.
 
 ## 4. PROBE, `--cmd` and probe evidence
 
@@ -191,74 +217,65 @@ the sandbox. Stopbar's kernel then gives the proven decisions and the sandbox gi
 - `probe:result` in `events.jsonl` is evidence, not a gate. It has no `req`, it is not a kernel step and it does not
   change `state.json`, so it can never allow a commit. It is appended under Stopbar's lock, like every other entry.
 - `stopbar attest` shows the latest `probe:result` per target since the last `init` or `reset`, with the sha256 of the
-  target file (`targetSha256`), the command (`targetCmd`), the tree snapshot and `atCurrentSnapshot`. The entry says
-  what the prober saw on that tree. It does not prove the target file: an agent that can write to `events.jsonl` can
-  also write a false entry, as for every other log line (see section 3). Compare `targetSha256` with the file you
-  reviewed.
+  target file (`targetSha256`), the command (`targetCmd`), the tree snapshot and `atCurrentSnapshot`. **Probe evidence
+  is the recorded result of one run, tied to the tree snapshot and to the hash of the prober file.** It says what the
+  prober saw on that tree. It is no proof against a hostile agent without an OS sandbox: an agent that can write to
+  `events.jsonl` can also write a false entry, as for every other log line (see section 3). Compare `targetSha256`
+  with the file you reviewed.
 - For `--cmd`, `targetSha256` covers one file only: `--target-file`, else the first existing file after the
   interpreter, else nothing (`null`). Imports, libraries and the interpreter are not hashed.
 
-## Known limits of 1.2.0
+## Known limits of 1.2.1
 
-- `safeTools` in `HALT`: a halted session still lets the tools in `config.safeTools` through. A human who adds a glob
-  there vouches that those tools are local; with a broad glob (for example `mcp__*`) a halted agent keeps those tools.
-  Edit, Write, Read, the shell and every tool outside the list stay paused.
-- `--require-run` decides by the event's source (`stopbar run` or an agent hook), not by what ran. Without it, the
-  exact gate command from the agent's shell still counts, as before.
-- Quote splicing: only quotes inside a word are undone (`.e""nv`, `.e"n"v`, `'.cl'"aude"`, `gi"t"`). A path built at
-  run time (`g=.g; d=$g"it"`), a backslash escape, a variable or a script (`node /tmp/x.js`) passes the text checks;
-  section 3 point 1. Only an OS sandbox closes this.
-- The stdin heredoc exception trusts the command on the header line not to run its stdin. Stopbar knows the common
-  shells and interpreters (and `xargs`, `at`, `tee`, `stopbar`); another program that executes stdin passes. The
-  exception covers only `HUMAN_ONLY` and `STOPBAR_ADMIN`; every other check still reads the body.
-- Git hooks by default: a foreign `pre-commit` or `pre-push` is kept with a `WARN` when the git hooks were added by
-  default; then that git action is not gated until a human runs `stopbar upgrade --hooks git --force-hooks`.
-  `stopbar doctor` reports `[WARN] hooks git` while one of the two Stopbar git hooks is missing.
-- `stopbar doctor` checks the kernel link only where `gdp-wired` resolves from the running copy (`import.meta.resolve`).
-  A pinned runtime outside any `node_modules` tree reports `[WARN] kernel link`; run `stopbar prove` in the package.
-- `--cmd`: the command runs through the system shell (`cmd.exe` on Windows, `/bin/sh` elsewhere), so quoting follows
-  that shell. A shell can hold stdout open after the program closed it; then only `--cmd-timeout` (default 300000 ms)
-  ends the wait.
-- `--cmd`: answers are checked for their shape (`name`, `seed`, `actions`, `ok`, `steps`, `cov`, `mismatch.step`,
-  `mismatch.what`), not for meaning. A program that answers `ok: true` without running anything passes. Mutants
-  (`--check-mutants`) are the check that the model can fail.
-- `--cmd`: Stopbar does not check that `generate` is deterministic. A reproduction replays the saved actions, so it
-  stays valid, but a new run of the same seed can differ if the program uses another source of randomness.
-- `probe init --lang py` prints `python` on Windows and `python3` elsewhere; use the name your system has.
-- `probe init --lang ts` writes a file that imports `stopbar/probe`: it runs only where that import resolves (Stopbar
-  installed in the project).
+What a regular expression cannot block (the unit test "1.2.1 known limits without an OS sandbox" keeps these visible):
 
-## Known limits of 1.1.3
+- A name built at run time: `cat $(echo .e)nv`, `f=.e; cat ${f}nv`, `g=.g; rm -rf $g"it"`. The hook sees `.e` and
+  `nv`, never `.env`. The same holds for aliases, shell functions and a backslash inside a word (`g\it`).
+- A script: `node /tmp/x.js`, `bash x.sh`. The text checks do not read the script.
+- A wildcard outside the cases of section 2: `find . -name '.g*' -delete`, `echo .g* | xargs rm -rf`, a PowerShell
+  `Remove-Item * -Recurse -Force` (on Windows `*` also matches dot directories), and directory wildcards on the way to a
+  secret (`cat secre*/db.txt`). A bare `.*` in `echo .*` or `ls .*` counts as a secret read (it reaches `.env`).
+- One variable or another program: `echo $TOKEN`, `export -p`, `declare -x`, `node -e "console.log(process.env)"`.
 
-- The blob-id comparison trusts `baseRef`: see point 4 of section 3 (a mutable branch name can be moved by the agent).
-  Use a commit SHA as `--base-ref` when the agent must not be able to move the baseline.
-- `init --force` and `reset` count all suspicious uncommitted changes as one kernel step. A test file that changed in
-  a branch commit against `baseRef` counts too, even if a human approved it in an earlier session: after `reset` such
-  a branch starts tainted until `approve-tests`.
+Other limits:
+
+- `safeTools` while halted: a human who adds a glob vouches that those tools are local. With a broad glob (for example
+  `mcp__*`) a halted agent keeps those tools. Edit, Write, Read and the shell stay paused whatever the list says.
+- `--require-run` is optional (default `false`). It decides by the event's source (`stopbar run` or an agent hook), not
+  by what ran. Without it, the exact gate command from the agent's shell counts.
+- The stdin heredoc exception holds only for one single-quoted `<<'EOF'` and trusts the command on the header line not
+  to run its stdin. Stopbar knows the common shells and interpreters (and `xargs`, `at`, `tee`, `stopbar`); another
+  program that executes stdin passes. The exception covers only the human-only checks.
+- Git hooks: a foreign `pre-commit` or `pre-push` is kept with a `WARN` when the git hooks were added by default; that
+  git action is not gated until a human runs `stopbar upgrade --hooks git --force-hooks`. With a custom
+  `core.hooksPath` (Husky, Lefthook, a shared directory) Stopbar writes no git hook there without `--force-hooks`, so
+  git commit and git push are not gated until a human adds the `git-hook` lines that `stopbar doctor` prints.
+  `stopbar doctor` reports `[WARN] hooks git` (not `[FAIL]`) while a Stopbar git hook is missing.
+- `baseRef`: a mutable branch name can be moved by the agent (section 3, point 4). Use a commit SHA as `--base-ref`
+  when the agent must not move the baseline. `stopbar status` prints a `note:` when the tree no longer differs from
+  `baseRef` on existing tests; it never clears the taint (L2.2).
+- `init --force` and `reset` count all suspicious uncommitted changes as one kernel step; a branch whose tests differ
+  from `baseRef` starts tainted until `approve-tests`.
 - `stopbar upgrade` re-pins the runtime from the package that runs the command. It does not check that the package is
-  newer, and it does not change `config.json`; new defaults (for example `safeTools`) are only named as a hint.
-
-## Known limits of 1.1.2
-
-- `stopGate: "warn"`: in Cursor, Codex CLI, Gemini CLI and Antigravity CLI the WARN text is not shown to the agent,
-  because their Stop protocols have no non-blocking message (a `followup_message`, `decision: "block"` or
-  `decision: "continue"` would start another turn). The entry in `events.jsonl` and `stopbar status` show it.
-  Claude Code gets the text on stdout with exit 0.
-- `cliCmd` is checked as text: one command, no shell operators, no `.git` or agent-settings directory. Stopbar does not
-  check that the command really starts Stopbar; a wrong `cliCmd` gives the agent a hint that does not work, and the
-  gates still count only real runs. Self-protection still blocks the human-only commands through `cliCmd`.
-- `buildCmd` and `fullTestCmd` that differ only in whitespace at the ends count as equal and are refused. Two different
-  commands that run the same script (for example `npm test` and `npm run test`) are not detected.
-
-- Lean: the check needs Docker and a one-time image build with network access, or (since 1.2.0, used in CI) Lean
-  4.34.0 on `PATH` with `node scripts/verify-lean.ts --local`. The base image is pinned by digest and
-  the Lean archive by sha256, both recorded at the first build (trust on first use). The Lean export is not
-  deterministic: each export is a different proof tree, and the gate checks the one it exports.
+  newer, and it does not change `config.json`.
+- `stopGate: "warn"`: in Cursor, Codex CLI, Gemini CLI and Antigravity CLI the WARN text is not shown to the agent; the
+  entry in `events.jsonl` and `stopbar status` show it.
+- `cliCmd` is checked as text, not for whether it starts Stopbar. `buildCmd` and `fullTestCmd` that run the same script
+  under two names (`npm test` and `npm run test`) are not detected.
+- `stopbar doctor` checks the kernel link only where `gdp-wired` resolves from the running copy; a pinned runtime
+  reports `[WARN] kernel link`.
+- `--cmd`: the command runs through the system shell (`cmd.exe` on Windows, `/bin/sh` elsewhere). A shell can hold
+  stdout open after the program closed it; then only `--cmd-timeout` (default 300000 ms) ends the wait. Answers are
+  checked for their shape, not for meaning; mutants (`--check-mutants`) are the check that the model can fail.
+  Stopbar does not check that `generate` is deterministic.
+- `probe init --lang py` prints `python` on Windows and `python3` elsewhere. `probe init --lang ts` runs only where
+  `stopbar/probe` resolves.
+- Lean: the check needs Docker and a one-time image build with network access, or Lean 4.34.0 on `PATH` with
+  `node scripts/verify-lean.ts --local`. The base image and the Lean archive are pinned at the first build (trust on
+  first use). Each export is a different proof tree; the gate checks the one it exports.
 - Platforms: the unit tests, E2E, `stopbar probe` and `stopbar prove` pass on Windows 11 with Git for Windows and on
-  Linux (Debian 13, Node 24, git 2.47). A live Claude Code session ran on Windows. macOS runs only in CI (since
-  1.2.0, `.github/workflows/ci.yml`).
-- Adapters: Cursor, Codex CLI, Gemini CLI and Antigravity CLI are spec-tested (see the README table); a client can
-  change its hook schema in a later version.
+  Linux (Debian 13, Node 24). macOS runs only in CI (`.github/workflows/ci.yml`).
+- Adapters: Cursor, Codex CLI, Gemini CLI and Antigravity CLI are spec-tested; a client can change its hook schema.
 - Hook latency: Windows starts a process in 50–70 ms, so a hook with one git process takes about 120–200 ms in all.
 
 ## Reporting a vulnerability

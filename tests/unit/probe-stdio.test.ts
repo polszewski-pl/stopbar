@@ -196,3 +196,39 @@ test('F7 probe(): a share of 40000 seeds reaches its worker through a file, not 
   assert.equal(r.summary.mutants?.killed, r.summary.mutants?.total)
   assert.deepEqual(readdirSync(work).filter((f) => f.startsWith('worker-')), [])
 })
+
+test('1.2.1 CLI `stopbar probe --cmd` never exits 0 without PROBE PASS; await probe() never ends in exit 13 (banner, non-JSON, crash on info)', async () => {
+  // regression (seen on Linux): kill() unref'd the child, then close() raced an 'exit' that never came against an
+  // unref'd timer, so the event loop emptied before the ProbeError was thrown: exit 0 from the CLI, 13 from `await probe()`
+  const banner = join(TMP, 'banner-target.mjs'), garbage = join(TMP, 'garbage-info-target.mjs')
+  writeFileSync(banner, "console.log('hello debug')\nprocess.stdin.resume()\n")
+  writeFileSync(garbage, "import {createInterface} from 'node:readline'\ncreateInterface({input: process.stdin}).on('line', () => console.log('not json at all'))\n")
+  const node = (f: string) => `"${process.execPath}" "${f}"`
+  const lib = JSON.stringify(pathToFileURL(join(ROOT, 'dist', 'probe', 'index.js')).href)
+  const cli = (c: string, ...extra: string[]) => spawnSync(process.execPath, [join(ROOT, 'bin', 'stopbar.mjs'), 'probe', '--cmd', c, ...extra], {cwd: TMP, encoding: 'utf8', timeout: 60000, windowsHide: true})
+  const cases: [string, RegExp][] = [
+    [node(banner), /printed a line that is not JSON: "hello debug"/],
+    [node(garbage), /printed a line that is not JSON: "not json at all"/],
+    [cmd('--crash', 'info'), /exited with code 3 before answering[\s\S]*boom: crash on info/],
+  ]
+  for (const [c, re] of cases) {
+    const r = cli(c)
+    assert.equal(r.status, 1, `CLI exit for ${c}: ${r.status} ${r.stdout}${r.stderr}`)
+    assert.match(r.stderr, re)
+    assert.doesNotMatch(r.stdout + r.stderr, /PROBE PASS/)
+    for (const fn of ['probe', 'loadCmd']) {
+      const script = join(TMP, `call-${fn}.mjs`)
+      writeFileSync(script, [
+        `import {${fn}, ProbeError} from ${lib}`,
+        `try { await ${fn}(${fn === 'probe' ? `{cmd: ${JSON.stringify(c)}, record: false, log: () => {}}` : JSON.stringify(c)}); console.log('NO ERROR') }`,
+        "catch (e) { console.log(`ERR ${e instanceof ProbeError} ${e.message}`); process.exitCode = 3 }",
+      ].join('\n') + '\n')
+      const r2 = spawnSync(process.execPath, [script], {encoding: 'utf8', timeout: 30000, windowsHide: true})
+      assert.equal(r2.status, 3, `${fn}() exit for ${c}: ${r2.status} ${r2.stdout}${r2.stderr}`)
+      assert.match(r2.stdout, new RegExp(`^ERR true [\\s\\S]*${re.source}`, 'm'))
+    }
+  }
+  // the contract both ways: exit 0 comes only with PROBE PASS
+  const ok = cli(cmd(), '--runs', '4', '--jobs', '1', '--work', join(TMP, 'work-cli'), '--no-record')
+  assert.ok(ok.status === 0 && /PROBE PASS/.test(ok.stdout), `${ok.status} ${ok.stdout.slice(-300)}${ok.stderr.slice(-300)}`)
+})

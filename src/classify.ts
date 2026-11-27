@@ -1,6 +1,7 @@
 // Deterministic classification rules of the wrapper: file paths and the text of a shell command. No AST.
 // Everything here is enforced by the wrapper, not by the proof (see SECURITY.md).
 import type {Config, Paths} from './config.ts'
+import {posix} from 'node:path'
 import {matchAny, matchAnySuffix} from './glob.ts'
 
 const norm = (p: string) => p.replace(/\\/g, '/')
@@ -235,18 +236,112 @@ export const looksLikeTests = (cmd: string) => TEST_RUNNER.test(cmd)
 const EXT_ONLY = /^\*\.[^/*?{}\[\]]+$/
 export type SecretHit = {token: string; pattern: string}
 
-/** The first secret path named in a command (e.g. `cat .env`, `type secrets\\db.txt`), with the pattern it matched. */
-export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true): SecretHit | null {
+// Commands that print the whole environment (tokens, keys) count as a secret read, as a file would. `env VAR=1 cmd` and a
+// bare `set` do not count: the first runs a command, the second is too common in scripts (a known limit, SECURITY.md).
+const ENV_DUMP: [RegExp, string][] = [
+  [/(?:^|[\s;&|(`])printenv(?![\w.\-])/i, 'env:printenv'],
+  [/(?:^|[\s;&|(`])(?:Get-ChildItem|gci|dir|ls|Get-Item|gi|Get-Content|gc|cat|type)\s+(?:-(?:Path|LiteralPath)\s+)?Env:/i, 'env:Get-ChildItem Env:'],
+  [/(?:^|[;&|(`\n])\s*env\s*(?:-0\s*)?(?=$|[;&|>)\n])/i, 'env:env'],
+  [/\/proc\/(?:self|\d+|\$\$)\/environ\b/i, 'env:/proc/environ'],
+]
+const HAS_GLOB = /[*?[{]/
+
+/** One path segment of a shell glob (`*`, `?`, `[...]`, `{a,b}`) as a RegExp (case-insensitive: Windows, and wider is
+ *  safer here), or null when it cannot be read. */
+export function globSegment(seg: string): RegExp | null {
+  let re = '', depth = 0
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i]
+    if (c === '*') re += '.*'
+    else if (c === '?') re += '.'
+    else if (c === '[') {
+      const j = seg.indexOf(']', i + 2)
+      if (j < 0) { re += '\\['; continue }
+      const body = seg.slice(i + 1, j).replace(/\\/g, '\\\\')
+      re += `[${body[0] === '!' ? '^' + body.slice(1) : body}]`
+      i = j
+    } else if (c === '{') { re += '(?:'; depth++ }
+    else if (c === ',' && depth) re += '|'
+    else if (c === '}' && depth) { re += ')'; depth-- }
+    else re += c.replace(/[.+^$()|\\/\]]/g, '\\$&')
+  }
+  if (depth) return null
+  try { return new RegExp(`^${re}$`, 'i') } catch { return null }
+}
+
+/** Names a wildcard may reach: the literal secret patterns and the `<prefix>*` ones (`.env*` gives .env and .env.local). */
+function secretSamples(paths: Paths): string[] {
+  const out: string[] = []
+  for (const g of paths.secrets) {
+    const last = g.split('/').pop() ?? ''
+    if (!/^[^*?[{]+\*?$/.test(last)) continue
+    const base = last.replace(/\*$/, '')
+    out.push(base, ...(last.endsWith('*') ? [`${base}.local`] : []))
+  }
+  return out
+}
+
+/** The first secret path named in a command (e.g. `cat .env`, `type secrets\\db.txt`), with the pattern it matched.
+ *  Also: a command that prints the environment (printenv, Get-ChildItem Env:), `..` segments (`src/../.env`), and a
+ *  wildcard that reaches a secret name (`.en*`, `.en?`, `src/../.e*`). */
+export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true, shell: 'bash' | 'powershell' = 'bash'): SecretHit | null {
   const words = (s: string) => s.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)
-  // the words as written, then as bash joins them (`.e""nv` is `.env`)
-  for (const tok of new Set([...words(cmd), ...words(unsplice(cmd)), ...words(unquoteShellWords(cmd))])) {
-    const hits = paths.secrets.filter((g) => matchesSecretGlob(tok, g))
-    if (!hits.length) continue
-    const strong = hits.find((g) => !EXT_ONLY.test(g))
-    if (strong) return {token: tok, pattern: strong}
-    if (/[\\/]/.test(tok) || exists(tok)) return {token: tok, pattern: hits[0]}
+  const texts = [cmd, unsplice(cmd), unquoteShellWords(cmd)]
+  if (paths.secrets.length) {
+    for (const t of texts) for (const [re, pattern] of ENV_DUMP) {
+      const m = re.exec(t)
+      if (m) return {token: m[0].replace(/^[\s;&|(`]+/, '').trim(), pattern}
+    }
+  }
+  // the words as written, then as bash joins them (`.e""nv` is `.env`); each also with its `..` segments resolved
+  for (const tok of new Set(texts.flatMap(words))) {
+    const n = posix.normalize(norm(tok))
+    for (const cand of n === tok ? [tok] : [tok, n]) {
+      const hits = paths.secrets.filter((g) => matchesSecretGlob(cand, g))
+      if (!hits.length) continue
+      const strong = hits.find((g) => !EXT_ONLY.test(g))
+      if (strong) return {token: tok, pattern: strong}
+      if (/[\\/]/.test(cand) || exists(cand)) return {token: tok, pattern: hits[0]}
+    }
+  }
+  // wildcards that expand: bash expands none inside quotes or after a backslash; PowerShell -Path expands them quoted too
+  const samples = secretSamples(paths)
+  for (const tok of new Set(words(shell === 'bash' ? globView(cmd) : unquoteShellWords(cmd)))) {
+    // the last segment: dot-leading (bash matches dotfiles only so), or after a literal prefix of 2+ chars
+    const last = posix.normalize(norm(tok)).split('/').pop() ?? ''
+    const at = last.search(HAS_GLOB)
+    if (at < 0 || !(last.startsWith('.') || at >= 2)) continue
+    const re = globSegment(last)
+    if (!re) continue
+    for (const s of samples) {
+      const pattern = re.test(s) ? secretPattern(s, paths) : null
+      if (pattern) return {token: tok, pattern}
+    }
   }
   return null
+}
+
+/** The command as bash joins its words, with the glob characters that do not expand (inside quotes, after a backslash)
+ *  replaced by \x01, so only live wildcards are left. */
+function globView(cmd: string): string {
+  let out = ''
+  const mask = (s: string) => s.replace(/[*?[\]{}]/g, '\x01')
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]
+    if (c === "'") {
+      const j = cmd.indexOf("'", i + 1)
+      out += mask(j < 0 ? cmd.slice(i + 1) : cmd.slice(i + 1, j))
+      i = j < 0 ? cmd.length : j
+    } else if (c === '"') {
+      let j = i + 1
+      for (; j < cmd.length && cmd[j] !== '"'; j++) {
+        if (cmd[j] === '\\' && j + 1 < cmd.length && '"\\$`'.includes(cmd[j + 1])) j++
+        out += mask(cmd[j])
+      }
+      i = j
+    } else if (c === '\\' && i + 1 < cmd.length) { out += mask(cmd[i + 1]); i++ } else out += c
+  }
+  return out
 }
 export const mentionsSecret = (cmd: string, paths: Paths, exists?: (p: string) => boolean) => secretInCommand(cmd, paths, exists) !== null
 
@@ -271,7 +366,7 @@ export function classifyBash(cmd: string, cfg: Pick<Config, 'buildCmd' | 'fullTe
     if (c === cfg.buildCmd.trim()) return {kind: 'build'}
     if (c === cfg.fullTestCmd.trim()) return {kind: 'fulltest'}
   }
-  return {kind: 'shell', risky: isRiskyShell(c), partialTests: looksLikeTests(c), secret: secretInCommand(c, cfg.paths, exists)}
+  return {kind: 'shell', risky: isRiskyShell(c), partialTests: looksLikeTests(c), secret: secretInCommand(c, cfg.paths, exists, shell)}
 }
 
 /** Kind of a tree change from a list of (status, path) and a test for "the path exists in the reference tree"
@@ -411,6 +506,71 @@ export function withoutStdinHeredoc(cmd: string): string | null {
   return [cmd.slice(0, nl), ...lines.slice(end)].join('\n')
 }
 
+// A wildcard that reaches .git or an agent settings directory (`rm -rf .g*`, `mv .cl* x`, `Remove-Item .g*`): blocked
+// for the commands that delete or move, and for any command when the wildcard is followed by a path inside such a
+// directory (`cp x .g*/hooks/pre-commit`). Other wildcards (`rm *.log`, a `.*` in a grep pattern) stay allowed.
+const GUARDED = ['.git', '.claude', '.cursor', '.codex', '.gemini', '.agents']
+const DESTRUCTIVE = /^(?:rm|rmdir|unlink|shred|mv|del|erase|rd|move|remove-item|ri|move-item|mi)$/i
+const INSIDE = /^(?:hooks|config|stopbar|info|refs|head|index|objects|settings[\w.-]*\.json|hooks\.json)$/i
+const globDir = (seg: string) => (HAS_GLOB.test(seg) && /^[.?[]/.test(seg) ? GUARDED.find((d) => globSegment(seg)?.test(d)) ?? null : null)
+/** `t`: the command with only live wildcards left (globView for bash). */
+function wildcardGuardedDir(t: string): string | null {
+  for (const part of norm(t).split(/[;&|\n()`]+/)) {
+    const ws = part.split(/[\s<>='"]+/).filter(Boolean)
+    let k = 0
+    while (k < ws.length && (/^\w+=/.test(ws[k]) || /^(?:sudo|command|exec|nice|time)$/i.test(ws[k]))) k++
+    const destructive = DESTRUCTIVE.test((ws[k] ?? '').split('/').pop()!.replace(/\.exe$/i, ''))
+    for (const w of ws.slice(k + 1)) {
+      const segs = w.split('/')
+      for (let i = 0; i < segs.length; i++) {
+        const d = globDir(segs[i])
+        if (d && (destructive || (i + 1 < segs.length && INSIDE.test(segs[i + 1])))) return d
+      }
+    }
+  }
+  return null
+}
+
+/** Shell words with their quotes kept; the operators ; & | ( ) and newline are words of their own. */
+function shellWords(cmd: string): string[] {
+  const out: string[] = []
+  let w = ''
+  const flush = () => { if (w) out.push(w); w = '' }
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]
+    if (c === ' ' || c === '\t' || c === '\r') { flush(); continue }
+    if (';&|()\n'.includes(c)) { flush(); out.push(c); continue }
+    if (c === "'" || c === '"' || c === '`') {
+      let j = i + 1
+      for (; j < cmd.length && cmd[j] !== c; j++) if (c !== "'" && cmd[j] === '\\') j++
+      w += cmd.slice(i, j + 1); i = j; continue
+    }
+    if (c === '$' && cmd[i + 1] === '(') {
+      let j = i + 2, depth = 1
+      for (; j < cmd.length && depth; j++) depth += cmd[j] === '(' ? 1 : cmd[j] === ')' ? -1 : 0
+      w += cmd.slice(i, j); i = j - 1; continue
+    }
+    if (c === '\\' && i + 1 < cmd.length) { w += cmd.slice(i, i + 2); i++; continue }
+    w += c
+  }
+  flush()
+  return out
+}
+// `git $f -m x`, `p=push; git $p`, `git "${cmd}"`, git `echo push`: the subcommand comes from an expansion, so the commit
+// and push gates cannot see it. A `git` inside a quoted string is one word with its quotes, so it is no command here.
+const GIT_OPT_ARG = /^(?:-[cC]|--(?:git-dir|work-tree|namespace|exec-path|config-env|attr-source|super-prefix))$/
+export function dynamicGitSubcommand(cmd: string): string | null {
+  const ws = shellWords(cmd)
+  for (let i = 0; i < ws.length; i++) {
+    if (!/^git(?:\.exe)?$/i.test(unquoteShellWords(ws[i]).replace(/\\/g, '/').split('/').pop()!)) continue
+    let j = i + 1
+    while (j < ws.length && ws[j].length > 1 && ws[j].startsWith('-')) j += GIT_OPT_ARG.test(ws[j]) ? 2 : 1
+    const sub = ws[j]
+    if (sub && /^(?:"?\$|"?`)/.test(sub)) return sub
+  }
+  return null
+}
+
 /** Shell command text. Returns the reason for a block, or null. Text matching only: see SECURITY.md.
  *  Every check runs on the text as written and as bash joins quoted parts of a word (`.g""it`, `'.cl'"aude"`, `gi"t"`:
  *  unsplice and unquoteShellWords). For bash, the body of
@@ -423,6 +583,10 @@ export function protectedCommand(cmd: string, pr: Protect, shell: 'bash' | 'powe
     if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
     for (const [re, d] of AGENT_DIRS) if (re.test(c)) return `the command names a ${d} directory (agent settings there hold the Stopbar hooks)`
   }
+  const g = wildcardGuardedDir(shell === 'bash' ? globView(cmd) : unquoteShellWords(cmd))
+  if (g) return `the command has a wildcard that reaches the ${g} directory (${g === '.git' ? 'Stopbar state, git hooks, git config live there' : 'agent settings there hold the Stopbar hooks'})`
+  const dyn = dynamicGitSubcommand(cmd)
+  if (dyn) return `the git subcommand comes from an expansion (${dyn}), which hides it from the commit and push gates; write the subcommand out`
   for (const t of texts) {
     const c = norm(t).toLowerCase()
     if (isGitConfigWrite(t)) return '`git config` writes .git/config; only reads (--get, --list) are allowed'

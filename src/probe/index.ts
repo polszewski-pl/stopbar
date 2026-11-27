@@ -14,26 +14,28 @@ import {pathToFileURL} from 'node:url'
 import {PKG_ROOT} from '../pkg.ts'
 import {findRepo, snapshot} from '../repo.ts'
 import {appendEvent, paths, readConfig, readState, withLock} from '../store.ts'
-import type {Outcome, ProbeRun, ProbeTarget} from './sdk.ts'
+import type {Mismatch, Outcome, ProbeRun, ProbeTarget} from './sdk.ts'
 import {CmdClient, commandFile, ProbeError} from './stdio.ts'
 
 export type {Mismatch, Outcome, ProbeRun, ProbeTarget} from './sdk.ts'
 export {ProbeError} from './stdio.ts'
 
-export const TARGETS: Record<string, () => Promise<ProbeTarget<any>>> = {
+export const TARGETS: Record<string, () => Promise<ProbeTarget<ProbeRun>>> = {
   wrapper: async () => (await import('./wrapper.ts')).wrapperTarget,
 }
 
 const sha = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
 
-function isTarget(x: any): x is ProbeTarget<any> {
-  return !!x && typeof x === 'object' && typeof x.name === 'string' && !!x.name && typeof x.description === 'string' &&
+function isTarget(v: unknown): v is ProbeTarget<ProbeRun> {
+  if (!v || typeof v !== 'object') return false
+  const x = v as Record<string, unknown>
+  return typeof x.name === 'string' && !!x.name && typeof x.description === 'string' &&
     typeof x.generate === 'function' && typeof x.execute === 'function' &&
     (x.mutants === undefined || (Array.isArray(x.mutants) && x.mutants.every((m: unknown) => typeof m === 'string')))
 }
 
 /** What the runner drives: a ProbeTarget, or a --cmd target whose generate answers asynchronously and that must be closed. */
-export type Runnable = Omit<ProbeTarget<any>, 'generate'> & {generate(seed: number): ProbeRun | Promise<ProbeRun>; close?(): Promise<void>}
+export type Runnable = Omit<ProbeTarget<ProbeRun>, 'generate'> & {generate(seed: number): ProbeRun | Promise<ProbeRun>; close?(): Promise<void>}
 export type Resolved = {t: Runnable; spec: string; file: string | null; sha256: string | null; cmd?: string}
 
 /** A name in TARGETS, else a .ts/.mts/.js/.mjs file (absolute, or relative to `cwd`, then to `repo`) that exports a
@@ -44,8 +46,8 @@ export async function loadTarget(spec: string, cwd = process.cwd(), repo?: strin
   const file = cands.find((f) => existsSync(f))
   if (!file) throw new ProbeError(`probe target ${JSON.stringify(spec)} is neither a known target (${Object.keys(TARGETS).join(', ')}) nor an existing file`)
   if (!/\.(ts|mts|js|mjs)$/.test(file)) throw new ProbeError(`probe target ${file}: the file must end in .ts, .mts, .js or .mjs`)
-  let mod: any
-  try { mod = await import(pathToFileURL(file).href) } catch (e) {
+  let mod: {default?: unknown; target?: unknown} | null
+  try { mod = await import(pathToFileURL(file).href) as {default?: unknown; target?: unknown} | null } catch (e) {
     throw new ProbeError(`probe target ${file} does not load: ${(e as Error)?.message ?? e}`)
   }
   const t = isTarget(mod?.default) ? mod.default : isTarget(mod?.target) ? mod.target : null
@@ -172,8 +174,12 @@ function defaultWork(dir: string): string {
 /** A worker gets its share in a file in `work` (`--worker-file <path>`): the seeds as one argv JSON overflow the command
  *  line (Windows ~32 KB, Linux 128 KB per argument) at large --runs or --mutant-runs. The file goes when the worker ends. */
 let workerFiles = 0
-function spawnWorker(p: Part): Promise<any[]> {
-  return new Promise<any[]>((ok, bad) => {
+/** One result line of a worker (see share): a run or a regression, or a mutant with `mutant` set. */
+type RunResult = Outcome & {seed: number; regression?: string; run?: ProbeRun; minimal?: ProbeRun; minimalMismatch?: Mismatch | null}
+type MutantResult = {mutant: string; killed: true; seed: number; tried: number; mismatch: Mismatch} | {mutant: string; killed: false; tried: number}
+
+function spawnWorker<T extends RunResult | MutantResult>(p: Part): Promise<T[]> {
+  return new Promise<T[]>((ok, bad) => {
     const file = join(p.work, `worker-${process.pid}-${++workerFiles}.json`)
     writeFileSync(file, JSON.stringify(p))
     const ch = spawn(process.execPath, [join(PKG_ROOT, 'bin', 'stopbar.mjs'), 'probe', '--worker-file', file], {stdio: ['ignore', 'pipe', 'inherit']})
@@ -182,9 +188,12 @@ function spawnWorker(p: Part): Promise<any[]> {
     ch.on('error', (e) => { rmSync(file, {force: true}); bad(e) })
     ch.on('exit', (code) => {
       rmSync(file, {force: true, maxRetries: 5})
-      let v: any
+      let v: unknown
       try { v = JSON.parse(s.trim().split('\n').pop()!) } catch { return bad(new Error(`probe worker exit ${code}: ${s.slice(0, 500)}`)) }
-      if (v && !Array.isArray(v) && typeof v.error === 'string') bad(new ProbeError(v.error)); else ok(v)
+      const error = v && typeof v === 'object' && !Array.isArray(v) ? (v as {error?: unknown}).error : undefined
+      if (typeof error === 'string') bad(new ProbeError(error))
+      else if (Array.isArray(v)) ok(v as T[])
+      else bad(new Error(`probe worker exit ${code}: not a result list: ${s.slice(0, 500)}`))
     })
   })
 }
@@ -238,25 +247,25 @@ async function probeWith(R: Resolved, o: ProbeOptions, log: (s: string) => void,
   const parts: Part[] = Array.from({length: jobs}, () => ({target: R.spec, ...cmdPart, seeds: [], regs: [], work}))
   seeds.forEach((s, i) => parts[i % jobs].seeds.push(s))
   regs.forEach((f, i) => parts[i % jobs].regs.push(f))
-  const results = (await Promise.all(parts.filter((p) => p.seeds.length || p.regs.length).map(spawnWorker))).flat()
+  const results = (await Promise.all(parts.filter((p) => p.seeds.length || p.regs.length).map((p) => spawnWorker<RunResult>(p)))).flat()
     .sort((a, b) => (a.regression ? 0 : 1) - (b.regression ? 0 : 1) || a.seed - b.seed)
-  const failed = results.filter((r) => !r.ok)
+  const failed = results.filter((r): r is RunResult & {ok: false} => !r.ok)
   for (const f of failed) {
     const file = join(out, `repro-${f.seed}.json`)
     const run = f.minimal ?? f.run ?? await t.generate(f.seed)
     writeFileSync(file, JSON.stringify({target: t.name, ...(R.file ? {targetPath} : {}), ...cmdField, found: new Date().toISOString(), mismatch: f.minimalMismatch ?? f.mismatch, run}, null, 1) + '\n')
     log(`FAIL seed ${f.seed}${f.regression ? ' (regression ' + f.regression + ')' : ''}: ${f.mismatch.what} at step ${f.mismatch.step} ${JSON.stringify(f.mismatch.action)}\n  expected ${JSON.stringify(f.mismatch.expected)}\n  actual   ${JSON.stringify(f.mismatch.actual)}\n  ${f.minimal ? 'minimal ' : ''}reproduction (${run.actions.length} steps): ${file}`)
   }
-  const ok = results.filter((r) => r.ok && !r.regression)
+  const ok = results.filter((r): r is RunResult & {ok: true} => r.ok && !r.regression)
   const coverage: Record<string, number> = {}
-  for (const r of ok) for (const [k, v] of Object.entries(r.cov as Record<string, number>)) coverage[k] = (coverage[k] ?? 0) + v
+  for (const r of ok) for (const [k, v] of Object.entries(r.cov)) coverage[k] = (coverage[k] ?? 0) + v
 
   // mutants: only on a passing original; each mutant in its own worker, seeds in order, the first failure kills it
   let mutants: {total: number; killed: number; survived: string[]; runsPerMutant: number; details: Record<string, unknown>[]} | null = null
   if (o.checkMutants && failed.length) log(`mutants: not checked, the original fails`)
   else if (o.checkMutants) {
     const mseeds = Array.from({length: mutantRuns}, (_, i) => seed0 + i)
-    const res = (await pool(mutantNames, jobs, (m) => spawnWorker({target: R.spec, ...cmdPart, seeds: mseeds, regs: [], work, mutant: m}))).flat()
+    const res = (await pool(mutantNames, jobs, (m) => spawnWorker<MutantResult>({target: R.spec, ...cmdPart, seeds: mseeds, regs: [], work, mutant: m}))).flat()
     const details = res.map((r) => r.killed
       ? {name: r.mutant, status: 'KILLED', seed: r.seed, step: r.mismatch.step, what: r.mismatch.what, action: r.mismatch.action, runs: r.tried}
       : {name: r.mutant, status: 'SURVIVED', runs: r.tried})

@@ -1395,6 +1395,14 @@ say('\nS38 HALT: local session tools (config.safeTools) still pass, so the agent
     check(`${tool} while halted: PAUSE (exit 2)`, r.code === 2 && /^PAUSE \(stopbar\): the session is halted/.test(r.msg), r.msg.slice(0, 120))
   }
   check('self-protection still comes first while halted', /^BLOCK/.test(hook(repo, 'PreToolUse', 'Bash', {command: 'rm -rf .git'}).msg))
+  // a too wide safeTools glob (a human error) never opens the file and shell tools while halted
+  const cf = join(stateDir(repo), 'config.json'), cfg0 = readFileSync(cf, 'utf8')
+  writeFileSync(cf, JSON.stringify({...JSON.parse(cfg0), safeTools: ['*']}, null, 2))
+  for (const [tool, ti] of paused.slice(0, 4)) {
+    const r = hook(repo, 'PreToolUse', tool, ti)
+    check(`safeTools ["*"]: ${tool} while halted is still PAUSE (exit 2)`, r.code === 2 && /^PAUSE \(stopbar\): the session is halted/.test(r.msg), r.msg.slice(0, 120))
+  }
+  writeFileSync(cf, cfg0)
   human(repo, 'resume', '--extra', '5')
   check('after resume Read passes again', status(repo).halted === false && hook(repo, 'PreToolUse', 'Read', {file_path: join(repo, 'src', 'sum.mjs')}).code === 0)
   keepEvents(repo, 's38-halt-safe-tools')
@@ -1422,6 +1430,7 @@ say('\nS39 --require-run: gates count only through stopbar run; .e""nv and .g""i
   const att = JSON.parse(spawnSync(process.execPath, [CLI, 'attest', '--repo', repo], {encoding: 'utf8'}).stdout)
   check('status, status --json, doctor and attest show requireRun', /requireRun true/.test(human(repo, 'status').out) && JSON.parse(human(repo, 'status', '--json').out).requireRun === true &&
     /requireRun: true/.test(human(repo, 'doctor').out) && att.config?.requireRun === true)
+  check('doctor [OK] config.json names the gate mode: stopbar run only (--require-run)', /^\[OK  \] config\.json .*gates: stopbar run only \(--require-run\)/m.test(human(repo, 'doctor').out))
 
   writeFileSync(join(repo, '.env'), 'X=1\n')
   human(repo, 'reset')
@@ -1490,6 +1499,62 @@ say('\nS41 stopbar status: a change no hook has counted yet is shown; commit is 
     typeof ja.workingTreeSnapshot === 'string' && ja.workingTreeSnapshot !== ja.snapshot && ja.kernel?.treeRev === jb.kernel?.treeRev && 'secretRead' in ja && ja.version === jb.version, JSON.stringify({c: ja.workingTreeCounted}))
   check('the next git commit is blocked (as status says)', agentBashCC(repo, 'git commit -q -am "x"').pre.code === 2)
   keepEvents(repo, 's41-status-uncounted')
+}
+
+// ---------------------------------------------------------------- S42 custom core.hooksPath; status hint after baseRef advanced
+say('\nS42 custom core.hooksPath: git hooks by default write nothing there (WARN), explicit --hooks git fails closed, doctor [WARN], --force-hooks writes; status note when the tainted tree no longer differs from baseRef')
+{
+  const repo = setupRepo('s42-custom-hooks-path')
+  const cd = join(repo, 'custom-hooks'), hd = join(repo, '.git', 'hooks')
+  const ours = (dir: string, n: string) => existsSync(join(dir, n)) && readFileSync(join(dir, n), 'utf8').includes('stopbar.mjs" git-hook')
+  run('git config core.hooksPath custom-hooks', repo)
+  mkdirSync(cd, {recursive: true}); writeFileSync(join(cd, 'reference-transaction'), '#!/bin/sh\necho shared hook\n')
+  const rtSha = sha(join(cd, 'reference-transaction'))
+  const initArgs = ['init', '--force', '--build', 'node build.mjs', '--test', 'node --test']
+  const r1 = human(repo, ...initArgs, '--hooks', 'claude')
+  check('core.hooksPath + git hooks by default: init exit 0, no pre-commit/pre-push in custom-hooks or .git/hooks, reference-transaction untouched',
+    r1.code === 0 && !existsSync(join(cd, 'pre-commit')) && !existsSync(join(cd, 'pre-push')) && !existsSync(join(hd, 'pre-commit')) && !existsSync(join(hd, 'pre-push')) &&
+    sha(join(cd, 'reference-transaction')) === rtSha && existsSync(join(repo, '.claude', 'settings.local.json')), r1.out.slice(0, 300))
+  check('the WARN names core.hooksPath and the manual git-hook pre-commit / pre-push lines and --force-hooks',
+    /WARN: .*core\.hooksPath/.test(r1.out) && /git-hook pre-commit/.test(r1.out) && /git-hook pre-push/.test(r1.out) && /--hooks git --force-hooks/.test(r1.out), r1.out.split('\n').filter((l) => /core\.hooksPath|git-hook/.test(l)).join(' | ').slice(0, 400))
+  const r2 = human(repo, ...initArgs, '--hooks', 'git')
+  check('explicit --hooks git without --force-hooks: exit 2 (FailClosed) naming core.hooksPath, custom-hooks untouched',
+    r2.code === 2 && /core\.hooksPath/.test(r2.out) && /--force-hooks/.test(r2.out) && !existsSync(join(cd, 'pre-commit')) && !existsSync(join(cd, 'pre-push')) && sha(join(cd, 'reference-transaction')) === rtSha, r2.out.slice(0, 300))
+  check('upgrade --hooks git without --force-hooks fails closed too (exit 2)', human(repo, 'upgrade', '--hooks', 'git').code === 2 && !existsSync(join(cd, 'pre-commit')))
+  const d1 = human(repo, 'doctor'), hg = d1.out.split('\n').find((l) => /hooks git/.test(l)) ?? ''
+  check('doctor: [WARN] hooks git names the custom core.hooksPath and the manual git-hook call, no [FAIL] hooks git',
+    /^\[WARN\] hooks git .*custom core\.hooksPath/.test(hg) && /git-hook pre-commit\|pre-push/.test(hg) && !/\[FAIL\] hooks git/.test(d1.out) &&
+    /git commit and git push are NOT gated by Stopbar/.test(hg) && /pre-commit: node "[^"]+\/bin\/stopbar\.mjs" git-hook pre-commit; pre-push: node "[^"]+\/bin\/stopbar\.mjs" git-hook pre-push/.test(hg), hg)
+  check('doctor [OK] config.json names the default gate mode (hook command text, --require-run optional)',
+    /^\[OK  \] config\.json .*gates: hook command text \(use --require-run for exit-code-only gates\)/m.test(d1.out))
+  writeFileSync(join(cd, 'pre-commit'), '#!/bin/sh\necho user pre-commit\n')
+  const r3 = human(repo, 'upgrade', '--hooks', 'git', '--force-hooks')
+  check('upgrade --hooks git --force-hooks writes both hooks in custom-hooks, keeps the foreign pre-commit as .stopbar-backup, reference-transaction untouched',
+    r3.code === 0 && ours(cd, 'pre-commit') && ours(cd, 'pre-push') && readFileSync(join(cd, 'pre-commit.stopbar-backup'), 'utf8').includes('user pre-commit') &&
+    sha(join(cd, 'reference-transaction')) === rtSha && !existsSync(join(hd, 'pre-commit')), r3.out.slice(0, 300))
+  check('doctor after --force-hooks: [OK] hooks git', /\[OK  \] hooks git/.test(human(repo, 'doctor').out))
+  keepEvents(repo, 's42-custom-hooks-path')
+
+  // status hint: testsTainted stays true (L2.2), but a human sees that the tree no longer differs from baseRef
+  const repo2 = setupRepo('s42-status-base-ref')
+  run('git update-ref refs/heads/main HEAD', repo2)
+  const i2 = human(repo2, ...initArgs, '--base-ref', 'main', '--no-pin')
+  const st = () => ({text: human(repo2, 'status').out, json: JSON.parse(human(repo2, 'status', '--json').out)})
+  const s0 = st()
+  check('untainted: no note, taintedDiffersFromBaseRef = null', i2.code === 0 && !/^note:/m.test(s0.text) && s0.json.taintedDiffersFromBaseRef === null, JSON.stringify(s0.json.taintedDiffersFromBaseRef))
+  agentWrite(repo2, 'tests/sum.test.mjs', readFileSync(join(repo2, 'tests', 'sum.test.mjs'), 'utf8').replace('sum(2, 3), 5', 'sum(2, 2), 4'))
+  const s1 = st()
+  check('test differs from main: tainted, no note, taintedDiffersFromBaseRef = true',
+    s1.json.kernel.testsTainted === true && !/^note:/m.test(s1.text) && s1.json.taintedDiffersFromBaseRef === true, JSON.stringify({t: s1.json.kernel.testsTainted, d: s1.json.taintedDiffersFromBaseRef}))
+  // a human commits the test change and main absorbs it, without stopbar reset
+  for (const c of ['git commit -q -am "human: test change"', 'git update-ref refs/heads/main HEAD']) run(c, repo2)
+  const stateSha = sha(join(stateDir(repo2), 'state.json'))
+  const s2 = st()
+  check('tree no longer differs from main: testsTainted still true (L2.2), status prints the note, taintedDiffersFromBaseRef = false',
+    s2.json.kernel.testsTainted === true && /^note: no existing test or test-config file currently differs from main; .*stopbar reset.*stopbar approve-tests/m.test(s2.text) &&
+    s2.json.taintedDiffersFromBaseRef === false, JSON.stringify({t: s2.json.kernel.testsTainted, d: s2.json.taintedDiffersFromBaseRef, note: s2.text.split('\n').find((l) => l.startsWith('note:'))}))
+  check('status did not write state.json', sha(join(stateDir(repo2), 'state.json')) === stateSha && status(repo2).testsTainted === true)
+  keepEvents(repo2, 's42-status-base-ref')
 }
 
 // ---------------------------------------------------------------- S12 (last: over all hook calls)

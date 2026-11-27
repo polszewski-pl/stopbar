@@ -3,9 +3,9 @@
 // beforeReadFile, afterFileEdit, afterShellExecution. Permission events: exit 2 denies, and the JSON on stdout carries
 // permission "deny" with user_message and agent_message. Other non-zero exits are fail-open unless the entry sets
 // failClosed: true, so `stopbar init --hooks cursor` writes failClosed: true.
-import {type Adapter, byName, commandText, edit, exitCodeIn, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
+import {type Adapter, str, byName, commandText, edit, exitCodeIn, json, make, outbound, pathsOf, read, shell, type ToolClass} from './types.ts'
 
-function tool(name: string, ti: Record<string, any>): ToolClass {
+function tool(name: string, ti: Record<string, unknown>): ToolClass {
   if (name === 'Shell') return shell(commandText(ti.command), ti.is_background === true || ti.run_in_background === true)
   if (name === 'Read') return read(pathsOf(ti))
   if (['Write', 'Edit', 'Delete', 'StrReplace', 'MultiEdit', 'ApplyPatch'].includes(name)) return edit(pathsOf(ti))
@@ -16,7 +16,7 @@ function tool(name: string, ti: Record<string, any>): ToolClass {
 }
 const toolInput = (x: unknown) => {
   if (typeof x === 'string') { try { const o = JSON.parse(x); return o && typeof o === 'object' ? o : {} } catch { return {} } }
-  return x && typeof x === 'object' ? (x as Record<string, any>) : {}
+  return x && typeof x === 'object' ? (x as Record<string, unknown>) : {}
 }
 const PERMISSION = new Set(['preToolUse', 'beforeShellExecution', 'beforeMCPExecution', 'beforeReadFile'])
 
@@ -28,7 +28,7 @@ export const cursor: Adapter = {
     const cwd = typeof i.cwd === 'string' && i.cwd ? i.cwd : Array.isArray(i.workspace_roots) ? i.workspace_roots[0] : undefined
     const base = (t: ToolClass) => ({cwd, ...t})
     switch (ev) {
-      case 'preToolUse': return {kind: 'pre-tool', event: make('cursor', i, ev, {hook_event_name: 'PreToolUse', ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input)))}, {tool: i.tool_name})}
+      case 'preToolUse': return {kind: 'pre-tool', event: make('cursor', i, ev, {hook_event_name: 'PreToolUse', ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input)))}, {tool: str(i.tool_name)})}
       case 'beforeShellExecution': return {kind: 'pre-tool', event: make('cursor', i, ev, {hook_event_name: 'PreToolUse', ...base(shell(commandText(i.command)))})}
       case 'beforeMCPExecution': return {kind: 'pre-tool', event: make('cursor', i, ev, {hook_event_name: 'PreToolUse', ...base(outbound(`mcp__${i.mcp_server_name ?? 'server'}__${i.tool_name ?? 'tool'}`))})}
       case 'beforeReadFile': return {kind: 'pre-tool', event: make('cursor', i, ev, {hook_event_name: 'PreToolUse', ...base(read(pathsOf(i)))})}
@@ -37,10 +37,10 @@ export const cursor: Adapter = {
         const code = exitCodeIn(out)
         const failed = code !== undefined && code !== 0
         return {kind: failed ? 'post-tool-failure' : 'post-tool', event: make('cursor', i, ev, {hook_event_name: failed ? 'PostToolUseFailure' : 'PostToolUse',
-          ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input))), tool_response: code === undefined ? out : {exitCode: code}}, {tool: i.tool_name})}
+          ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input))), tool_response: code === undefined ? out : {exitCode: code}}, {tool: str(i.tool_name)})}
       }
       case 'postToolUseFailure': return {kind: 'post-tool-failure', event: make('cursor', i, ev, {hook_event_name: 'PostToolUseFailure',
-        ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input))), is_interrupt: i.is_interrupt === true || i.failure_type === 'permission_denied'}, {tool: i.tool_name})}
+        ...base(tool(String(i.tool_name ?? ''), toolInput(i.tool_input))), is_interrupt: i.is_interrupt === true || i.failure_type === 'permission_denied'}, {tool: str(i.tool_name)})}
       case 'afterFileEdit': return {kind: 'post-tool', event: make('cursor', i, ev, {hook_event_name: 'PostToolUse', ...base(edit(pathsOf(i)))})}
       // no exit code in afterShellExecution: a gate command seen only here never passes (use postToolUse)
       case 'afterShellExecution': return {kind: 'post-tool', event: make('cursor', i, ev, {hook_event_name: 'PostToolUse', ...base(shell(commandText(i.command)))}, {requireExitCode: true})}
