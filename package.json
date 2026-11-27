@@ -1,6 +1,6 @@
 {
   "name": "stopbar",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "A formally proven execution gate for AI coding agents: hooks for Claude Code, Cursor, Codex CLI, Gemini CLI and Antigravity CLI, plus git hooks. No commit without a passing build and full test suite, no silent test weakening, no exfiltration after a secret read.",
   "author": "Paweł Olszewski <kontakt@polszewski.com>",
   "license": "MIT",

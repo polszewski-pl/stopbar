@@ -1,8 +1,8 @@
 # Changelog
 
-## [1.2.3] (unreleased)
+## [1.2.3] (2026-11-28)
 
-`src/kernel.ts` is unchanged; no new dependency. `PreToolUse` still starts no git process.
+The kernel and dependencies are unchanged.
 
 - **Security fix: `stopbar doctor` with `GIT_DIR` no longer writes into the repository under check (affected:
   1.0.0–1.2.2).** With `GIT_DIR` or another `GIT_*` variable pointing at that repository (for example inside a git
