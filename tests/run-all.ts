@@ -14,8 +14,21 @@ function run(name: string, args: string[]): Promise<{name: string; code: number;
     const ch = spawn(process.execPath, args, {cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe']})
     let out = ''
     ch.stdout.on('data', (d) => { out += d }); ch.stderr.on('data', (d) => { out += d })
-    ch.on('exit', (code) => ok({name, code: code ?? 1, ms: Date.now() - t, tail: out.trim().split('\n').slice(-3).join('\n')}))
+    ch.on('exit', (code) => ok({name, code: code ?? 1, ms: Date.now() - t, tail: tailOf(out, code ?? 1)}))
   })
+}
+
+// A failed check names itself at the start of its line: `  [FAIL] <check>` (E2E; doctor output quoted in the log is
+// indented deeper and a `[PASS] ... :: [FAIL] ...` detail does not start so), `✖ <test>` / `not ok` (node:test),
+// `FAIL seed`, `PROBE FAIL`, `MUTANTS FAIL` (probe), and an assertion message.
+const FAIL_LINE = /^ {0,2}\[FAIL\] |^\s*✖ |^\s*not ok\b|^FAIL seed |^(?:PROBE|MUTANTS) FAIL|AssertionError/
+/** The last 3 lines; for a failed suite also up to 20 lines that name a failure, so a CI log shows which checks failed. */
+function tailOf(out: string, code: number): string {
+  const ls = out.trim().split('\n')
+  const last = ls.slice(-3)
+  if (code === 0) return last.join('\n')
+  const fails = ls.slice(0, -3).filter((l) => FAIL_LINE.test(l)).slice(0, 20).map((l) => l.trimEnd().slice(0, 300))
+  return [...(fails.length ? ['failures:', ...fails, '...'] : []), ...last].join('\n')
 }
 
 const units = readdirSync(join(ROOT, 'tests', 'unit')).filter((f) => f.endsWith('.test.ts')).map((f) => join('tests', 'unit', f))

@@ -1608,13 +1608,14 @@ say('\nS43 Husky (core.hooksPath .husky): Edit and sed of the hook are blocked w
     wi.code === 0 && wr.code === 1 && /stopbar pre-commit:/.test(wr.stderr) && /worktrees/.test(wgd) && existsSync(join(wgd, 'stopbar', 'runtime', 'bin', 'stopbar.mjs')), `${wi.code} ${wr.code} ${wgd} ${wr.stderr.trim().slice(0, 100)}`)
 
   // the line disappears outside the agent hooks (a tool or a human): doctor fails and never writes the event log
-  run("sed -i '/git-hook/d' .husky/pre-commit", repo)
+  // (written from Node: `sed -i` without a suffix is GNU only; BSD sed on macOS reads the script as the suffix)
+  writeFileSync(join(hk, 'pre-commit'), '#!/bin/sh\n')
   const evSha = sha(evF)
   const d2 = human(repo, 'doctor'), h2 = hooksLine(d2.out)
   check('pre-commit line gone after it was in HEAD: [FAIL] hooks git (exit 1), names HEAD:.husky/pre-commit and the portable line',
     d2.code === 1 && /^\[FAIL\] hooks git .*pre-commit/.test(h2) && /HEAD:\.husky\/pre-commit calls it|it ran since the last init/.test(h2) && h2.includes('npx --no-install stopbar git-hook pre-commit') && noAbs(h2), h2.slice(0, 300))
   check('doctor did not write events.jsonl (its sha256, which attest reports, is unchanged)', sha(evF) === evSha)
-  run("sed -i '/git-hook/d' .husky/pre-push", repo)
+  writeFileSync(join(hk, 'pre-push'), '#!/bin/sh\n')
   const h3 = hooksLine(human(repo, 'doctor').out)
   check('both lines gone: [FAIL] hooks git names pre-commit and pre-push', /^\[FAIL\] hooks git .*pre-commit and pre-push/.test(h3) && /HEAD:\.husky\/pre-push calls it/.test(h3), h3.slice(0, 300))
   agentBash(repo, 'echo hi')
