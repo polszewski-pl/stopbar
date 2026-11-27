@@ -2,6 +2,7 @@
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {copyFileSync, existsSync, readFileSync, rmSync, statSync} from 'node:fs'
+import {homedir} from 'node:os'
 import {dirname, isAbsolute, join, resolve} from 'node:path'
 
 export class FailClosed extends Error {
@@ -32,6 +33,67 @@ export function findRepo(cwd: string): Repo {
     if (up === dir) throw new FailClosed(`not inside a git repository: ${cwd}`, 'run Claude Code inside a git repository, or run `git init` and `stopbar init`')
     dir = up
   }
+}
+
+// ---------------------------------------------------------------- core.hooksPath without a git process
+/** The git common dir: `<gitDir>/commondir` (a worktree) names it, relative to gitDir; else gitDir itself. */
+function commonDirOf(r: Repo): string {
+  try {
+    const rel = readFileSync(join(r.gitDir, 'commondir'), 'utf8').trim()
+    if (rel) return isAbsolute(rel) ? rel : resolve(r.gitDir, rel)
+  } catch { /* no commondir: not a linked worktree */ }
+  return r.gitDir
+}
+
+/** The value of one line `key = value` of a git config file: quotes removed, the escapes \" \\ \t \n \b read, an
+ *  inline comment (# or ; outside quotes) dropped, spaces around the value trimmed. A key with no `=` is boolean true. */
+function configLineValue(rest: string): string {
+  let out = '', q = false, pend = ''
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === '\\' && i + 1 < rest.length) { const n = rest[++i]; out += pend + ({t: '\t', n: '\n', b: '\b'}[n] ?? n); pend = ''; continue }
+    if (c === '"') { q = !q; out += pend; pend = ''; continue }
+    if (!q && (c === '#' || c === ';')) break
+    if (!q && (c === ' ' || c === '\t')) { if (out) pend += c; continue }
+    out += pend + c; pend = ''
+  }
+  return out
+}
+
+/** The last `[core] hooksPath` value of a git config file, or undefined. Section and key names are case-insensitive;
+ *  `[core "x"]` is another section. Include files are not followed (a known limit, SECURITY.md). */
+export function configHooksPath(text: string): string | undefined {
+  let inCore = false, val: string | undefined
+  for (let line of text.split(/\r?\n/)) {
+    line = line.trim()
+    const sec = /^\[\s*([A-Za-z0-9.-]+)(\s+"(?:[^"\\]|\\.)*")?\s*\]\s*/.exec(line)
+    if (sec) { inCore = sec[1].toLowerCase() === 'core' && !sec[2]; line = line.slice(sec[0].length) }
+    if (!inCore || !line || line.startsWith('#') || line.startsWith(';')) continue
+    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=(.*))?$/.exec(line)
+    if (kv && kv[1].toLowerCase() === 'hookspath') val = kv[2] === undefined ? 'true' : configLineValue(kv[2])
+  }
+  return val
+}
+
+export type HooksPath = {raw: string; dir: string}
+/** `core.hooksPath` read from the files: `<common-dir>/config`, then `<gitDir>/config.worktree` (wins when set). A
+ *  relative value is relative to the working tree root (as git runs the hooks), `~/` is the home directory. Null when
+ *  unset, empty, or when it names the default <common-dir>/hooks. Pure file system: no git process in PreToolUse. */
+export function readHooksPath(r: Repo): HooksPath | null {
+  const common = commonDirOf(r)
+  let raw: string | undefined
+  for (const f of [join(common, 'config'), join(r.gitDir, 'config.worktree')]) {
+    let text: string
+    try { text = readFileSync(f, 'utf8') } catch { continue }
+    const v = configHooksPath(text)
+    if (v !== undefined) raw = v
+  }
+  if (!raw) return null
+  const expanded = raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw
+  const dir = isAbsolute(expanded) ? resolve(expanded) : resolve(r.root, expanded)
+  const def = resolve(common, 'hooks')
+  const same = process.platform === 'win32' ? dir.toLowerCase() === def.toLowerCase() : dir === def
+  return same ? null : {raw, dir}
 }
 
 export let gitCalls = 0

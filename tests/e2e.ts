@@ -4,7 +4,7 @@
 import {spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
-import {homedir} from 'node:os'
+import {homedir, tmpdir} from 'node:os'
 import {dirname, join, resolve} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {findBash} from './lib.ts'
@@ -1523,8 +1523,9 @@ say('\nS42 custom core.hooksPath: git hooks by default write nothing there (WARN
   check('upgrade --hooks git without --force-hooks fails closed too (exit 2)', human(repo, 'upgrade', '--hooks', 'git').code === 2 && !existsSync(join(cd, 'pre-commit')))
   const d1 = human(repo, 'doctor'), hg = d1.out.split('\n').find((l) => /hooks git/.test(l)) ?? ''
   check('doctor: [WARN] hooks git names the custom core.hooksPath and the manual git-hook call, no [FAIL] hooks git',
-    /^\[WARN\] hooks git .*custom core\.hooksPath/.test(hg) && /git-hook pre-commit\|pre-push/.test(hg) && !/\[FAIL\] hooks git/.test(d1.out) &&
-    /git commit and git push are NOT gated by Stopbar/.test(hg) && /pre-commit: node "[^"]+\/bin\/stopbar\.mjs" git-hook pre-commit; pre-push: node "[^"]+\/bin\/stopbar\.mjs" git-hook pre-push/.test(hg), hg)
+    /^\[WARN\] hooks git .*custom core\.hooksPath/.test(hg) && !/\[FAIL\] hooks git/.test(d1.out) &&
+    /git commit and git push are NOT gated by Stopbar/.test(hg) && hg.includes('`npx --no-install stopbar git-hook pre-commit` to custom-hooks/pre-commit and `npx --no-install stopbar git-hook pre-push` to custom-hooks/pre-push') &&
+    !/\.git\/stopbar\/runtime/i.test(hg.replace(/\$\(git rev-parse --git-dir\)\/stopbar\/runtime/g, '')), hg)
   check('doctor [OK] config.json names the default gate mode (hook command text, --require-run optional)',
     /^\[OK  \] config\.json .*gates: hook command text \(use --require-run for exit-code-only gates\)/m.test(d1.out))
   writeFileSync(join(cd, 'pre-commit'), '#!/bin/sh\necho user pre-commit\n')
@@ -1555,6 +1556,156 @@ say('\nS42 custom core.hooksPath: git hooks by default write nothing there (WARN
     s2.json.taintedDiffersFromBaseRef === false, JSON.stringify({t: s2.json.kernel.testsTainted, d: s2.json.taintedDiffersFromBaseRef, note: s2.text.split('\n').find((l) => l.startsWith('note:'))}))
   check('status did not write state.json', sha(join(stateDir(repo2), 'state.json')) === stateSha && status(repo2).testsTainted === true)
   keepEvents(repo2, 's42-status-base-ref')
+}
+
+// ---------------------------------------------------------------- S43 Husky: protected hook files, doctor [FAIL], portable hook line
+say('\nS43 Husky (core.hooksPath .husky): Edit and sed of the hook are blocked with 0 git processes in PreToolUse; doctor [WARN] never set up, [OK] with the portable lines, [FAIL] once a line from HEAD or a written hook is gone; no absolute .git/stopbar/runtime path in the hint')
+{
+  const repo = setupRepo('s43-husky'), hk = join(repo, '.husky'), evF = join(stateDir(repo), 'events.jsonl')
+  const hooksLine = (out: string) => out.split('\n').find((l) => /hooks git/.test(l)) ?? ''
+  const absRuntime = join(repo, '.git', 'stopbar', 'runtime').replace(/\\/g, '/').toLowerCase()
+  const noAbs = (s: string) => !s.replace(/\\/g, '/').toLowerCase().includes(absRuntime)
+  mkdirSync(hk, {recursive: true})
+  run('git config core.hooksPath .husky', repo)
+  const r1 = human(repo, 'init', '--force', '--build', 'node build.mjs', '--test', 'node --test', '--hooks', 'claude')
+  const w1 = r1.out.split('\n').filter((l) => /core\.hooksPath/.test(l)).join('\n')
+  check('init WARN for .husky: the portable `npx --no-install stopbar git-hook` lines first, the git-dir relative form, no absolute .git/stopbar/runtime path',
+    r1.code === 0 && w1.includes('`npx --no-install stopbar git-hook pre-commit` to .husky/pre-commit and `npx --no-install stopbar git-hook pre-push` to .husky/pre-push') &&
+    w1.includes('`node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook pre-commit`') && noAbs(w1), w1.slice(0, 400))
+  check('the init event records gitHooksWritten: [] (Stopbar wrote no git hook)', JSON.stringify(events(repo).filter((e) => e.source === 'human:init').at(-1)?.gitHooksWritten) === '[]')
+  const h0 = hooksLine(human(repo, 'doctor').out)
+  check('doctor before the lines are added: [WARN] hooks git (never set up) with the portable form, no absolute runtime path',
+    /^\[WARN\] hooks git .*custom core\.hooksPath/.test(h0) && h0.includes('npx --no-install stopbar git-hook pre-commit') && noAbs(h0), h0.slice(0, 300))
+  const ds = human(repo, 'doctor', '--strict')
+  check('doctor --strict with that warning: exit 1, RESULT: FAIL (strict: N warning(s))', ds.code === 1 && /^RESULT: FAIL \(strict: \d+ warning\(s\)\)$/m.test(ds.out), ds.out.split('\n').at(-1))
+  const dj = human(repo, 'doctor', '--strict', '--json'), j = JSON.parse(dj.out) as {ok: boolean; strict: boolean; warns: number; fails: number}
+  check('doctor --strict --json: exit 1, ok false, strict true, warnings > 0, no failure', dj.code === 1 && j.ok === false && j.strict === true && j.warns > 0 && j.fails === 0, JSON.stringify({ok: j.ok, strict: j.strict, warns: j.warns, fails: j.fails}))
+  check('doctor without --strict: the same warning exits 0', human(repo, 'doctor').code === 0)
+
+  // a human adds the portable lines and commits them (--no-verify: the gates are not green in this repository)
+  for (const n of ['pre-commit', 'pre-push']) writeFileSync(join(hk, n), `#!/bin/sh\nnpx --no-install stopbar git-hook ${n}\n`)
+  run('git add .husky && git commit -q --no-verify -m "husky hooks"', repo)
+  const h1 = hooksLine(human(repo, 'doctor').out)
+  check('doctor with both portable lines in .husky: [OK] hooks git', /^\[OK  \] hooks git/.test(h1), h1)
+  const before = sha(join(hk, 'pre-commit'))
+  const timing = () => events(repo).filter((e) => e.source === 'hook-timing' && e.event === 'PreToolUse').at(-1)
+  const e1 = hook(repo, 'PreToolUse', 'Edit', {file_path: join(hk, 'pre-commit'), old_string: 'npx --no-install stopbar git-hook pre-commit', new_string: ''})
+  check('Edit .husky/pre-commit: exit 2, gitCalls 0 in PreToolUse', e1.code === 2 && /git hook manager files/.test(e1.msg) && timing()?.gitCalls === 0, `${e1.msg.slice(0, 120)} gitCalls=${timing()?.gitCalls}`)
+  const s1 = agentBash(repo, "sed -i '/git-hook/d' .husky/pre-commit")
+  check("sed -i '/git-hook/d' .husky/pre-commit: exit 2, not run, gitCalls 0 in PreToolUse", s1.pre.code === 2 && !s1.ran && sha(join(hk, 'pre-commit')) === before && timing()?.gitCalls === 0, `${s1.pre.msg.slice(0, 120)} gitCalls=${timing()?.gitCalls}`)
+  for (const c of ['rm -rf .husky', 'find . -name ".hu*" -delete', 'rm -rf $(pwd)/.hu*', 'echo > lefthook.yml']) {
+    const b = agentBash(repo, c)
+    check(`${c}: exit 2 (not run), gitCalls 0`, b.pre.code === 2 && !b.ran && existsSync(join(hk, 'pre-commit')) && timing()?.gitCalls === 0)
+  }
+  const rel = run('node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook pre-commit', repo)
+  check('the git-dir relative line runs the pinned runtime (exit 1: gates not green, "stopbar pre-commit:")', rel.code === 1 && /stopbar pre-commit:/.test(rel.stderr), (rel.stderr || rel.stdout).trim().slice(0, 160))
+  const wt = join(TMP, 's43-husky-wt')
+  run(`git worktree add -q "${wt.replace(/\\/g, '/')}" -b s43-wt`, repo)
+  const wi = human(wt, 'init', '--build', 'node build.mjs', '--test', 'node --test')
+  const wr = run('node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook pre-commit', wt)
+  const wgd = run('git rev-parse --absolute-git-dir', wt).stdout.trim()
+  check("in a linked worktree the same line runs that worktree's pinned runtime (<git-dir>/stopbar = Stopbar's state dir)",
+    wi.code === 0 && wr.code === 1 && /stopbar pre-commit:/.test(wr.stderr) && /worktrees/.test(wgd) && existsSync(join(wgd, 'stopbar', 'runtime', 'bin', 'stopbar.mjs')), `${wi.code} ${wr.code} ${wgd} ${wr.stderr.trim().slice(0, 100)}`)
+
+  // the line disappears outside the agent hooks (a tool or a human): doctor fails and never writes the event log
+  run("sed -i '/git-hook/d' .husky/pre-commit", repo)
+  const evSha = sha(evF)
+  const d2 = human(repo, 'doctor'), h2 = hooksLine(d2.out)
+  check('pre-commit line gone after it was in HEAD: [FAIL] hooks git (exit 1), names HEAD:.husky/pre-commit and the portable line',
+    d2.code === 1 && /^\[FAIL\] hooks git .*pre-commit/.test(h2) && /HEAD:\.husky\/pre-commit calls it|it ran since the last init/.test(h2) && h2.includes('npx --no-install stopbar git-hook pre-commit') && noAbs(h2), h2.slice(0, 300))
+  check('doctor did not write events.jsonl (its sha256, which attest reports, is unchanged)', sha(evF) === evSha)
+  run("sed -i '/git-hook/d' .husky/pre-push", repo)
+  const h3 = hooksLine(human(repo, 'doctor').out)
+  check('both lines gone: [FAIL] hooks git names pre-commit and pre-push', /^\[FAIL\] hooks git .*pre-commit and pre-push/.test(h3) && /HEAD:\.husky\/pre-push calls it/.test(h3), h3.slice(0, 300))
+  agentBash(repo, 'echo hi')
+  check('the .husky change made outside the agent hooks taints the session (.husky/** is test config)', status(repo).testsTainted === true)
+  keepEvents(repo, 's43-husky')
+
+  // --force-hooks into an untracked custom core.hooksPath: the upgrade event names the hooks; a removed one is a FAIL
+  const repo2 = setupRepo('s43-force-hooks'), cd = join(repo2, 'shared-hooks')
+  run('git config core.hooksPath shared-hooks', repo2)
+  const u = human(repo2, 'upgrade', '--hooks', 'git', '--force-hooks')
+  check('upgrade --hooks git --force-hooks writes both hooks; the event has gitHooksWritten; doctor [OK]',
+    u.code === 0 && existsSync(join(cd, 'pre-commit')) && JSON.stringify(events(repo2).filter((e) => e.source === 'human:upgrade').at(-1)?.gitHooksWritten) === '["pre-commit","pre-push"]' &&
+    /^\[OK  \] hooks git/m.test(human(repo2, 'doctor').out), u.out.slice(0, 200))
+  rmSync(join(cd, 'pre-push'))
+  const f1 = hooksLine(human(repo2, 'doctor').out)
+  check('pre-push removed after --force-hooks wrote it: [FAIL] hooks git (written by stopbar upgrade)', /^\[FAIL\] hooks git .*pre-push: written by stopbar upgrade/.test(f1), f1.slice(0, 300))
+  rmSync(join(cd, 'pre-commit'))
+  const f2 = hooksLine(human(repo2, 'doctor').out)
+  check('both removed: [FAIL] hooks git names pre-commit and pre-push', /^\[FAIL\] hooks git .*pre-commit and pre-push/.test(f2), f2.slice(0, 300))
+  keepEvents(repo2, 's43-force-hooks')
+}
+
+// ---------------------------------------------------------------- S44 doctor --strict, init notes, --help, safeTools
+say('\nS44 doctor --strict on a clean setup, init notes (--require-run, codex), --help in every subcommand changes nothing, init --force keeps safeTools, --safe-tools')
+{
+  const repo = setupRepo('s44-strict-help'), cfgF = join(stateDir(repo), 'config.json'), evF = join(stateDir(repo), 'events.jsonl')
+  const base = ['init', '--force', '--build', 'node build.mjs', '--test', 'node --test']
+  const safeOf = () => JSON.stringify((JSON.parse(readFileSync(cfgF, 'utf8')) as {safeTools?: string[]}).safeTools)
+  const r = human(repo, ...base, '--hooks', 'claude')
+  const d = human(repo, 'doctor', '--strict')
+  check('doctor --strict on a clean setup (pinned runtime, Claude Code and git hooks): exit 0, RESULT: OK (0 warning(s))',
+    r.code === 0 && d.code === 0 && /^RESULT: OK \(0 warning\(s\)\)$/m.test(d.out), d.out.split('\n').filter((l) => /^\[WARN|^\[FAIL|^RESULT/.test(l)).join(' | ').slice(0, 300))
+  const dj = JSON.parse(human(repo, 'doctor', '--strict', '--json').out) as {ok: boolean; strict: boolean; warns: number}
+  check('doctor --strict --json without warnings: ok true, strict true, warns 0', dj.ok === true && dj.strict === true && dj.warns === 0)
+  check('init without --require-run: a tip names --require-run and stopbar doctor --strict; no Codex note', /tip: for CI .*--require-run.*stopbar doctor --strict/.test(r.out) && !/NOTE: Codex CLI/.test(r.out))
+  const rc = human(repo, ...base, '--hooks', 'codex')
+  check('init --hooks codex without --require-run: a NOTE recommends --require-run (Codex CLI passes no exit status to hooks)', rc.code === 0 && /NOTE: Codex CLI does not pass the exit status .*--require-run/.test(rc.out), rc.out.split('\n').find((l) => /Codex/.test(l)))
+  const rr = human(repo, ...base, '--hooks', 'codex', '--require-run')
+  check('init --hooks codex --require-run: no Codex note, no tip', rr.code === 0 && !/NOTE: Codex CLI/.test(rr.out) && !/tip: for CI/.test(rr.out))
+
+  agentWrite(repo, 'src/sum.mjs', 'export const sum = (a, b) => b + a\n')
+  const st0 = sha(join(stateDir(repo), 'state.json')), ev0 = sha(evF), rev0 = status(repo).treeRev
+  const h = human(repo, 'reset', '--help')
+  check('stopbar reset --help: exit 0, prints the help, state.json and events.jsonl unchanged, revision kept',
+    h.code === 0 && /stopbar reset +a human starts a fresh kernel state/.test(h.out) && sha(join(stateDir(repo), 'state.json')) === st0 && sha(evF) === ev0 && rev0 > 0 && status(repo).treeRev === rev0, `${h.code} rev ${rev0}`)
+  for (const a of [['init', '-h'], ['doctor', '--help'], ['approve-tests', '--help'], ['probe', '--help'], ['run', '--help'], ['resume', '-h'], ['upgrade', '--help']]) {
+    const x = human(repo, ...a)
+    check(`stopbar ${a.join(' ')}: exit 0 with the help, nothing changed`, x.code === 0 && /^stopbar \d+\.\d+\.\d+: proven gates/.test(x.out) && sha(join(stateDir(repo), 'state.json')) === st0 && sha(evF) === ev0)
+  }
+  const pc = spawnSync(process.execPath, [CLI, 'probe', '--cmd', '--help', '--runs', '1', '--no-record'], {cwd: repo, encoding: 'utf8'})
+  check('probe --cmd --help: --help is the value of --cmd, not a request for help', !/proven gates for coding agents/.test(pc.stdout ?? '') && pc.status !== 0, `${pc.status} ${(pc.stderr ?? '').trim().slice(0, 120)}`)
+
+  const c = JSON.parse(readFileSync(cfgF, 'utf8')) as {safeTools: string[]}
+  writeFileSync(cfgF, JSON.stringify({...c, safeTools: [...c.safeTools, 'mcp__local_notes__*']}, null, 2) + '\n')
+  const k1 = human(repo, ...base)
+  check('init --force keeps the custom safeTools of the previous config.json and says so', k1.code === 0 && safeOf() === '["mcp__ccd_turn__*","mcp__ccd_session_mgmt__*","mcp__local_notes__*"]' &&
+    /safeTools kept from the previous config\.json/.test(k1.out), safeOf())
+  const k2 = human(repo, ...base, '--safe-tools', 'mcp__ccd_turn__*, mcp__x__*')
+  check('init --force --safe-tools sets the list (comma separated, trimmed)', k2.code === 0 && safeOf() === '["mcp__ccd_turn__*","mcp__x__*"]' && /safeTools from --safe-tools/.test(k2.out), safeOf())
+  const noValue = spawnSync(process.execPath, [CLI, ...base, '--safe-tools'], {cwd: repo, encoding: 'utf8'})
+  check('--safe-tools with an invalid glob is refused (exit 1), --safe-tools without a value too', human(repo, ...base, '--safe-tools', 'a**b').code === 1 &&
+    noValue.status === 1 && /--safe-tools needs a value/.test(noValue.stderr ?? ''), `${noValue.status} ${(noValue.stderr ?? '').trim()}`)
+  writeFileSync(cfgF, '{"version": 1, "broken')
+  const k3 = human(repo, ...base)
+  check('a damaged config.json does not block init --force: the default safeTools', k3.code === 0 && safeOf() === '["mcp__ccd_turn__*","mcp__ccd_session_mgmt__*"]' && !/safeTools kept/.test(k3.out), k3.out.slice(0, 160))
+  keepEvents(repo, 's44-strict-help')
+}
+
+// ---------------------------------------------------------------- S45 stopbar run without PWD (Windows); 'stopbar/probe' outside any node_modules
+say("\nS45 stopbar run: the gate command does not inherit PWD on Windows; a .probe.ts outside the package and any node_modules imports 'stopbar/probe'")
+{
+  const repo = setupRepo('s45-run-pwd')
+  writeFileSync(join(repo, 'pwd.mjs'), "import {writeFileSync} from 'node:fs'\nwriteFileSync('pwd.txt', process.env.PWD ?? '<unset>')\n")
+  human(repo, 'init', '--force', '--build', 'node pwd.mjs', '--test', 'node --test', '--no-pin')
+  const rb = spawnSync(process.execPath, [CLI, 'run', 'build', '--repo', repo], {encoding: 'utf8', env: {...process.env, PWD: 'C:/foo'}})
+  const seen = existsSync(join(repo, 'pwd.txt')) ? readFileSync(join(repo, 'pwd.txt'), 'utf8') : '<no file>'
+  check(`stopbar run build with PWD=C:/foo: exit 0${process.platform === 'win32' ? ', the gate command sees no inherited PWD' : ' (PWD is left as it is off Windows)'}`,
+    rb.status === 0 && (process.platform === 'win32' ? seen === '<unset>' : seen !== '<no file>'), `exit ${rb.status} PWD=${seen}`)
+
+  const outside = join(tmpdir(), `stopbar-e2e-probe-${process.pid}`)
+  rmSync(outside, {recursive: true, force: true})
+  const ti = spawnSync(process.execPath, [CLI, 'probe', 'init', '--lang', 'ts', '--out', outside], {cwd: outside.replace(/[\\/][^\\/]+$/, ''), encoding: 'utf8'})
+  const file = join(outside, 'sample.probe.ts')
+  const noModules = (() => { for (let d = outside; ; d = dirname(d)) { if (existsSync(join(d, 'node_modules'))) return false; if (dirname(d) === d) return true } })()
+  const pr = spawnSync(process.execPath, [CLI, 'probe', '--target', file, '--runs', '20', '--check-mutants', '--no-record', '--work', join(outside, 'work')], {cwd: outside, encoding: 'utf8'})
+  const out = `${pr.stdout ?? ''}${pr.stderr ?? ''}`
+  check("probe --target <dir outside the package, no node_modules on the way>/sample.probe.ts (import from 'stopbar/probe'): --runs 20 --check-mutants exit 0, 2/2 killed",
+    ti.status === 0 && noModules && /from 'stopbar\/probe'/.test(readFileSync(file, 'utf8')) && pr.status === 0 && /PROBE PASS: 20\/20/.test(out) && /MUTANTS PASS: 2\/2 killed/.test(out),
+    `init ${ti.status} noModules ${noModules} probe ${pr.status} ${out.split('\n').filter((l) => /PASS|FAIL|ERR_|Error/.test(l)).join(' | ').slice(0, 300)}`)
+  rmSync(outside, {recursive: true, force: true})
+  keepEvents(repo, 's45-run-pwd')
 }
 
 // ---------------------------------------------------------------- S12 (last: over all hook calls)

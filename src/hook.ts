@@ -6,7 +6,7 @@ import * as K from './classify.ts'
 import {cliOf, type Config, DEFAULT_SAFE_TOOLS} from './config.ts'
 import {matchAny} from './glob.ts'
 import {decode, kstep, type Req, type View} from './engine.ts'
-import {changesSinceHead, countedEntries, diffEntries, differsFromHead, type Entries, FailClosed, findRepo, gitCalls, markCounted, oidOf, refEntries, type Repo, type Snap, snapshot} from './repo.ts'
+import {changesSinceHead, countedEntries, diffEntries, differsFromHead, type Entries, FailClosed, findRepo, gitCalls, markCounted, oidOf, readHooksPath, refEntries, type Repo, type Snap, snapshot} from './repo.ts'
 import {appendEvent, readConfig, readState, type Saved, withLock, writeState} from './store.ts'
 import {codeDirs} from './pkg.ts'
 
@@ -15,7 +15,7 @@ type Ctx = {repo: Repo; cfg: Config; s: Saved; protect: K.Protect; dirty: boolea
 /** A hook event: Claude Code's JSON object (adapters translate other clients into it). Fields are read with guards. */
 export type HookEvent = Record<string, unknown>
 /** Stopbar's own fields on an event: set by the adapters and by `stopbar run`, never by the agent's client. */
-type Meta = {adapter?: string; rawKeys?: unknown; expectedSnapshot?: string; expectedRev?: number; requireExitCode?: boolean}
+type Meta = {adapter?: string; rawKeys?: unknown; expectedSnapshot?: string; expectedRev?: number; requireExitCode?: boolean; event?: string}
 
 const obj = (x: unknown): Record<string, unknown> => (x && typeof x === 'object' && !Array.isArray(x) ? x as Record<string, unknown> : {})
 const strings = (...xs: unknown[]): string[] => xs.flatMap((x) => (Array.isArray(x) ? x as unknown[] : [x])).filter((x): x is string => typeof x === 'string' && x.length > 0)
@@ -27,6 +27,7 @@ function metaOf(x: unknown): Meta {
     ...(typeof m.expectedSnapshot === 'string' ? {expectedSnapshot: m.expectedSnapshot} : {}),
     ...(typeof m.expectedRev === 'number' ? {expectedRev: m.expectedRev} : {}),
     ...(m.requireExitCode === true ? {requireExitCode: true} : {}),
+    ...(typeof m.event === 'string' ? {event: m.event} : {}),
   }
 }
 
@@ -295,6 +296,10 @@ export function runHook(raw: string, t0 = performance.now()): Out {
   return runEvent(input as HookEvent, t0)
 }
 
+/** Self-protection of this repository: .git, the Stopbar state and code, and a custom core.hooksPath read from the git
+ *  config files (no git process). */
+export const protectOf = (repo: Repo): K.Protect => ({gitDir: repo.gitDir, stateDir: repo.stateDir, codeDirs: codeDirs(), ...K.hooksProtect(repo.root, readHooksPath(repo))})
+
 /** One normalised hook event (Claude Code's shape; adapters translate other clients into it). Never throws. */
 export function runEvent(input: HookEvent, t0 = performance.now()): Out {
   try {
@@ -302,14 +307,14 @@ export function runEvent(input: HookEvent, t0 = performance.now()): Out {
     const g0 = gitCalls
     return withLock(repo, () => {
       const cfg = readConfig(repo)
-      const ctx: Ctx = {repo, cfg, s: readState(repo), protect: {gitDir: repo.gitDir, stateDir: repo.stateDir, codeDirs: codeDirs()}, dirty: false}
-      const ev = input.hook_event_name
+      const ctx: Ctx = {repo, cfg, s: readState(repo), protect: protectOf(repo), dirty: false}
+      const ev = input.hook_event_name, meta = metaOf(input.stopbar)
       const res = ev === 'PreToolUse' ? pre(ctx, input)
         : ev === 'PostToolUse' ? post(ctx, input, false)
           : ev === 'PostToolUseFailure' ? post(ctx, input, true)
             : ev === 'Stop' ? stop(ctx, input) : {code: 0}
       if (ctx.dirty) writeState(repo, ctx.s)
-      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, ...(metaOf(input.stopbar).adapter ? {adapter: metaOf(input.stopbar).adapter} : {}), exit: res.code, gitCalls: gitCalls - g0,
+      appendEvent(repo, {source: 'hook-timing', event: ev, tool: input.tool_name, ...(meta.adapter ? {adapter: meta.adapter} : {}), ...(meta.adapter === 'git' && meta.event ? {gitHook: meta.event} : {}), exit: res.code, gitCalls: gitCalls - g0,
         handlerMs: Math.round(performance.now() - t0), processMs: Math.round(process.uptime() * 1000)})
       return res
     })

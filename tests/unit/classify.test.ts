@@ -382,12 +382,16 @@ test('1.2.1 closed bypasses: environment dumps, `..` and wildcards to secrets, w
   for (const c of ['git -C $dir status', 'git -c $kv status', 'git commit -m "$msg"', 'echo "git $x"', 'git log --format=$fmt', 'git status']) assert.equal(protectedCommand(c, pr), null, c)
 })
 
-test('1.2.1 known limits without an OS sandbox (documented in SECURITY.md): text matching cannot see these', () => {
+test('1.2.2 known limits without an OS sandbox (documented in SECURITY.md): text matching cannot see these', () => {
   // the secret name is built at run time (command substitution, a variable); the hook sees only `.e` and `nv`
   for (const c of ['cat $(echo .e)nv', 'f=.e; cat ${f}nv']) assert.equal(secretInCommand(c, P, () => false), null, c)
   // a script the agent wrote outside the repository runs code the wrapper never reads
   assert.equal(secretInCommand('node /tmp/x.js', P, () => false), null)
   assert.equal(protectedCommand('node /tmp/x.js', {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: []}), null)
+  // find without a name pattern, or with a name inside .git; a hook path built at run time
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: []}
+  for (const c of ['find . -delete', 'find . -name config -delete', 'd=.hu; sed -i d ${d}sky/pre-commit']) assert.equal(protectedCommand(c, pr), null, c)
+  assert.equal(secretInCommand('find . -type f -exec cat {} +', P, () => false), null)
 })
 
 test('1.2.1 heredoc exceptions hold only for a single-quoted delimiter <<\'EOF\', never for <<EOF, <<"EOF", bash -s or sh', () => {
@@ -404,5 +408,62 @@ test('1.2.1 heredoc exceptions hold only for a single-quoted delimiter <<\'EOF\'
   for (const c of [`agy -p - <<EOF\n${body}\nEOF`, `agy -p - <<"EOF"\n${body}\nEOF`, `bash -s <<'EOF'\n${body}\nEOF`, `sh <<'EOF'\n${body}\nEOF`]) {
     assert.equal(withoutStdinHeredoc(c), null, c)
     assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), pr, 'bash'), 'human-only Stopbar command or setting', c)
+  }
+})
+
+// ---------------------------------------------------------------- 1.2.2
+const PRH = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: ['C:/tools/stopbar/dist'], hooksDir: 'C:/r/custom-hooks', hooksPathRaw: 'custom-hooks'}
+
+test('1.2.2 hook managers: Edit/Write to .husky/**, lefthook*.yml, .lefthook/** and the custom core.hooksPath directory is blocked', () => {
+  const root = 'C:/r'
+  for (const p of ['C:/r/.husky/pre-commit', 'C:/r/.husky/_/husky.sh', 'C:/r/lefthook.yml', 'C:/r/.lefthook.yml', 'C:/r/lefthook.yaml', 'C:/r/.lefthook.yaml',
+    'C:/r/lefthook-local.yml', 'C:/r/.lefthook-local.yaml', 'C:/r/.lefthook/pre-commit/lint.sh', 'C:/r/custom-hooks/pre-push', 'c:\\R\\Custom-Hooks\\pre-commit', 'C:/r/.HUSKY/pre-push'])
+    assert.ok(protectedPath(p, root, PRH), p)
+  for (const p of ['C:/r/src/husky.ts', 'C:/r/docs/lefthook.md', 'C:/r/custom-hooks-old/x', 'C:/r/src/hooks/useX.ts', 'C:/r/lefthook.json.bak', 'C:/r/src/custom-hooks/a.ts'])
+    assert.equal(protectedPath(p, root, PRH), null, p)
+  // without a custom core.hooksPath only the hook-manager files are protected
+  const pr = {gitDir: 'C:/r/.git', stateDir: 'C:/r/.git/stopbar', codeDirs: []}
+  assert.ok(protectedPath('C:/r/.husky/pre-commit', root, pr))
+  assert.equal(protectedPath('C:/r/custom-hooks/pre-push', root, pr), null)
+})
+
+test('1.2.2 hook managers: shell commands that name .husky, lefthook*.yml, .lefthook or the custom core.hooksPath are blocked', () => {
+  for (const c of ["sed -i '/git-hook/d' .husky/pre-commit", 'rm -rf .husky', 'echo x > .husky/pre-push', 'rm lefthook.yml', "sed -i '/stopbar/d' .lefthook.yml",
+    'rm -rf .lefthook', 'mv lefthook-local.yaml x', "sed -i '/git-hook/d' custom-hooks/pre-commit", 'rm -rf ./custom-hooks', 'rm C:/r/custom-hooks/pre-push',
+    'cat "custom-hooks/pre-commit"', 'rm -rf .h""usky', 'rm -rf .hu*', 'cp x .hu*/pre-commit', 'rm -rf .lef*', 'Remove-Item -Recurse .hus*'])
+    assert.ok(protectedCommand(commandForSelfProtect(c, 'bash'), PRH), c)
+  for (const c of ['npx husky', 'npm run prepare', 'ls src/hooks', 'cat src/custom-hooks.ts', 'rm -rf custom-hooks-old', 'echo lefthook', 'npx lefthook install', 'git status', 'rm *.log'])
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), PRH), null, c)
+  // an empty, `.` or `/` core.hooksPath value never protects the whole tree
+  for (const raw of ['', '.', '/', './']) {
+    const pr = {...PRH, hooksDir: undefined, hooksPathRaw: raw}
+    for (const c of ['rm -rf dist', 'ls ./src', 'cat /etc/hosts']) assert.equal(protectedCommand(c, pr), null, `${JSON.stringify(raw)}: ${c}`)
+  }
+})
+
+test('1.2.2 $(pwd), ${PWD}, $PWD and `pwd` before a wildcard are read as the current directory', () => {
+  const vs = ['$(pwd)', '"$(pwd)"', '${PWD}', '"${PWD}"', '$PWD', '"$PWD"', '`pwd`', '"`pwd`"']
+  for (const v of vs) {
+    for (const d of ['.g*', '.cl*']) assert.match(protectedCommand(`rm -rf ${v}/${d}`, PRH) ?? '', /wildcard that reaches the \.(git|claude) directory/, `rm -rf ${v}/${d}`)
+    assert.ok(secretInCommand(`cat ${v}/.e*`, P, () => false), `cat ${v}/.e*`)
+    for (const c of [`echo ${v}/src/*.ts`, `rm -rf ${v}/dist/*`, `ls ${v}/src`, `cp ${v}/src/*.ts lib/`]) {
+      assert.equal(protectedCommand(c, PRH), null, c)
+      assert.equal(secretInCommand(c, P, () => false), null, c)
+    }
+  }
+})
+
+test('1.2.2 find: -name/-path patterns that reach a protected directory with -delete/-exec, or a secret with -exec, are caught', () => {
+  for (const c of ['find . -maxdepth 1 -name ".g*" -exec rm -rf {} +', 'find . -name ".g*" -delete', "find . -iname '.G*' -delete", 'find . -path "*/.g*" -delete',
+    "find . -name '.cl*' -execdir rm -rf {} \\;", 'find . -name ".hu*" -delete', 'find . -name ".lef*" -ok rm {} \\;', 'find . -name "custom-h*" -okdir rm {} \\;',
+    'find . -name "*" -delete', 'find . -ipath "./.c*" -exec rm -rf {} +', 'find . -wholename "*/.cu*" -delete'])
+    assert.ok(protectedCommand(commandForSelfProtect(c, 'bash'), PRH), c)
+  for (const c of ['find . -name ".e*" -exec cat {} +', 'find . -iname "*.PEM" -exec cat {} \\;', 'find . -path "*/.env*" -execdir cat {} +', "find . -name '*.key' -ok cat {} \\;",
+    'find src -name "id_rsa*" -exec cat {} +', 'find . -name "*" -exec cat {} +'])
+    assert.equal(secretInCommand(c, P, () => false)?.pattern !== undefined, true, c)
+  for (const c of ['find . -name "*.ts" -exec wc -l {} +', 'find . -name "*.test.ts" -delete', 'find . -name "*" -maxdepth 1', 'find . -name ".g*"', 'find . -name ".e*"',
+    'find dist -name "*.map" -delete', 'find . -type f -name "*.log" -exec rm {} +', 'find . -path "./node_modules" -prune -o -name "*.ts" -print']) {
+    assert.equal(protectedCommand(commandForSelfProtect(c, 'bash'), PRH), null, c)
+    assert.equal(secretInCommand(c, P, () => false), null, c)
   }
 })

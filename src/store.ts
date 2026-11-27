@@ -5,7 +5,7 @@ import {type Config, ConfigError, validateConfig} from './config.ts'
 import {CODEC} from './kernel.gen.js'
 import {FailClosed, type Repo} from './repo.ts'
 
-export const VERSION = '1.2.1'
+export const VERSION = '1.2.2'
 export type KState = {scalars: Record<string, number>; maps: Record<string, unknown>}
 export type Saved = {version: 2; kernel: KState; snapshot: string; params: {maxRetries: number; cap: number}}
 
@@ -130,14 +130,16 @@ export function appendEvent(r: Repo, entry: Record<string, unknown>) {
   } finally { closeSync(fd) }
 }
 
-export type EventLog = {events: Record<string, any>[]; torn: {line: number; text: string}[]}
+/** One parsed line of events.jsonl: the fields read by status, doctor and attest are typed; the rest stay unknown. */
+export type EventEntry = {source?: string; req?: {op?: string}; secretTainted?: boolean; treeRev?: number; secret?: {pattern: string; path: string; tool: string}; [k: string]: unknown}
+export type EventLog = {events: EventEntry[]; torn: {line: number; text: string}[]}
 export function readEvents(r: Repo): EventLog {
   const f = files(r).events
   if (!existsSync(f)) return {events: [], torn: []}
   const out: EventLog = {events: [], torn: []}
   readFileSync(f, 'utf8').split('\n').forEach((l, i) => {
     if (!l) return
-    try { out.events.push(JSON.parse(l)) } catch { out.torn.push({line: i + 1, text: l.slice(0, 120)}) }
+    try { const e: unknown = JSON.parse(l); out.events.push(e && typeof e === 'object' && !Array.isArray(e) ? e as EventEntry : {value: e}) } catch { out.torn.push({line: i + 1, text: l.slice(0, 120)}) }
   })
   return out
 }

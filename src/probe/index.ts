@@ -8,6 +8,7 @@
 import {spawn} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {registerHooks} from 'node:module'
 import {availableParallelism, tmpdir} from 'node:os'
 import {isAbsolute, join, relative, resolve} from 'node:path'
 import {pathToFileURL} from 'node:url'
@@ -38,6 +39,18 @@ function isTarget(v: unknown): v is ProbeTarget<ProbeRun> {
 export type Runnable = Omit<ProbeTarget<ProbeRun>, 'generate'> & {generate(seed: number): ProbeRun | Promise<ProbeRun>; close?(): Promise<void>}
 export type Resolved = {t: Runnable; spec: string; file: string | null; sha256: string | null; cmd?: string}
 
+let probeHook = false
+/** `import ... from 'stopbar/probe'` in a target file resolves to this package's SDK, also where no node_modules on the
+ *  way from the file has stopbar (a global install, a copy outside the project). Every other specifier resolves as
+ *  Node resolves it. Synchronous module hooks (node:module registerHooks, Node >= 22.15), registered once per process
+ *  (the runner and each worker). */
+function resolveStopbarProbe() {
+  if (probeHook) return
+  probeHook = true
+  const sdk = pathToFileURL(join(PKG_ROOT, 'dist', 'probe', 'sdk.js')).href
+  registerHooks({resolve: (specifier, context, nextResolve) => (specifier === 'stopbar/probe' ? {url: sdk, shortCircuit: true} : nextResolve(specifier, context))})
+}
+
 /** A name in TARGETS, else a .ts/.mts/.js/.mjs file (absolute, or relative to `cwd`, then to `repo`) that exports a
  *  ProbeTarget as `default` or as `target`. */
 export async function loadTarget(spec: string, cwd = process.cwd(), repo?: string): Promise<Resolved> {
@@ -46,6 +59,7 @@ export async function loadTarget(spec: string, cwd = process.cwd(), repo?: strin
   const file = cands.find((f) => existsSync(f))
   if (!file) throw new ProbeError(`probe target ${JSON.stringify(spec)} is neither a known target (${Object.keys(TARGETS).join(', ')}) nor an existing file`)
   if (!/\.(ts|mts|js|mjs)$/.test(file)) throw new ProbeError(`probe target ${file}: the file must end in .ts, .mts, .js or .mjs`)
+  resolveStopbarProbe()
   let mod: {default?: unknown; target?: unknown} | null
   try { mod = await import(pathToFileURL(file).href) as {default?: unknown; target?: unknown} | null } catch (e) {
     throw new ProbeError(`probe target ${file} does not load: ${(e as Error)?.message ?? e}`)

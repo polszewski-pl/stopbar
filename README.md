@@ -11,7 +11,7 @@ command text and asks the kernel; it is covered by unit and E2E tests and statef
 
 | Proven (Lean 4.34.0) | Tested (wrapper + E2E + PROBE) | Not covered without OS sandbox |
 |---|---|---|
-| The decision rule `src/kernel.ts`: no commit without a passing build and full suite at the current revision (L1); test taint until a human approval (L2.x); pause of risky and outbound calls after a secret read (L3.x); halt on budget and retries (L4.x). 10 mutants each fall with a counterexample. | How tool calls become kernel requests: exact gate commands, content snapshots of the tree, test and secret path patterns, self-protection of `.git`, agent settings and the Stopbar code, the client adapters, the git hooks. | A path or name built at run time (`f=.e; cat ${f}nv`), a script the agent wrote and runs (`node /tmp/x.js`), code that the gate commands run, secrets in files with ordinary names. See [SECURITY.md](SECURITY.md) section 3. |
+| The decision rule `src/kernel.ts`: no commit without a passing build and full suite at the current revision (L1); test taint until a human approval (L2.x); pause of risky and outbound calls after a secret read (L3.x); halt on budget and retries (L4.x). 10 mutants each fall with a counterexample. | How tool calls become kernel requests: exact gate commands, content snapshots of the tree, test and secret path patterns, self-protection of `.git`, agent settings, Husky and Lefthook hooks and the Stopbar code, the client adapters, the git hooks. | A path or name built at run time (`f=.e; cat ${f}nv`), a script the agent wrote and runs (`node /tmp/x.js`), code that the gate commands run, secrets in files with ordinary names. See [SECURITY.md](SECURITY.md) section 3. |
 
 **Without an OS sandbox, Stopbar stops shortcuts and mistakes of an agent; it is not a security boundary against a
 hostile agent.** A command can build a path at run time or hide it in a script that the text rules do not see. See
@@ -25,11 +25,10 @@ It stops an agent from:
 - looping on failing builds or tests, or going past a budget of tool calls;
 - switching itself off by editing the agent's hook configuration, git hooks or its own state.
 
-The decisions come from one rule, `src/kernel.ts`. gdp-wired 0.60.0 proves its laws by induction, and 10 mutants of
-the rule each fall with a counterexample. Every client goes through the same rule: an adapter translates the client's
-hook payload into one internal event and renders the decision in the client's own output format.
-
 ## Supported agents
+
+Every client goes through the same rule: an adapter translates the client's hook payload into one internal event and
+renders the decision in the client's own output format.
 
 | Agent | Config written by `init --hooks` | Events | Block protocol | Status |
 |---|---|---|---|---|
@@ -109,7 +108,7 @@ EOF
 
 | Command | Who | What it does |
 |---|---|---|
-| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--require-run] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-git-hooks] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated; `git` is added to any other target unless `--no-git-hooks`. `--require-run`: the build and full test gates count only through `stopbar run build\|test`. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. |
+| `stopbar init --build "<cmd>" --test "<cmd>" [--profile p] [--base-ref <ref>] [--cli "<cmd>"] [--stop-gate block\|warn] [--require-run] [--safe-tools "<glob>,<glob>"] [--max-retries 3] [--cap 500] [--cost 1] [--hooks <targets>] [--no-git-hooks] [--no-pin] [--force] [--force-hooks]` | human | Writes `config.json` and a fresh state, pins the runtime, writes or prints the hooks. Targets: `claude` (`local`), `claude-project` (`project`), `cursor`, `codex`, `gemini`, `antigravity` (`agy`), `git`, comma separated; `git` is added to any other target unless `--no-git-hooks`. `--require-run`: the build and full test gates count only through `stopbar run build\|test`. `--build` and `--test` must be different commands. `--base-ref` sets the git ref used to judge whether a test file already existed (default `HEAD`). `--cli` sets the Stopbar command in hints (default `npx --no-install stopbar`). `--stop-gate warn` lets a turn end with unverified changes (default `block`); commit and push stay gated. `--safe-tools` sets `safeTools` (comma separated globs); without it `--force` keeps the list of the previous `config.json`. |
 | `stopbar upgrade [--hooks <targets>] [--force-hooks]` | human | After you update the Stopbar package: re-pins the hook runtime in `.git/stopbar/runtime` and, with `--hooks`, rewrites the hooks. `state.json`, `config.json` and the snapshots stay as they are (revision, gates, taint, budget), so an active session keeps its green gates. Use it instead of `init --force`. |
 | `stopbar hook [--adapter auto\|claude\|cursor\|codex\|gemini\|antigravity]` | agent | The hook. JSON on stdin; the decision in the client's format (see Supported agents). |
 | `stopbar git-hook pre-commit\|pre-push` | git | The git fallback gate. Exit 1 aborts the commit or push. |
@@ -119,13 +118,14 @@ EOF
 | `stopbar approve-shell` | human | Allows **one** risky or outbound call after a secret read. |
 | `stopbar resume --extra N` | human | Lifts a halt (retry limit or budget) and adds N to the budget. |
 | `stopbar reset` | human | Fresh kernel state. Config and event log stay. Also repairs a damaged `state.json`. Uncommitted changes of existing tests or test config (against `baseRef`, else `HEAD`) are not forgotten: the session starts tainted, with a `WARN`, until `approve-tests`. `init --force` does the same. |
-| `stopbar doctor [--json]` | human | Environment, config, state, hooks and a dry run. Exit 1 on a problem. |
+| `stopbar doctor [--json] [--strict]` | human, CI | Environment, config, state, hooks and a dry run. It only reads the repository's event log. Exit 1 on a problem; with `--strict` also on a warning (`RESULT: FAIL (strict: N warning(s))`, in `--json` `ok: false, strict: true`). |
 | `stopbar prove [--out f.json] [--lean f.lean]` | human, CI | PROVE: the inductive proof of the kernel and the 10 mutants. Exit 0 only if everything holds. `verify` is an alias. |
-| `stopbar probe [--target wrapper\|<file> \| --cmd "<command>" [--target-file <path>] [--cmd-timeout 300000]] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file, or of a program in any language over NDJSON (`--cmd`, see [PROBE for your project](#probe-for-your-project)). `--target` and `--cmd` exclude each other. A failure is shrunk to a minimal JSON reproduction. |
+| `stopbar probe [--target wrapper\|<file> \| --cmd "<command>" [--target-file <path>] [--cmd-timeout 300000]] [--runs 200] [--seed 1] [--jobs N] [--work dir] [--out dir] [--regressions dir] [--regressions-only] [--check-mutants] [--mutant-runs 50] [--no-record]` | human, CI | PROBE: stateful probing of the hooks against the proven kernel (`wrapper`, needs the full package with gdp-wired), of your own model in a `.ts`, `.mts`, `.js` or `.mjs` file, or of a program in any language over NDJSON (`--cmd`, see [docs/probe.md](docs/probe.md)). `--target` and `--cmd` exclude each other. A failure is shrunk to a minimal JSON reproduction. |
 | `stopbar probe init [--lang ts\|py] [--name sample] [--out probes] [--force] [--repo <dir>]` | human, agent | Writes a starter target with 2 actions, 1 invariant and 2 mutants (`<name>.probe.ts` or `<name>_probe.py`) and prints the command that runs it. It does not overwrite a file without `--force`. |
 | `stopbar attest [--format json\|md]` | human, CI | ATTEST: the session attestation. The same state and log give the same output. Exit 1 if the state and the log disagree, exit 2 if a file is damaged. `probes` (Markdown: `## Probe evidence`) lists the latest `probe:result` per target since the last `init` or `reset`, with `atCurrentSnapshot`. |
 
-All commands take `--repo <dir>`. The agent cannot run the human commands: the hooks block them.
+All commands take `--repo <dir>` and `--help` / `-h` (prints the help, runs nothing). The agent cannot run the human
+commands: the hooks block them.
 
 State, configuration and the event log are in `<repo>/.git/stopbar/`: `config.json`, `state.json`, `events.jsonl`, the
 private snapshot index and the pinned runtime. They are outside the working tree, so they never change the tree hash.
@@ -137,100 +137,13 @@ The gate (GATE, with PROVE and ATTEST) is the product. PROBE is a test tool that
 | Part | Command | What it gives you |
 |---|---|---|
 | PROVE | `stopbar prove`, `npm run verify:lean` | The inductive proof of the kernel, 10 mutants that must fall with a counterexample, and (release gate) `lake build` of the Lean export in a pinned Lean 4.34.0 container without network. |
-| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also your own project: a TS/JS model written with `defineModel` from `stopbar/probe`, or a program in any language (Python, Go, Rust, ...) that speaks NDJSON on stdin/stdout (`--cmd`), with mutants that must be caught. |
+| PROBE | `stopbar probe` | Stateful probing: at least 200 random multi-step sequences of hook events, human commands and damaged files on real git repositories, compared step by step with the proven kernel (target `wrapper`, Stopbar itself). Since 1.2.0 also your own project: a TS/JS model written with `defineModel` from `stopbar/probe`, or a program in any language (Python, Go, Rust, ...) that speaks NDJSON on stdin/stdout (`--cmd`), with mutants that must be caught. Guide: [docs/probe.md](docs/probe.md). |
 | GATE | `stopbar init`, `upgrade`, `hook`, `git-hook`, `run`, `status`, `approve-tests`, `approve-shell`, `resume`, `reset`, `doctor` | The agent hooks, the git fallback and the human commands. |
 | ATTEST | `stopbar attest` | A deterministic attestation of the session: HEAD, tree, gates, human actions, probe evidence and the sha256 of the event log. |
 
 **Probe evidence** in `stopbar attest` is the recorded result of one probe run, tied to the tree snapshot and to the
 sha256 of the prober file. It says what the prober saw on that tree. It is no proof against a hostile agent without an
 OS sandbox: an agent that can write `events.jsonl` can also write a false entry ([SECURITY.md](SECURITY.md) section 4).
-
-## PROBE for your project
-
-`stopbar probe --target <file>` runs a model of any TS/JS code. The file exports (as `default` or as `target`) a
-target; `defineModel` from `stopbar/probe` builds one from a list of actions:
-
-```ts
-import {defineModel} from 'stopbar/probe'
-
-export default defineModel<{q: BoundedQueue<number>; model: number[]}>({
-  name: 'bounded-queue', description: 'FIFO queue with capacity 4 vs an array model',
-  setup: () => ({q: new BoundedQueue<number>(4), model: []}),
-  actions: [
-    {name: 'push', weight: 3, gen: (r) => ({x: r.int(0, 99)}), run: (s, {x}, check) => {
-      const accepted = s.model.length < 4
-      check.eq('push result', s.q.push(x), accepted)
-      if (accepted) s.model.push(x)
-    }},
-    {name: 'shift', gen: () => null, run: (s, _a, check) => check.eq('shift result', s.q.shift(), s.model.shift())},
-  ],
-  invariants: [{name: 'size', check: (s, check) => check.eq('size', s.q.size, s.model.length)}],
-  mutants: {M1_dropCap: () => ({q: new BoundedQueue<number>(4, {checkCap: false}), model: []})},
-})
-```
-
-- `gen(r)` returns pure JSON data for one step. `r` is a deterministic generator (`createRng`: xorshift32, the same
-  numbers on Windows and Linux). A run is `{seed, actions: [{t: name, args}]}` with `minSteps`..`maxSteps` steps
-  (default 15..40).
-- `run(state, args, check)` drives the real code and compares it with the model: `check.eq` (deep strict equality),
-  `check.ok`, `check.fail`. A failed check, and any exception from the code under test, is a mismatch with the step and
-  the action, not a crash. Invariants run after `setup` (step -1) and after every step. `teardown` runs after every run
-  whose `setup` returned, also after a failure.
-- A failure is shrunk (cut after the failing step, then removal of blocks of half, a quarter, ... of the run, then of
-  single steps) and written to `repro-<seed>.json` in `--out`. `--regressions <dir>` replays such files on every run.
-  A file target replays only the regressions you name.
-- `--check-mutants`: each mutant replaces `setup` with a damaged system under test. The original must pass, and every
-  mutant must fail within `--mutant-runs` seeds (default 50). Exit 0 only then. A survivor is named in the output and
-  in `summary.json` (`mutants.survived`). A target without mutants is refused.
-- In a repository with Stopbar, every run appends a `probe:result` entry to `events.jsonl` (target, sha256 of the
-  target file, tree snapshot, runs, steps, mutants, sha256 of `summary.json`). It is not a kernel step and does not
-  change `state.json`. `stopbar attest` shows the latest entry per target and whether the tree is still the one that
-  was probed. `--no-record` skips the entry. Outside a Stopbar repository nothing is recorded.
-
-A complete example with two mutants: [`examples/bounded-queue.probe.ts`](examples/bounded-queue.probe.ts)
-(`stopbar probe --target examples/bounded-queue.probe.ts --check-mutants`). TypeScript files need Node's type
-stripping (Node 22.18 or later): only erasable syntax, no `enum` and no constructor parameter properties.
-
-### Any language: `--cmd`
-
-`stopbar probe --cmd "<command>"` probes a program in any language (Python, Go, Rust, ...). Each worker (`--jobs`)
-starts the command once, in a shell, in the current directory, and keeps it for all its runs, so the start-up cost
-is paid once per worker and not once per seed. Stopbar sends one JSON object per line on stdin and reads one answer
-per line on stdout (NDJSON):
-
-| Request | Answer |
-|---|---|
-| `{"op":"info"}` | `{"name":"<string>","description":"<string>","mutants":["M1",...]}` (`mutants` is optional) |
-| `{"op":"generate","seed":123}` | `{"seed":123,"actions":[...]}`: pure JSON data, the same for the same seed |
-| `{"op":"execute","run":{"seed":123,"actions":[...]},"dir":"<scratch dir>","mutant":"M1"}` | `{"ok":true,"steps":N,"cov":{"push":3}}` or `{"ok":false,"mismatch":{"step":2,"action":{...},"what":"...","expected":...,"actual":...}}` |
-
-- `mutant` is sent only with `--check-mutants`. `dir` is an empty scratch directory for each execution.
-- Any answer can be `{"error":"<text>"}`. stdout is for the protocol only: print logs to stderr.
-- An exception of the code under test is a finding: catch it in `execute` and answer with a mismatch (the
-  templates do this). A process that exits, closes stdout, prints a line that is not JSON or gives no answer within
-  `--cmd-timeout` ms (default 300000) stops the probe with exit 1 and the end of its stderr. When the probe ends,
-  Stopbar closes stdin; a process that does not exit within 2 s is killed.
-- Shrinking, `--regressions` / `--regressions-only`, `--check-mutants`, `summary.json`, `repro-<seed>.json`,
-  `probe:result` and `attest` work as for `--target <file>`. `target` in a reproduction is the `name` from `info`;
-  `targetCmd` is the command. A `--cmd` target replays only the regressions in `--regressions <dir>`.
-- `targetSha256` is the sha256 of `--target-file <path>`, else of the first word after the interpreter that is an
-  existing file (`python examples/bounded_queue_probe.py` hashes that file), else `null`.
-
-[`examples/bounded_queue_probe.py`](examples/bounded_queue_probe.py) is the same queue model in Python, with the
-standard library only:
-
-```sh
-stopbar probe --cmd "python examples/bounded_queue_probe.py" --runs 200 --check-mutants
-```
-
-### A starter target: `stopbar probe init`
-
-`stopbar probe init --lang ts` writes `probes/sample.probe.ts` (`defineModel`), and `--lang py` writes
-`probes/sample_probe.py` (the NDJSON protocol, standard library only: `json`, `random`, `sys`). Both hold the same
-model with 2 actions, 1 invariant, 2 mutants and the rules for zero false positives, and `--check-mutants` passes on
-them as written. The command prints the line that runs the file. `--name` takes letters, digits, `-` and `_` only;
-`--out` (default `probes`) is relative to `--repo`, else to the current directory; an existing file stays unless you
-pass `--force`.
 
 ## Agent skill
 
@@ -292,6 +205,8 @@ profile by editing the lists: no code change is necessary.
   A `config.json` written by 1.0.0–1.1.1 keeps its own list and keeps working; to stop false
   `PAUSE`s on the session tools after a secret read, add `"mcp__ccd_session_mgmt__*"` to `safeTools` or write the file
   again with `stopbar init --force ...`. `stopbar doctor` shows a `[WARN] safeTools` while a default entry is missing.
+  `stopbar init --safe-tools "<glob>,<glob>"` sets the list. Since 1.2.2 `init --force` without `--safe-tools` keeps
+  the list of the previous `config.json` (when that file is valid) and says so.
 - **`cliCmd`** (optional, set via `stopbar init --cli "<cmd>"`) is the command that starts Stopbar in the hints shown to
   the agent (`<cliCmd> run build|test`). Without it the hints say `npx --no-install stopbar`. It must be one command
   without shell operators and must not name a `.git` or agent-settings directory, because the agent's shell may not run
@@ -317,8 +232,24 @@ exit-code-only gates)` by default, `gates: stopbar run only (--require-run)` wit
 **Custom `core.hooksPath`** (Husky, Lefthook, a shared hooks directory): since 1.2.1 Stopbar does not write into it.
 `init --hooks <client>` then writes no git hook and prints a `WARN`; `init --hooks git` fails closed (exit 2);
 `stopbar doctor` reports `[WARN] hooks git`: git commit and git push are not gated by Stopbar until a human adds one
-line to each hook of the hook manager, `node "<runtime>/bin/stopbar.mjs" git-hook pre-commit` and `... git-hook
-pre-push` (doctor prints the exact lines), or runs `stopbar upgrade --hooks git --force-hooks`.
+line to each hook of the hook manager, or runs `stopbar upgrade --hooks git --force-hooks`. The line works on every
+machine, so it can go into a tracked hook such as `.husky/pre-commit`:
+
+```sh
+npx --no-install stopbar git-hook pre-commit      # .husky/pre-commit
+npx --no-install stopbar git-hook pre-push        # .husky/pre-push
+# without Stopbar in the local node_modules: the pinned runtime, relative to the git dir (also in a linked worktree)
+node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook pre-commit
+```
+
+The first command follows `--cli` (default `npx --no-install stopbar`). Since 1.2.2 the agent cannot remove that
+line: Edit and Write of `.husky/**`, `lefthook*.yml`, `.lefthook*.yml`, `.lefthook/**` and of every file in the
+custom `core.hooksPath` are blocked, and so are shell commands that name them (`sed -i '/git-hook/d' .husky/pre-commit`,
+`rm -rf .husky`, `find . -name '.hu*' -delete`). The hook reads `core.hooksPath` from the git config files itself,
+without a git process. These files are also test config, so a change made outside the agent hooks taints the
+session. `stopbar doctor` reports `[FAIL] hooks git` (not `[WARN]`) when a Stopbar git hook that was there is gone:
+written by the last `init` or a later `upgrade`, run since the last `init` or `reset`, called by the tracked hook
+in `HEAD`, or the other of the two hooks is still in place.
 
 ## Hardening: OS sandbox + client deny rules
 
@@ -387,10 +318,13 @@ Ubuntu, Windows and macOS (Node 24); `npm run prove`; and `lake build` of the Le
 - run: npx stopbar prove --out stopbar-prove.json
 ```
 
-For headless agent runs in CI, initialise Stopbar in the job and keep the evidence:
+For headless agent runs in CI, initialise Stopbar in the job with `--require-run` (the gates count only through
+`stopbar run build|test`), check the setup with `stopbar doctor --strict` (a warning fails the job) and keep the
+evidence:
 
 ```yaml
-- run: npx stopbar init --build "npm run build" --test "npm test" --hooks project
+- run: npx stopbar init --build "npm run build" --test "npm test" --hooks project --require-run
+- run: npx stopbar doctor --strict
 - run: claude -p "<task>" --setting-sources project,local --max-turns 20
 - run: npx stopbar status --json > stopbar-status.json
 - run: npx stopbar attest --format md > stopbar-attest.md
@@ -413,16 +347,16 @@ latency. An earlier prototype that loaded the prover in every hook measured p50 
 
 | Platform | Node | git | Python | Typecheck | Unit | E2E | `stopbar probe` | `--cmd` Python example | `stopbar prove` | `stopbar doctor` |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 74/74 | 460/460 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 74/74 | 460/460 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
-| macOS 26.7.2 arm64 (`macos-latest`, GitHub Actions, CI of 1.2.0) | 24.22.3 | 2.56.1 | – | 0 errors | pass | 443/443 | 202/202 sequences | – | – | – |
+| Windows 11, Git for Windows | 24.19.0 | 2.56.0 | 3.14.7 | 0 errors | 81/81 | 502/502 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| Linux, Debian 13 (container, no network) | 24.21.0 | 2.47.3 | 3.13.5 | 0 errors | 81/81 | 502/502 | 202/202 sequences | 200/200, mutants 2/2 | proven, 10/10 mutants | OK |
+| macOS 26.7.2 arm64 (`macos-latest`, GitHub Actions, CI of 1.2.1) | 24.22.3 | 2.56.1 | – | 0 errors | pass | 460/460 | 202/202 sequences | – | – | – |
 | Ubuntu, Windows (GitHub Actions) | 24 | runner | runner | CI | CI | CI | CI | – | CI (Ubuntu) | – |
 
-The first two rows are runs of 1.2.1 on our machines; both also pass `stopbar probe --target
-examples/bounded-queue.probe.ts --runs 50 --check-mutants` (50/50, mutants 2/2). The macOS row is the CI run of 1.2.0
-(commit `8bfd8cb`, workflow `.github/workflows/ci.yml`): build, typecheck, `npm test` (unit with the dot reporter, so no
-count in the log) and the same `bounded-queue` probe (50/50, mutants 2/2). The `prove` job of CI runs on Ubuntu only.
-CI runs after a push; the results of 1.2.1 will be on the repository's Actions page (see the CI badge).
+The first two rows are runs of 1.2.2 on our machines; both also pass `stopbar probe --target
+examples/bounded-queue.probe.ts --runs 50 --check-mutants` (50/50, mutants 2/2). The macOS row is the CI run of 1.2.1
+(commit `fdd8360`, workflow `ci`, run #2; `.github/workflows/ci.yml`): build, typecheck, `npm test` (unit with the dot
+reporter, so no count in the log) and the same `bounded-queue` probe (50/50, mutants 2/2). The `prove` job of CI runs
+on Ubuntu only. CI runs after a push, so 1.2.2 has no CI run yet.
 
 The E2E suite runs every adapter (Cursor, Codex CLI, Gemini CLI, Antigravity CLI) and the git fallback with real
 git commits and pushes. The probe runs the same 200 seeds plus 2 regressions on both platforms, with the same 5020 steps
@@ -431,8 +365,9 @@ The `--cmd` column is `stopbar probe --cmd "<python> examples/bounded_queue_prob
 (3970 steps on both platforms). E2E scenario S37 runs `--cmd` with a Node target everywhere, and the Python example
 and the `--lang py` template only where `python3` or `python` is found.
 `npm run verify:lean` passes in the Lean 4.34.0 container: `lake build` exit 0, 0 errors, 0 `sorry` (run on the same
-`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0 and 1.2.1 do not change). `node scripts/verify-lean.ts --local`
-gives the same result with Lean 4.34.0 on `PATH` (checked in a Debian 13 container with the toolchain of that image).
+`src/kernel.ts`, sha256 `c602fc4bcf8ffb2e...`, which 1.2.0, 1.2.1 and 1.2.2 do not change; 18 theorems in
+`StopbarKernel.lean`, axioms `Classical.choice`, `Quot.sound`, `propext` only). `node scripts/verify-lean.ts --local`
+is the same check with Lean 4.34.0 on `PATH`; CI uses it.
 
 ## License
 

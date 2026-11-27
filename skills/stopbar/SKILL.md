@@ -50,7 +50,8 @@ set another one with `stopbar init --cli "<cmd>"`.
 - Do not bypass a block with a script, a wrapper, a generated file, an alias, `git -c alias.*`, `--no-verify` or
   another git client.
 - Do not edit `.git/` (hooks, `.git/stopbar/`), the hook config of any agent (`.claude/`, `.cursor/`, `.codex/`,
-  `.gemini/`, `.agents/`) or the Stopbar package.
+  `.gemini/`, `.agents/`), the git hook managers (`.husky/`, `lefthook*.yml`, `.lefthook/`, a custom
+  `core.hooksPath`) or the Stopbar package. A change to a hook there is for a human.
 
 ### Human-only commands
 

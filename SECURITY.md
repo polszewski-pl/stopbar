@@ -108,6 +108,17 @@ There is no proof for them.
   cannot see it. A secret read is also: a command that prints the environment (`printenv`, a bare `env`,
   `Get-ChildItem Env:`, `/proc/self/environ`); a path with `..` segments (`cat src/../.env`); a live wildcard that
   reaches a secret name (`cat .en*`, `cat .en?`, `cat src/../.en*`). `env VAR=1 cmd` and `set` are not a read.
+- **Since 1.2.2, git hook managers, `$(pwd)` and `find`.** Edit and Write may not touch `.husky/**`, `lefthook*.yml`,
+  `.lefthook*.yml` (also `.yaml` and `-local`), `.lefthook/**` or any file in a custom `core.hooksPath`, and a shell
+  command may not name them (matched on path-segment boundaries; an empty, `.` or `/` value is ignored, and a value that
+  is the working tree root or above it protects nothing). The hook reads `core.hooksPath` from `<common-dir>/config`
+  and `<git-dir>/config.worktree` (no git process; include files are not followed). These files are test config in
+  every profile. `.husky` and `.lefthook` are guarded against wildcards like `.git`. `$(pwd)`, `${PWD}`, `$PWD` and
+  `` `pwd` `` (also in double quotes) read as `.` for the wildcard and secret checks. `find` with a `-name`, `-iname`,
+  `-path`, `-ipath`, `-wholename` or `-iwholename` pattern (find expands it itself, also when quoted) that reaches a
+  guarded directory, with `-delete`, `-exec`, `-execdir`, `-ok` or `-okdir`, is blocked; one that reaches a secret name
+  with an `-exec` action is a secret read. `stopbar doctor` reports `[FAIL] hooks git` when a Stopbar git hook that
+  was written, has run, or is called in `HEAD` is gone, and `stopbar doctor --strict` fails on any `[WARN]` (CI).
 - **Halted sessions.** While halted, every tool is paused except the tools in `config.safeTools` (default:
   `mcp__ccd_turn__*` and `mcp__ccd_session_mgmt__*`, the local task-list, turn and session-message tools of Claude
   Desktop), so the agent can still ask a human for `stopbar resume`. These tools never take a kernel step, so they
@@ -225,14 +236,19 @@ command text:
 - For `--cmd`, `targetSha256` covers one file only: `--target-file`, else the first existing file after the
   interpreter, else nothing (`null`). Imports, libraries and the interpreter are not hashed.
 
-## Known limits of 1.2.1
+## Known limits of 1.2.2
 
-What a regular expression cannot block (the unit test "1.2.1 known limits without an OS sandbox" keeps these visible):
+1.2.2 closes three ways around the wrapper that 1.2.1 listed or let through: removing the `stopbar git-hook` line
+from a Husky or Lefthook hook (`Edit`, `sed -i '/git-hook/d' .husky/pre-commit`) with only a `[WARN]` from doctor,
+`rm -rf $(pwd)/.g*`, and `find . -name '.g*' -delete` / `find . -name '.e*' -exec cat {} +`.
+
+What a regular expression cannot block (the unit test "1.2.2 known limits without an OS sandbox" keeps these visible):
 
 - A name built at run time: `cat $(echo .e)nv`, `f=.e; cat ${f}nv`, `g=.g; rm -rf $g"it"`. The hook sees `.e` and
   `nv`, never `.env`. The same holds for aliases, shell functions and a backslash inside a word (`g\it`).
 - A script: `node /tmp/x.js`, `bash x.sh`. The text checks do not read the script.
-- A wildcard outside the cases of section 2: `find . -name '.g*' -delete`, `echo .g* | xargs rm -rf`, a PowerShell
+- A wildcard outside the cases of section 2: `echo .g* | xargs rm -rf`, `find . -delete` or `find . -type f -exec
+  cat {} +` without a name pattern, `find . -name config -delete` (a name inside `.git`, not `.git` itself), a PowerShell
   `Remove-Item * -Recurse -Force` (on Windows `*` also matches dot directories), and directory wildcards on the way to a
   secret (`cat secre*/db.txt`). A bare `.*` in `echo .*` or `ls .*` counts as a secret read (it reaches `.env`).
 - One variable or another program: `echo $TOKEN`, `export -p`, `declare -x`, `node -e "console.log(process.env)"`.
@@ -250,7 +266,12 @@ Other limits:
   git action is not gated until a human runs `stopbar upgrade --hooks git --force-hooks`. With a custom
   `core.hooksPath` (Husky, Lefthook, a shared directory) Stopbar writes no git hook there without `--force-hooks`, so
   git commit and git push are not gated until a human adds the `git-hook` lines that `stopbar doctor` prints.
-  `stopbar doctor` reports `[WARN] hooks git` (not `[FAIL]`) while a Stopbar git hook is missing.
+  `stopbar doctor` reports `[WARN] hooks git` while a Stopbar git hook was never set up, and `[FAIL]` only once one
+  that was written, ran, or is in `HEAD` is gone; a hook that was added by hand, never committed and never run is
+  only a `[WARN]` when it disappears. A hook path built at run time (`d=.hu; sed -i d ${d}sky/pre-commit`) passes like
+  any name built at run time, and a hook manager that keeps its configuration elsewhere (`package.json` for Husky 4,
+  `simple-git-hooks`) is not covered. `npx --no-install stopbar git-hook` runs the Stopbar in the project's
+  `node_modules`, not the pinned runtime.
 - `baseRef`: a mutable branch name can be moved by the agent (section 3, point 4). Use a commit SHA as `--base-ref`
   when the agent must not move the baseline. `stopbar status` prints a `note:` when the tree no longer differs from
   `baseRef` on existing tests; it never clears the taint (L2.2).

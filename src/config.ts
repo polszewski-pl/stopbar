@@ -34,7 +34,9 @@ const TEST_JS = ['**/*.test.*', '**/*.spec.*', '**/e2e/**']
 const TEST_PY = ['**/test_*.py', '**/*_test.py']
 const TEST_OTHER = ['**/*_test.go', '**/*_test.rs', '**/*Test.java', '**/*Tests.cs']
 
-const CFG_COMMON = ['.gitignore', '.gitattributes', '.github/workflows/**', '.gitlab-ci.yml', '.pre-commit-config.yaml', 'Makefile']
+// the git hook managers (Husky, Lefthook): a change made outside the agent hooks still taints (defense in depth)
+const CFG_COMMON = ['.gitignore', '.gitattributes', '.github/workflows/**', '.gitlab-ci.yml', '.pre-commit-config.yaml', 'Makefile',
+  '.husky/**', 'lefthook*.yml', '.lefthook*.yml', 'lefthook*.yaml', '.lefthook*.yaml', '.lefthook/**']
 const CFG_JS = ['package.json', 'tsconfig*.json', '.eslint*', 'eslint.config.*', 'vitest.config.*', 'vitest.workspace.*',
   'jest.config.*', 'playwright.config.*', '.mocharc*', 'ava.config.*', 'biome.json', '.c8rc*', '.nycrc*']
 const CFG_PY = ['pyproject.toml', 'pytest.ini', 'conftest.py', 'tox.ini', 'setup.cfg', 'noxfile.py', '.coveragerc',
@@ -112,9 +114,9 @@ export function validateConfig(c: unknown): Config {
   return o as unknown as Config
 }
 
-// A path segment such as .git or .claude. Self-protection (classify.ts protectedCommand) blocks every shell command that
-// names one, so a hint `<cliCmd> run test` with such a segment could never run.
-const PROTECTED_SEGMENT = /(^|[^a-z0-9_.\-])\.(git|claude|cursor|codex|gemini|agents)([^a-z0-9_\-]|$)/i
+// A path segment such as .git, .claude or .husky. Self-protection (classify.ts protectedCommand) blocks every shell
+// command that names one, so a hint `<cliCmd> run test` with such a segment could never run.
+const PROTECTED_SEGMENT = /(^|[^a-z0-9_.\-])\.(git|claude|cursor|codex|gemini|agents|husky|lefthook)([^a-z0-9_\-]|$)/i
 
 /** Why a cliCmd value cannot be used, or null. */
 export function cliCmdProblem(cmd: string): string | null {
@@ -134,7 +136,7 @@ export function isSafeRef(ref: string): boolean {
 }
 
 export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: string; maxRetries?: number; cap?: number; costPerCall?: number; baseRef?: string
-  cliCmd?: string; stopGate?: string; requireRun?: boolean}): Config {
+  cliCmd?: string; stopGate?: string; requireRun?: boolean; safeTools?: string[]}): Config {
   const profile = a.profile ?? 'default'
   const paths = PROFILES[profile]
   if (!paths) throw new ConfigError(`unknown profile ${JSON.stringify(profile)}; known: ${Object.keys(PROFILES).join(', ')}`)
@@ -144,7 +146,7 @@ export function makeConfig(a: {buildCmd: string; fullTestCmd: string; profile?: 
     version: 1, profile, buildCmd: a.buildCmd.trim(), fullTestCmd: a.fullTestCmd.trim(),
     maxRetries: a.maxRetries ?? DEFAULTS.maxRetries, cap: a.cap ?? DEFAULTS.cap, costPerCall: a.costPerCall ?? DEFAULTS.costPerCall,
     paths: {tests: [...paths.tests], testConfig: [...paths.testConfig], secrets: [...paths.secrets]},
-    safeTools: [...DEFAULT_SAFE_TOOLS],
+    safeTools: [...(a.safeTools ?? DEFAULT_SAFE_TOOLS)],
     ...(baseRef && baseRef !== 'HEAD' ? {baseRef} : {}),
     ...(cliCmd !== undefined ? {cliCmd} : {}),
     ...(a.stopGate !== undefined ? {stopGate: a.stopGate} : {}),

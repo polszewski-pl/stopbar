@@ -10,12 +10,13 @@ const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code ho
 
   stopbar init --build "<cmd>" --test "<cmd>" [--profile default|ts|python|strict] [--base-ref <ref>] [--max-retries 3] [--cap 500]
                [--cost 1] [--hooks claude,claude-project,cursor,codex,gemini,antigravity,git] [--no-pin] [--force] [--force-hooks] [--repo <dir>]
-               [--cli "<cmd>"] [--stop-gate block|warn] [--require-run] [--no-git-hooks]
+               [--cli "<cmd>"] [--stop-gate block|warn] [--require-run] [--no-git-hooks] [--safe-tools "<glob>,<glob>"]
                                    --hooks <clients> adds the git hooks (pre-commit, pre-push) unless --no-git-hooks;
                                      a foreign git hook is kept with a warning (replace it: --hooks git --force-hooks)
                                    --cli: command that starts Stopbar in hints (default: npx --no-install stopbar)
                                    --stop-gate warn: Stop only warns; git commit and git push stay blocked until the gates pass
                                    --require-run: build and full test gates count only through stopbar run build|test
+                                   --safe-tools: local tools that are never outbound (globs; --force keeps the previous list)
   stopbar upgrade [--hooks <targets>] [--force-hooks] [--repo <dir>]
                                    a human re-pins the hook runtime from this package (and rewrites hooks with --hooks);
                                    state, gates, taint and budget stay as they are
@@ -28,7 +29,7 @@ const HELP = `stopbar ${VERSION}: proven gates for coding agents (Claude Code ho
   stopbar approve-shell            a human allows ONE risky or outbound call after a secret was read
   stopbar resume --extra N         a human lifts a halt and adds N to the budget
   stopbar reset                    a human starts a fresh kernel state (config and event log stay)
-  stopbar doctor [--json]          environment, config, state, hooks and a dry run
+  stopbar doctor [--json] [--strict]  environment, config, state, hooks and a dry run; --strict: a [WARN] fails (exit 1)
 
 Four pillars:
   PROVE   stopbar prove [--out f.json] [--lean f.lean]   inductive proof of the kernel and the 10 mutants
@@ -52,7 +53,7 @@ Four pillars:
   GATE    init, upgrade, hook, status, approve-tests, approve-shell, resume, reset, doctor (above)
   ATTEST  stopbar attest [--format json|md]   deterministic attestation: HEAD, tree, gates, human actions, log sha256,
           probe evidence (the latest probe:result per target, and whether it was taken at the current snapshot)
-All commands take --repo <dir> (default: the current directory). 'verify' is an alias of 'prove'.`
+All commands take --repo <dir> (default: the current directory) and --help / -h. 'verify' is an alias of 'prove'.`
 
 function opts(a: string[]) {
   const get = (name: string) => { const i = a.indexOf(`--${name}`); return i >= 0 && i + 1 < a.length ? a[i + 1] : undefined }
@@ -66,7 +67,14 @@ function opts(a: string[]) {
   }
 }
 
+// flags that take a value: a --help right after one of them is that value (e.g. --cmd --help), not a request for help
+const VALUE_FLAGS = new Set(['build', 'test', 'profile', 'base-ref', 'max-retries', 'cap', 'cost', 'hooks', 'repo', 'cli', 'stop-gate', 'safe-tools', 'rev', 'extra',
+  'target', 'cmd', 'target-file', 'cmd-timeout', 'runs', 'seed', 'jobs', 'work', 'out', 'regressions', 'mutant-runs', 'lang', 'name', 'format', 'lean', 'adapter', 'worker', 'worker-file'].map((f) => `--${f}`))
+/** --help or -h as a word of its own after the subcommand: print the help, run nothing. */
+const wantsHelp = (a: string[]) => a.some((x, i) => (x === '--help' || x === '-h') && !VALUE_FLAGS.has(a[i - 1] ?? ''))
+
 async function main(): Promise<{code: number; msg?: string}> {
+  if (wantsHelp(argv.slice(1))) return {code: 0, msg: HELP}
   if (cmd === 'hook') {
     const {handle} = await import('./adapters/index.ts')
     const i = argv.indexOf('--adapter')
@@ -86,7 +94,7 @@ async function main(): Promise<{code: number; msg?: string}> {
   if (cmd === 'init') return (await import('./commands.ts')).init(o)
   if (cmd === 'upgrade') return (await import('./commands.ts')).upgrade(o)
   if (['status', 'approve-tests', 'approve-shell', 'resume', 'reset'].includes(cmd)) return (await import('./commands.ts')).human(cmd, o)
-  if (cmd === 'doctor') return (await import('./doctor.ts')).doctor({repo: o.get('repo'), json: o.has('json')})
+  if (cmd === 'doctor') return (await import('./doctor.ts')).doctor({repo: o.get('repo'), json: o.has('json'), strict: o.has('strict')})
   if (cmd === 'prove' || cmd === 'verify') {
     const r = await (await import('./verify.ts')).verify({out: o.get('out'), lean: o.get('lean')})
     return {code: r.ok ? 0 : 1}

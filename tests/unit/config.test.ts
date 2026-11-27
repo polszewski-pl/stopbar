@@ -1,7 +1,7 @@
 // Config rules added in 1.1.2: distinct gate commands, default safeTools, cliCmd and stopGate.
 import assert from 'node:assert/strict'
 import {test} from 'node:test'
-import {commandForSelfProtect, isTestPath, protectedCommand} from '../../dist/classify.js'
+import {commandForSelfProtect, isTestConfigPath, isTestPath, protectedCommand} from '../../dist/classify.js'
 import {cliCmdProblem, cliOf, DEFAULT_CLI, DEFAULT_SAFE_TOOLS, makeConfig, validateConfig} from '../../dist/config.js'
 import {runHint, whyBlocked} from '../../dist/hook.js'
 
@@ -87,4 +87,12 @@ test('requireRun: optional boolean, written only when on; scripts/*test* is a te
     for (const f of ['scripts/test.sh', 'scripts/run-tests.mjs', 'scripts/e2e-test.py']) assert.ok(isTestPath(f, p), `${profile}: ${f}`)
     assert.ok(!isTestPath('scripts/build.ts', p), `${profile}: scripts/build.ts`)
   }
+})
+
+test('1.2.2 hook-manager files are test config (a change outside the agent hooks taints) and cannot be named by --cli', () => {
+  const p = makeConfig({buildCmd: 'npm run build', fullTestCmd: 'npm test'}).paths
+  for (const f of ['.husky/pre-commit', '.husky/_/h', 'lefthook.yml', '.lefthook.yml', 'lefthook-local.yaml', '.lefthook-local.yml', 'lefthook.yaml', '.lefthook/pre-commit/a.sh'])
+    assert.ok(isTestConfigPath(f, p), f)
+  for (const f of ['src/husky.ts', 'docs/lefthook.md']) assert.equal(isTestConfigPath(f, p), false, f)
+  for (const c of ['node .husky/stopbar.mjs', 'node x/.lefthook/stopbar.mjs']) assert.ok(cliCmdProblem(c), c)
 })

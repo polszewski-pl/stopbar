@@ -1,5 +1,53 @@
 # Changelog
 
+## [1.2.2] (2026-11-27)
+
+`src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.2.1. No new dependency.
+`PreToolUse` still starts no git process. A `config.json` and a `state.json` from 1.0.0–1.2.1 work without migration;
+the new test-config patterns below reach an existing repository with `stopbar init --force`.
+
+- **Husky, Lefthook and a custom `core.hooksPath` are protected.** Edit and Write of `.husky/**`, `lefthook*.yml`,
+  `.lefthook*.yml` (also `.yaml`, `-local`), `.lefthook/**` and of every file in the custom `core.hooksPath` are
+  blocked; so are shell commands that name them (`sed -i '/git-hook/d' .husky/pre-commit`, `rm -rf .husky`), matched on
+  path-segment boundaries (an empty, `.` or `/` value protects nothing). The hook reads `core.hooksPath` from
+  `<common-dir>/config` and `config.worktree` itself (`readHooksPath`), without a git process. `.husky` and `.lefthook`
+  join the wildcard guard (`rm -rf .hu*`), and `pre-commit`, `pre-push` and `_` the names checked inside a guarded
+  directory. The same files are test config in every profile, so a change made outside the agent hooks taints.
+- **`stopbar doctor` reports `[FAIL] hooks git` when a Stopbar git hook is gone**: written by the last `init` or a later
+  `upgrade` (the events now record `gitHooksWritten`), run since the last `init` or `reset` (`hook-timing` records
+  `gitHook`), called by the tracked hook file in `HEAD`, or the other hook is still in place and the log does not say
+  that Stopbar left this one out. A hook that was never set up stays `[WARN]`. Doctor only reads `events.jsonl`.
+- **Portable hook line.** The `WARN` of `init`, the refusal of `--hooks git` and `doctor` print
+  `npx --no-install stopbar git-hook pre-commit|pre-push` (from `--cli`) first and, without a local `node_modules`,
+  `node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook <name>`; no absolute path into `.git`.
+- **Wildcards after `$(pwd)`.** `$(pwd)`, `"$(pwd)"`, `${PWD}`, `$PWD`, `` `pwd` `` (also quoted, `pwd -L|-P`) read as `.`
+  before the command is split, so `rm -rf $(pwd)/.g*` is blocked as `rm -rf $PWD/.g*` was, and `cat $(pwd)/.e*` is a
+  secret read.
+- **`find` with a pattern.** `find` with `-name`, `-iname`, `-path`, `-ipath`, `-wholename` or `-iwholename` whose
+  pattern reaches `.git`, an agent settings directory, `.husky`, `.lefthook`, a Lefthook file or the custom
+  `core.hooksPath`, together with `-delete`, `-exec`, `-execdir`, `-ok` or `-okdir`, is blocked; a pattern that reaches a
+  secret name (`.e*`, `*.pem`, `*.key`, `*/.env*`) with an `-exec` action is a secret read. `find . -name "*.ts" -exec
+  wc -l {} +` and `find . -name "*.test.ts" -delete` stay allowed.
+- **`stopbar doctor --strict`**: a `[WARN]` fails too (exit 1, `RESULT: FAIL (strict: N warning(s))`, `--json`
+  `ok: false, strict: true`). Without the flag nothing changes.
+- **`init` notes.** Without `--require-run`, `init` names `--require-run` and `doctor --strict` for CI; with
+  `--hooks codex` it recommends `--require-run`, because Codex CLI passes no exit status to its hooks. The default stays
+  `requireRun: false`.
+- **`init --force` keeps `safeTools`**, and `--safe-tools "<glob>,<glob>"` sets them. A damaged previous `config.json`
+  never blocks `--force` (then the default list).
+- **`--help` / `-h` in every subcommand** prints the help and runs nothing (`stopbar reset --help` no longer resets). A
+  `--help` that is the value of a flag (`--cmd --help`) is not taken as a request for help.
+- **`stopbar run` on Windows** starts the gate command without the `PWD` inherited from Git Bash, so a bash inside
+  the gate sets its own (`PATH="$PWD/node_modules/.bin:$PATH"` broke at the colon of `C:`, exit 127). `stopbar doctor`
+  warns when a gate starts with a bare `bash` and the first bash on `PATH` is WSL's.
+- **`import 'stopbar/probe'` without `stopbar` in the project's `node_modules`.** `stopbar probe --target <file>`
+  resolves that specifier to its own SDK with a module resolve hook (`registerHooks`, `node:module`), in the runner and
+  in each worker.
+- **Docs.** The PROBE guide moved from `README.md` to [`docs/probe.md`](docs/probe.md) (in the npm package). The README
+  starts with one statement of what is proven, what is tested and what needs an OS sandbox, without the repeated
+  paragraph. `SECURITY.md`: Known limits of 1.2.2.
+- No `any` in `integrations.ts` and `store.ts` (typed JSON and event entries). Version 1.2.2.
+
 ## 1.2.1 (2026-11-27)
 
 `src/kernel.ts` is unchanged (sha256 `c602fc4bcf8ffb2e...`); every kernel law holds as in 1.2.0. No new dependency.

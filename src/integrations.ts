@@ -2,7 +2,8 @@
 // and other hooks stay; earlier Stopbar entries are replaced). Targets: claude (alias local), claude-project (alias
 // project), cursor, codex, gemini, antigravity (alias agy), git; several at once, comma separated.
 import {chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs'
-import {dirname, isAbsolute, join, resolve} from 'node:path'
+import {dirname, isAbsolute, join, relative, resolve} from 'node:path'
+import {DEFAULT_CLI} from './config.ts'
 import {FailClosed, git, type Repo} from './repo.ts'
 
 export const TARGETS = ['claude', 'claude-project', 'cursor', 'codex', 'gemini', 'antigravity', 'git'] as const
@@ -35,19 +36,33 @@ export function claudeHooks(command: string) {
   }
 }
 
-function readJson(f: string): any {
+type Json = Record<string, unknown>
+const isJson = (x: unknown): x is Json => !!x && typeof x === 'object' && !Array.isArray(x)
+/** A JSON file as an object ({} when missing or empty). Not JSON: fails closed and the file is not overwritten. */
+function readJson(f: string): Json {
   if (!existsSync(f)) return {}
   const raw = readFileSync(f, 'utf8')
-  try { return raw.trim() ? JSON.parse(raw) : {} } catch (e) {
+  let v: unknown
+  try { v = raw.trim() ? JSON.parse(raw) : {} } catch (e) {
     throw new FailClosed(`${f} is not valid JSON (${(e as Error).message}); not overwriting it`, 'fix the file by hand, then run init again')
   }
+  return isJson(v) ? v : {}
+}
+/** The object under `key` of `o`; a missing value or one that is not an object is replaced by {}. */
+function objAt(o: Json, key: string): Json {
+  const v = o[key]
+  if (isJson(v)) return v
+  const fresh: Json = {}
+  o[key] = fresh
+  return fresh
 }
 function writeJson(f: string, o: unknown) { mkdirSync(dirname(f), {recursive: true}); writeFileSync(f, JSON.stringify(o, null, 2) + '\n') }
 const mentions = (x: unknown) => STOPBAR_HOOK.test(JSON.stringify(x ?? ''))
 /** Event arrays: drop earlier Stopbar entries, append ours. */
-function mergeEvents(hooks: Record<string, any>, want: Record<string, any[]>) {
+function mergeEvents(hooks: Json, want: Record<string, unknown[]>) {
   for (const [ev, entries] of Object.entries(want)) {
-    const kept = Array.isArray(hooks[ev]) ? hooks[ev].filter((x: unknown) => !mentions(x)) : []
+    const cur = hooks[ev]
+    const kept = Array.isArray(cur) ? (cur as unknown[]).filter((x) => !mentions(x)) : []
     hooks[ev] = [...kept, ...entries]
   }
 }
@@ -55,8 +70,7 @@ function mergeEvents(hooks: Record<string, any>, want: Record<string, any[]>) {
 function claudeFile(root: string, file: string, command: string) {
   const f = join(root, '.claude', file)
   const cur = readJson(f)
-  cur.hooks = cur.hooks && typeof cur.hooks === 'object' ? cur.hooks : {}
-  mergeEvents(cur.hooks, claudeHooks(command))
+  mergeEvents(objAt(cur, 'hooks'), claudeHooks(command))
   writeJson(f, cur)
   return f
 }
@@ -65,9 +79,8 @@ function cursorFile(root: string, command: string) {
   const f = join(root, '.cursor', 'hooks.json')
   const cur = readJson(f)
   cur.version = cur.version ?? 1
-  cur.hooks = cur.hooks && typeof cur.hooks === 'object' ? cur.hooks : {}
   const e = (timeout: number) => [{command, timeout, failClosed: true}]
-  mergeEvents(cur.hooks, {preToolUse: e(30), postToolUse: e(60), postToolUseFailure: e(60), stop: e(30)})
+  mergeEvents(objAt(cur, 'hooks'), {preToolUse: e(30), postToolUse: e(60), postToolUseFailure: e(60), stop: e(30)})
   writeJson(f, cur)
   return f
 }
@@ -75,9 +88,8 @@ function cursorFile(root: string, command: string) {
 function codexFile(root: string, command: string) {
   const f = join(root, '.codex', 'hooks.json')
   const cur = readJson(f)
-  cur.hooks = cur.hooks && typeof cur.hooks === 'object' ? cur.hooks : {}
   const h = (timeout: number) => [{hooks: [{type: 'command', command, timeout}]}]
-  mergeEvents(cur.hooks, {PreToolUse: h(30), PostToolUse: h(60), Stop: h(30)})
+  mergeEvents(objAt(cur, 'hooks'), {PreToolUse: h(30), PostToolUse: h(60), Stop: h(30)})
   writeJson(f, cur)
   return f
 }
@@ -85,9 +97,8 @@ function codexFile(root: string, command: string) {
 function geminiFile(root: string, command: string) {
   const f = join(root, '.gemini', 'settings.json')
   const cur = readJson(f)
-  cur.hooks = cur.hooks && typeof cur.hooks === 'object' ? cur.hooks : {}
   const h = (timeout: number) => [{matcher: '*', hooks: [{name: 'stopbar', type: 'command', command, timeout}]}]
-  mergeEvents(cur.hooks, {BeforeTool: h(30000), AfterTool: h(60000), AfterAgent: h(30000)})
+  mergeEvents(objAt(cur, 'hooks'), {BeforeTool: h(30000), AfterTool: h(60000), AfterAgent: h(30000)})
   writeJson(f, cur)
   return f
 }
@@ -123,11 +134,30 @@ export function gitHooksDir(repo: Repo): {dir: string; customHooksPath: string |
 type HooksDir = ReturnType<typeof gitHooksDir>
 
 const hookBin = (runtimeRoot: string) => join(runtimeRoot, 'bin', 'stopbar.mjs').replace(/\\/g, '/')
-const manualHooks = (hd: HooksDir, bin: string) =>
-  `add \`node "${bin}" git-hook pre-commit\` to ${join(hd.dir, 'pre-commit')} and \`node "${bin}" git-hook pre-push\` to ${join(hd.dir, 'pre-push')}`
-function customHooksRefusal(hd: HooksDir, runtimeRoot: string) {
+const GIT_HOOK_NAMES = ['pre-commit', 'pre-push'] as const
+
+/** The lines a human adds to a shared or tracked hook (Husky, Lefthook, a custom core.hooksPath): first `<cli> git-hook
+ *  <name>` (works on every machine with Stopbar in node_modules), then, without a local node_modules, the pinned runtime
+ *  named relative to the repository's git dir (the state dir is <git-dir>/stopbar, also in a linked worktree), never an
+ *  absolute path into .git. `pinned`: the hooks run the pinned runtime (init without --no-pin). */
+export function portableHookLines(cli: string, pinned: boolean): {primary: (n: string) => string; alt: ((n: string) => string) | null} {
+  return {
+    primary: (n) => `${cli} git-hook ${n}`,
+    alt: pinned ? (n) => `node "$(git rev-parse --git-dir)/stopbar/runtime/bin/stopbar.mjs" git-hook ${n}` : null,
+  }
+}
+/** One sentence: which line goes into which hook file. `names`: the hooks that lack it. */
+export function portableHookHint(dir: string, root: string, cli: string, pinned: boolean, names: readonly string[] = GIT_HOOK_NAMES): string {
+  const l = portableHookLines(cli, pinned)
+  const rel = (n: string) => { const p = relative(root, join(dir, n)); return (p && !p.startsWith('..') && !isAbsolute(p) ? p : join(dir, n)).replace(/\\/g, '/') }
+  return `add the line \`${l.primary(names[0])}\` to ${rel(names[0])}` + names.slice(1).map((n) => ` and \`${l.primary(n)}\` to ${rel(n)}`).join('') +
+    (l.alt ? `; without Stopbar in the local node_modules use \`${l.alt(names[0])}\`${names.length > 1 ? ` (and ${names.slice(1).join(', ')})` : ''} instead` : '')
+}
+type HookOpts = {cli: string; root: string; pinned: boolean}
+const manualHooks = (hd: HooksDir, o: HookOpts) => portableHookHint(hd.dir, o.root, o.cli, o.pinned)
+function customHooksRefusal(hd: HooksDir, o: HookOpts) {
   return new FailClosed(`core.hooksPath (${hd.customHooksPath}) points git hooks outside .git/hooks, to ${hd.dir}; not writing shared or tracked hooks there`,
-    `chain them by hand: ${manualHooks(hd, hookBin(runtimeRoot))}; or run again with --force-hooks to write them there (a foreign hook is kept as <name>.stopbar-backup)`)
+    `chain them by hand: ${manualHooks(hd, o)}; or run again with --force-hooks to write them there (a foreign hook is kept as <name>.stopbar-backup)`)
 }
 
 /** A foreign pre-commit or pre-push hook: 'fail' (git named in --hooks), 'backup' (--force-hooks: kept as
@@ -135,17 +165,17 @@ function customHooksRefusal(hd: HooksDir, runtimeRoot: string) {
  *  A custom core.hooksPath (shared or tracked hooks) is written only with 'backup'; 'keep' writes nothing there and
  *  warns, 'fail' refuses. */
 type Foreign = 'fail' | 'backup' | 'keep'
-function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: string) => void, hd: HooksDir = gitHooksDir(repo)): string[] {
+function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: string) => void, hd: HooksDir, ho: HookOpts, written: string[]): string[] {
   const {dir} = hd
   const bin = hookBin(runtimeRoot)
   if (hd.customHooksPath !== null && foreign !== 'backup') {
-    if (foreign === 'fail') throw customHooksRefusal(hd, runtimeRoot)
-    warn(`WARN: this repository uses a custom core.hooksPath (${hd.customHooksPath} -> ${dir}); Stopbar did not touch those shared or tracked hooks, so git commit and git push are not gated by Stopbar here. To chain them by hand, ${manualHooks(hd, bin)}; to write them there directly (a foreign hook is kept as <name>.stopbar-backup): stopbar upgrade --hooks git --force-hooks`)
+    if (foreign === 'fail') throw customHooksRefusal(hd, ho)
+    warn(`WARN: this repository uses a custom core.hooksPath (${hd.customHooksPath} -> ${dir}); Stopbar did not touch those shared or tracked hooks, so git commit and git push are not gated by Stopbar here. To chain them by hand, ${manualHooks(hd, ho)}; to write them there directly (a foreign hook is kept as <name>.stopbar-backup): stopbar upgrade --hooks git --force-hooks`)
     return []
   }
   mkdirSync(dir, {recursive: true})
   const out: string[] = []
-  for (const name of ['pre-commit', 'pre-push']) {
+  for (const name of GIT_HOOK_NAMES) {
     const f = join(dir, name)
     const body = `#!/bin/sh\n# Stopbar fallback gate, written by \`stopbar init --hooks git\`.\nexec node "${bin}" git-hook ${name}\n`
     if (existsSync(f) && !readFileSync(f, 'utf8').includes('stopbar.mjs" git-hook')) {
@@ -159,18 +189,25 @@ function gitHooks(repo: Repo, runtimeRoot: string, foreign: Foreign, warn: (s: s
     writeFileSync(f, body)
     chmodSync(f, 0o755)
     out.push(f)
+    written.push(name)
   }
   return out
 }
 
 /** Installs every target; returns one line per written file. `gitByDefault`: git was not named in --hooks but added by
- *  init, so a foreign git hook is kept with a warning (`warn`) instead of failing; --force-hooks still replaces it. */
-export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string, force: boolean, o: {gitByDefault?: boolean; warn?: (s: string) => void} = {}): string[] {
+ *  init, so a foreign git hook is kept with a warning (`warn`) instead of failing; --force-hooks still replaces it.
+ *  `cli`: the command in the hint for shared or tracked hooks (config.cliCmd). `gitHooksWritten` receives the name of
+ *  each git hook as it is written, also when a later target fails (the event log of init and upgrade keeps it, so
+ *  `stopbar doctor` knows which git hooks Stopbar wrote). */
+export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string, force: boolean,
+  o: {gitByDefault?: boolean; warn?: (s: string) => void; cli?: string; gitHooksWritten?: string[]} = {}): string[] {
   const lines: string[] = []
   const foreign: Foreign = force ? 'backup' : o.gitByDefault ? 'keep' : 'fail'
   const hd = targets.includes('git') ? gitHooksDir(repo) : null
+  const ho: HookOpts = {cli: o.cli ?? DEFAULT_CLI, root: repo.root, pinned: resolve(runtimeRoot) === resolve(repo.stateDir, 'runtime')}
+  const written = o.gitHooksWritten ?? []
   // a refusal (explicit --hooks git into a custom core.hooksPath) comes before any client file is written
-  if (hd && foreign === 'fail' && hd.customHooksPath !== null) throw customHooksRefusal(hd, runtimeRoot)
+  if (hd && foreign === 'fail' && hd.customHooksPath !== null) throw customHooksRefusal(hd, ho)
   for (const t of targets) {
     if (t === 'claude') lines.push(`claude: ${claudeFile(repo.root, 'settings.local.json', hookCommand(runtimeRoot))}`)
     else if (t === 'claude-project') lines.push(`claude: ${claudeFile(repo.root, 'settings.json', hookCommand(runtimeRoot))}`)
@@ -178,7 +215,7 @@ export function installHooks(repo: Repo, targets: Target[], runtimeRoot: string,
     else if (t === 'codex') lines.push(`codex: ${codexFile(repo.root, hookCommand(runtimeRoot, 'codex'))}`)
     else if (t === 'gemini') lines.push(`gemini: ${geminiFile(repo.root, hookCommand(runtimeRoot, 'gemini'))}`)
     else if (t === 'antigravity') lines.push(`antigravity: ${antigravityFile(repo.root, hookCommand(runtimeRoot, 'antigravity'))}`)
-    else if (t === 'git') for (const f of gitHooks(repo, runtimeRoot, foreign, o.warn ?? (() => {}), hd ?? undefined)) lines.push(`git: ${f}`)
+    else if (t === 'git' && hd) for (const f of gitHooks(repo, runtimeRoot, foreign, o.warn ?? (() => {}), hd, ho, written)) lines.push(`git: ${f}`)
   }
   return lines
 }

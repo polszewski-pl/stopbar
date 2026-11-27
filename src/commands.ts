@@ -82,11 +82,18 @@ export function init(o: Opts): Out {
   for (const [k, v] of [['--build', buildCmd], ['--test', fullTestCmd]]) {
     if (hasChain(v)) return {code: 1, msg: `${k} ${JSON.stringify(v)} has shell operators; put it in one script (e.g. an npm script) so its exit status is the gate`}
   }
-  for (const f of ['cli', 'stop-gate', 'hooks']) if (o.has(f) && o.get(f) === undefined) return {code: 1, msg: `--${f} needs a value`}
+  for (const f of ['cli', 'stop-gate', 'hooks', 'safe-tools']) if (o.has(f) && o.get(f) === undefined) return {code: 1, msg: `--${f} needs a value`}
+  // safeTools: --safe-tools, else (with --force) the list of a readable previous config.json, else the default
+  const safeOpt = o.get('safe-tools')
+  let safeTools = safeOpt === undefined ? undefined : safeOpt.split(',').map((x) => x.trim()).filter(Boolean)
+  let keptSafe = false
+  if (safeTools === undefined && o.has('force') && existsSync(paths(repo).config)) {
+    try { safeTools = readConfig(repo).safeTools; keptSafe = safeTools !== undefined } catch { /* a damaged config.json never blocks --force */ }
+  }
   let cfg: Config
   try {
     cfg = makeConfig({buildCmd, fullTestCmd, profile: o.get('profile'), maxRetries: o.int('max-retries', 3), cap: o.int('cap', 500), costPerCall: o.int('cost', 1), baseRef: o.get('base-ref'),
-      cliCmd: o.get('cli'), stopGate: o.get('stop-gate'), requireRun: o.has('require-run')})
+      cliCmd: o.get('cli'), stopGate: o.get('stop-gate'), requireRun: o.has('require-run'), safeTools})
   } catch (e) { if (e instanceof ConfigError) return {code: 1, msg: e.message}; throw e }
   if (existsSync(paths(repo).config) && !o.has('force')) return {code: 1, msg: `already initialised (${paths(repo).config}); use --force to replace config and state`}
   const pin = !o.has('no-pin')
@@ -115,16 +122,28 @@ export function init(o: Opts): Out {
     writeState(repo, s)
     const runtime = pin ? pinRuntime(repo) : PKG_ROOT
     const command = hookCommand(runtime)
-    appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE, ...(targets.length ? {hooks: targets} : {})})
+    const warns: string[] = [], gitHooksWritten: string[] = []
+    let written: string[] = [], failed: unknown
+    if (targets.length) {
+      try { written = installHooks(repo, targets, runtime, o.has('force-hooks'), {gitByDefault, warn: (w) => warns.push(w), cli: cliOf(cfg), gitHooksWritten}) } catch (e) { failed = e }
+    }
+    // the log names the git hooks Stopbar wrote: `stopbar doctor` reports [FAIL] when one of them disappears later
+    appendEvent(repo, {source: 'human:init', cfg, runtime, version: VERSION, kernel: MACHINE, ...(targets.length ? {hooks: targets, gitHooksWritten} : {})})
+    if (failed !== undefined) throw failed
     const warn = countDirtyTests(repo, s, dirty, 'init:dirty-tests')
     const lines = [`Stopbar ${VERSION} initialised in ${repo.stateDir}`, `  profile ${cfg.profile}; build: ${cfg.buildCmd}; full tests: ${cfg.fullTestCmd}${cfg.baseRef ? `; base ref: ${cfg.baseRef}` : ''}`,
       `  stop gate: ${cfg.stopGate ?? 'block'}; gate hints use: ${cliOf(cfg)} run build|test${cfg.requireRun ? '; requireRun: true (gates count only through stopbar run build|test)' : ''}`,
       `  hooks run: ${command}`]
-    const warns: string[] = []
-    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'), {gitByDefault, warn: (w) => warns.push(w)})) lines.push(`  hooks written: ${l}`)
+    const safe = cfg.safeTools ?? DEFAULT_SAFE_TOOLS
+    if (JSON.stringify(safe) !== JSON.stringify(DEFAULT_SAFE_TOOLS)) lines.push(`  safeTools ${keptSafe ? 'kept from the previous config.json' : 'from --safe-tools'}: ${JSON.stringify(safe)}`)
+    if (targets.length) for (const l of written) lines.push(`  hooks written: ${l}`)
     else lines.push('  add these hooks to .claude/settings.local.json (or run init again with --hooks claude,cursor,codex,gemini,antigravity,git):', JSON.stringify(hooksConfig(command), null, 2))
     if (gitByDefault) lines.push('  git hooks (pre-commit, pre-push) were added to --hooks by default; pass --no-git-hooks to skip them')
     else if (named.length && o.has('no-git-hooks')) lines.push('  WARN: --no-git-hooks: git aliases, merge, cherry-pick, am and commit-tree are not gated before a push; stopbar doctor reports it')
+    if (!cfg.requireRun) {
+      if (targets.includes('codex')) lines.push(`  NOTE: Codex CLI does not pass the exit status of a shell command to its hooks, so the gates count through \`${cliOf(cfg)} run build|test\`; run init again with --require-run to count them only that way`)
+      lines.push('  tip: for CI or a strict setup use --require-run (gates count only through `stopbar run build|test`) and `stopbar doctor --strict` (a warning fails)')
+    }
     lines.push(...warns.map((w) => `  ${w}`), ...warn, 'Next: restart the agent in this repository and run `stopbar doctor`.')
     return {code: 0, msg: lines.join('\n')}
   })
@@ -143,9 +162,13 @@ export function upgrade(o: Opts): Out {
     readState(repo) // a missing or damaged state fails closed here, with the fix
     const had = existsSync(join(repo.stateDir, 'runtime'))
     const runtime = pinRuntime(repo)
-    appendEvent(repo, {source: 'human:upgrade', version: VERSION, runtime, kernel: MACHINE, ...(targets.length ? {hooks: targets} : {})})
+    const gitHooksWritten: string[] = []
+    let written: string[] = [], failed: unknown
+    if (targets.length) { try { written = installHooks(repo, targets, runtime, o.has('force-hooks'), {cli: cliOf(cfg), gitHooksWritten}) } catch (e) { failed = e } }
+    appendEvent(repo, {source: 'human:upgrade', version: VERSION, runtime, kernel: MACHINE, ...(targets.length ? {hooks: targets, gitHooksWritten} : {})})
+    if (failed !== undefined) throw failed
     const lines = [`Stopbar ${VERSION}: hook runtime re-pinned in ${runtime}`, '  state.json, config.json and the snapshots are unchanged (revision, gates, taint, budget)']
-    if (targets.length) for (const l of installHooks(repo, targets, runtime, o.has('force-hooks'))) lines.push(`  hooks written: ${l}`)
+    if (targets.length) for (const l of written) lines.push(`  hooks written: ${l}`)
     else if (!had) lines.push(`  there was no pinned runtime (init --no-pin): the hooks still run what they ran; add --hooks <targets> to point them at ${hookCommand(runtime)}`)
     const missing = DEFAULT_SAFE_TOOLS.filter((t) => !(cfg.safeTools ?? DEFAULT_SAFE_TOOLS).includes(t))
     if (missing.length) lines.push(`  hint: config.safeTools lacks the default ${missing.join(', ')}; a human adds them to config.json (stopbar doctor shows it)`)

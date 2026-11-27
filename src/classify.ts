@@ -285,6 +285,7 @@ function secretSamples(paths: Paths): string[] {
  *  Also: a command that prints the environment (printenv, Get-ChildItem Env:), `..` segments (`src/../.env`), and a
  *  wildcard that reaches a secret name (`.en*`, `.en?`, `src/../.e*`). */
 export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) => boolean = () => true, shell: 'bash' | 'powershell' = 'bash'): SecretHit | null {
+  cmd = normPwd(cmd)
   const words = (s: string) => s.split(/[\s'"=(),;|&<>@:]+/).filter(Boolean)
   const texts = [cmd, unsplice(cmd), unquoteShellWords(cmd)]
   if (paths.secrets.length) {
@@ -318,6 +319,15 @@ export function secretInCommand(cmd: string, paths: Paths, exists: (p: string) =
       if (pattern) return {token: tok, pattern}
     }
   }
+  // find -name/-path <pattern> -exec ...: find expands the pattern itself; also `*.key` (a.key) and `**/x/**` (x/a)
+  const extra = paths.secrets.flatMap((g) => {
+    const last = g.split('/').pop() ?? ''
+    if (EXT_ONLY.test(last)) return [`a${last.slice(1)}`]
+    const dir = /^\*\*\/([^*?[{\/]+)\/\*\*$/.exec(g)
+    return dir ? [`${dir[1]}/a`] : []
+  })
+  const f = findReaches(cmd, [...samples, ...extra], false)
+  if (f) { const pattern = secretPattern(f.name, paths); if (pattern) return {token: `find ${f.pat}`, pattern} }
   return null
 }
 
@@ -398,10 +408,22 @@ export function classifyTreeChange(changes: {status: string; path: string}[], in
 
 // ---------------------------------------------------------------- self-protection
 // Unconditional BLOCK in PreToolUse, outside the kernel. Paths are compared normalised: '/' separators, lower case.
-export type Protect = {gitDir: string; stateDir: string; codeDirs: string[]}
+/** `hooksDir`: the directory a custom `core.hooksPath` points to (absolute; set only when it is outside the default
+ *  .git/hooks and not the working tree root or above it); `hooksPathRaw`: the value as written in the git config. */
+export type Protect = {gitDir: string; stateDir: string; codeDirs: string[]; hooksDir?: string; hooksPathRaw?: string}
 
 const lc = (p: string) => norm(p).toLowerCase().replace(/\/+$/, '')
 const under = (a: string, dir: string) => a === dir || a.startsWith(dir + '/')
+
+/** The Protect fields of a custom core.hooksPath (repo.ts readHooksPath). A value that names the working tree root or a
+ *  directory above it would protect the whole tree: then only the raw value is kept (it is ignored when it is `.`). */
+export function hooksProtect(root: string, hp: {raw: string; dir: string} | null): Pick<Protect, 'hooksDir' | 'hooksPathRaw'> {
+  if (!hp) return {}
+  return under(lc(root), lc(hp.dir)) ? {hooksPathRaw: hp.raw} : {hooksDir: hp.dir, hooksPathRaw: hp.raw}
+}
+
+// the files of the git hook managers Husky and Lefthook: a tracked hook there calls `stopbar git-hook`
+const HOOK_MANAGER_PATH = /(^|\/)(?:\.husky(?:\/|$)|\.lefthook(?:\/|$)|\.?lefthook(?:-local)?\.ya?ml$)/
 
 // the hook configuration of every supported client (project and user level)
 const AGENT_CONFIG: [RegExp, string][] = [
@@ -419,6 +441,8 @@ export function protectedPath(abs: string, root: string, pr: Protect): string | 
   const tail = under(a, r) ? a.slice(r.length) : a
   if (/(^|\/)\.git(\/|$)/.test(tail) || under(a, lc(pr.gitDir)) || under(a, lc(pr.stateDir))) return 'git metadata (.git/**, Stopbar state, git hooks, git config)'
   for (const [re, what] of AGENT_CONFIG) if (re.test(a)) return `${what} hold the Stopbar hooks`
+  if (HOOK_MANAGER_PATH.test(tail)) return 'git hook manager files (.husky/**, lefthook*.yml, .lefthook/**) call the Stopbar git hooks'
+  if (pr.hooksDir && under(a, lc(pr.hooksDir))) return `the custom core.hooksPath directory (${pr.hooksPathRaw ?? pr.hooksDir}) holds the git hooks`
   for (const d of pr.codeDirs) if (under(a, lc(d))) return `Stopbar code (${d})`
   return null
 }
@@ -426,6 +450,94 @@ export function protectedPath(abs: string, root: string, pr: Protect): string | 
 const SEG = (name: string) => new RegExp(String.raw`(^|[^a-z0-9_.\-])${name.replace(/\./g, '\\.')}([^a-z0-9_\-]|$)`, 'i')
 const DOT_GIT = SEG('.git')
 const AGENT_DIRS: [RegExp, string][] = [[SEG('.claude'), '.claude'], [SEG('.cursor'), '.cursor'], [SEG('.codex'), '.codex'], [SEG('.gemini'), '.gemini'], [SEG('.agents'), '.agents']]
+const HOOK_MANAGERS: [RegExp, string][] = [[SEG('.husky'), '.husky'], [SEG('.lefthook'), '.lefthook'],
+  [/(^|[^a-z0-9_.\-])\.?lefthook(?:-local)?\.ya?ml([^a-z0-9_\-]|$)/i, 'lefthook*.yml']]
+const LEFTHOOK_FILES = ['lefthook', '.lefthook', 'lefthook-local', '.lefthook-local'].flatMap((b) => [`${b}.yml`, `${b}.yaml`])
+const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const PATH_END = String.raw`(?=[/\s'";&|)<>]|$)`
+
+/** The custom core.hooksPath as a relative value (`./` and trailing `/` dropped), or null when it is empty, `.`, `..`,
+ *  `/`, absolute or above the tree. */
+function relHooksPath(pr: Protect): string | null {
+  const r = norm(pr.hooksPathRaw ?? '').replace(/^(?:\.\/)+/, '').replace(/\/+$/, '')
+  if (!r || r === '.' || r.startsWith('../') || r === '..' || /^(?:[a-z]:)?\//i.test(r) || r.startsWith('~')) return null
+  return r
+}
+/** Regular expressions for the custom core.hooksPath in a command (lower case text): the relative value as a path from
+ *  the working tree (at a word start or after `./`), and the absolute directory (also as Git Bash writes it, /c/...). */
+function hooksPathNeedles(pr: Protect): RegExp[] {
+  const out: RegExp[] = []
+  const rel = relHooksPath(pr)
+  if (rel) out.push(new RegExp(String.raw`(?:^|[\s'"=(;&|<>]|\./)${reEsc(rel.toLowerCase())}${PATH_END}`))
+  if (pr.hooksDir) {
+    const abs = lc(pr.hooksDir)
+    for (const a of new Set([abs, abs.replace(/^([a-z]):/, '/$1')])) out.push(new RegExp(reEsc(a) + PATH_END))
+  }
+  return out
+}
+/** Directory names a wildcard or a `find` pattern must not reach: .git, the agent settings and hook managers, and the
+ *  first segment of a relative custom core.hooksPath (and its last one, for find). */
+function guardedNames(pr: Protect | undefined, forFind: boolean): string[] {
+  const out = [...GUARDED]
+  const rel = pr ? relHooksPath(pr) : null
+  if (rel) {
+    const first = rel.split('/')[0]
+    if (forFind || first.startsWith('.')) out.push(first)
+  }
+  if (forFind && pr?.hooksDir) out.push(norm(pr.hooksDir).replace(/\/+$/, '').split('/').pop()!)
+  return [...new Set(out.filter(Boolean))]
+}
+const guardReason = (d: string) => d === '.git' ? 'Stopbar state, git hooks, git config live there'
+  : /^\.(?:claude|cursor|codex|gemini|agents)$/.test(d) ? 'agent settings there hold the Stopbar hooks' : 'the git hooks there call Stopbar'
+
+/** `$(pwd)`, `"$(pwd)"`, `${PWD}`, `$PWD`, `` `pwd` `` (each also in double quotes, `pwd -L|-P` too) as `.`: the current
+ *  directory, so `rm -rf $(pwd)/.g*` reads as `rm -rf ./.g*`. For the text scans only. */
+const PWD_ONE = String.raw`\$\(\s*pwd(?:\s+-[LP])?\s*\)|\$\{PWD\}|\$PWD(?!\w)|\x60\s*pwd(?:\s+-[LP])?\s*\x60`
+const PWD_FORMS = new RegExp(`"(?:${PWD_ONE})"|${PWD_ONE}`, 'g')
+export const normPwd = (cmd: string) => cmd.replace(PWD_FORMS, '.')
+
+// `find` with a name or path predicate and an action. `find` expands the pattern itself, so a quoted `-name '.g*'` is a
+// live wildcard (unlike a quoted word for bash).
+const FIND_PRED = /^-i?(?:name|path|wholename)$/i
+const FIND_EXEC = /^-(?:exec|execdir|ok|okdir)$/
+type FindCall = {preds: {path: boolean; pat: string; re: RegExp}[]; del: boolean; exec: boolean}
+function findCalls(cmd: string): FindCall[] {
+  const out: FindCall[] = []
+  let cur: FindCall | null = null, start = true
+  const ws = shellWords(cmd)
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i]
+    if (w.length === 1 && ';&|()\n'.includes(w)) { cur = null; start = true; continue }
+    const u = unquoteShellWords(w)
+    if (start) {
+      if (/^\w+=/.test(u) || /^(?:sudo|command|exec|nice|time|xargs|env)$/i.test(u)) continue
+      start = false
+      if (/^g?find$/i.test(norm(u).split('/').pop()!.replace(/\.exe$/i, ''))) { cur = {preds: [], del: false, exec: false}; out.push(cur) }
+      continue
+    }
+    if (!cur) continue
+    if (FIND_PRED.test(u) && i + 1 < ws.length) {
+      const pat = unquoteShellWords(ws[++i]).replace(/\\(.)/g, '$1')
+      const re = globSegment(pat)
+      if (re) cur.preds.push({path: /path|wholename/i.test(u), pat, re})
+    } else if (u === '-delete') cur.del = true
+    else if (FIND_EXEC.test(u)) cur.exec = true
+  }
+  return out
+}
+/** The first name a find pattern reaches (`-name` on the last segment, `-path` on the path below `.`), for the find
+ *  calls with -exec/-execdir/-ok/-okdir (and -delete when `withDelete`). */
+function findReaches(cmd: string, names: string[], withDelete: boolean): {name: string; pat: string} | null {
+  for (const c of findCalls(cmd)) {
+    if (!(c.exec || (withDelete && c.del))) continue
+    for (const p of c.preds) for (const n of names) {
+      if (!p.path && n.includes('/')) continue
+      const cands = p.path ? [n, `./${n}`, `./a/${n}`, `./${n}/a`, `./a/${n}/a`] : [n]
+      if (cands.some((x) => p.re.test(x))) return {name: n, pat: p.pat}
+    }
+  }
+  return null
+}
 const HUMAN_ONLY = /\b(approve-tests|approve-shell)\b|\bSTOPBAR_[A-Z_]+/i
 // an admin subcommand right after the program word (`stopbar`, `stopbar.mjs`, `stopbar@1.2.0`, `.../stopbar/dist/cli.js`,
 // quoted or not): `stopbar init` is human-only, `stopbar probe init` (a prober scaffold, SKILL.md) is the agent's
@@ -509,12 +621,12 @@ export function withoutStdinHeredoc(cmd: string): string | null {
 // A wildcard that reaches .git or an agent settings directory (`rm -rf .g*`, `mv .cl* x`, `Remove-Item .g*`): blocked
 // for the commands that delete or move, and for any command when the wildcard is followed by a path inside such a
 // directory (`cp x .g*/hooks/pre-commit`). Other wildcards (`rm *.log`, a `.*` in a grep pattern) stay allowed.
-const GUARDED = ['.git', '.claude', '.cursor', '.codex', '.gemini', '.agents']
+const GUARDED = ['.git', '.claude', '.cursor', '.codex', '.gemini', '.agents', '.husky', '.lefthook']
 const DESTRUCTIVE = /^(?:rm|rmdir|unlink|shred|mv|del|erase|rd|move|remove-item|ri|move-item|mi)$/i
-const INSIDE = /^(?:hooks|config|stopbar|info|refs|head|index|objects|settings[\w.-]*\.json|hooks\.json)$/i
-const globDir = (seg: string) => (HAS_GLOB.test(seg) && /^[.?[]/.test(seg) ? GUARDED.find((d) => globSegment(seg)?.test(d)) ?? null : null)
-/** `t`: the command with only live wildcards left (globView for bash). */
-function wildcardGuardedDir(t: string): string | null {
+const INSIDE = /^(?:hooks|config|stopbar|info|refs|head|index|objects|settings[\w.-]*\.json|hooks\.json|pre-commit|pre-push|_)$/i
+/** `t`: the command with only live wildcards left (globView for bash). `names`: guardedNames. */
+function wildcardGuardedDir(t: string, names: string[] = GUARDED): string | null {
+  const globDir = (seg: string) => (HAS_GLOB.test(seg) && /^[.?[]/.test(seg) ? names.find((d) => globSegment(seg)?.test(d)) ?? null : null)
   for (const part of norm(t).split(/[;&|\n()`]+/)) {
     const ws = part.split(/[\s<>='"]+/).filter(Boolean)
     let k = 0
@@ -578,13 +690,19 @@ export function dynamicGitSubcommand(cmd: string): string | null {
  *  .git, the agent settings directories and Stopbar code stay protected in it. */
 export function protectedCommand(cmd: string, pr: Protect, shell: 'bash' | 'powershell' = 'bash'): string | null {
   const texts = [...new Set([cmd, unsplice(cmd), unquoteShellWords(cmd)])]
+  const needles = hooksPathNeedles(pr)
   for (const t of texts) {
     const c = norm(t).toLowerCase()
     if (DOT_GIT.test(c)) return 'the command names a .git directory (Stopbar state, git hooks, git config live there)'
     for (const [re, d] of AGENT_DIRS) if (re.test(c)) return `the command names a ${d} directory (agent settings there hold the Stopbar hooks)`
+    for (const [re, d] of HOOK_MANAGERS) if (re.test(c)) return `the command names ${d} (git hook manager files there call the Stopbar git hooks)`
+    if (needles.some((re) => re.test(c))) return `the command names the custom core.hooksPath directory (${pr.hooksPathRaw ?? pr.hooksDir}), which holds the git hooks`
   }
-  const g = wildcardGuardedDir(shell === 'bash' ? globView(cmd) : unquoteShellWords(cmd))
-  if (g) return `the command has a wildcard that reaches the ${g} directory (${g === '.git' ? 'Stopbar state, git hooks, git config live there' : 'agent settings there hold the Stopbar hooks'})`
+  const p = normPwd(cmd)
+  const g = wildcardGuardedDir(shell === 'bash' ? globView(p) : unquoteShellWords(p), guardedNames(pr, false))
+  if (g) return `the command has a wildcard that reaches the ${g} directory (${guardReason(g)})`
+  const f = findReaches(p, [...guardedNames(pr, true), ...LEFTHOOK_FILES], true)
+  if (f) return `find ${JSON.stringify(f.pat)} with -delete, -exec, -execdir, -ok or -okdir reaches ${f.name} (${LEFTHOOK_FILES.includes(f.name) ? 'the git hook manager file calls the Stopbar git hooks' : guardReason(f.name)})`
   const dyn = dynamicGitSubcommand(cmd)
   if (dyn) return `the git subcommand comes from an expansion (${dyn}), which hides it from the commit and push gates; write the subcommand out`
   for (const t of texts) {

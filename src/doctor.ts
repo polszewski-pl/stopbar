@@ -2,18 +2,19 @@
 import {execFileSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import {existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
-import {join} from 'node:path'
+import {isAbsolute, join, relative} from 'node:path'
 import {hasChain} from './classify.ts'
 import {fresh, HOOK_MATCHERS} from './commands.ts'
 import {cliOf, DEFAULT_SAFE_TOOLS, makeConfig} from './config.ts'
 import {decode, MACHINE} from './engine.ts'
 import {runHook} from './hook.ts'
-import {gitHooksDir} from './integrations.ts'
+import {gitHooksDir, portableHookHint} from './integrations.ts'
 import {PKG_ROOT} from './pkg.ts'
-import {FailClosed, findRepo, hasRefTree, type Repo} from './repo.ts'
-import {paths, readConfig, readEvents, readState, VERSION, writeConfig, writeState} from './store.ts'
+import {FailClosed, findRepo, git, hasRefTree, type Repo} from './repo.ts'
+import {type EventEntry, paths, readConfig, readEvents, readState, VERSION, writeConfig, writeState} from './store.ts'
 
 type Check = {status: 'OK' | 'WARN' | 'FAIL'; name: string; detail: string}
+type Ev = EventEntry
 const sha = (f: string) => createHash('sha256').update(readFileSync(f)).digest('hex')
 
 type Obj = Record<string, unknown>
@@ -79,7 +80,7 @@ function stopbarCommands(events: Record<string, unknown> | undefined): Record<st
 }
 
 /** Other clients and the git fallback. Returns how many clients have Stopbar hooks, and how many Stopbar git hooks exist. */
-function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: string) => void): {clients: number; git: number} {
+function checkOtherClients(repo: Repo, ev: Ev[], add: (s: Check['status'], n: string, d: string) => void): {clients: number; git: number} {
   let found = 0
   const clients: [string, string, (j: unknown) => Obj | undefined, string[]][] = [
     ['cursor', join(repo.root, '.cursor', 'hooks.json'), hooksOf, ['preToolUse', 'postToolUse', 'postToolUseFailure', 'stop']],
@@ -106,23 +107,69 @@ function checkOtherClients(repo: Repo, add: (s: Check['status'], n: string, d: s
   const {dir} = hd
   // a Stopbar line that is not a comment: the hook init writes, or `stopbar git-hook <name>` chained by hand (Husky, Lefthook)
   const calls = (n: string) => new RegExp(`^[^#\\n]*stopbar(\\.mjs)?"?\\s+git-hook\\s+${n}\\b`, 'm')
-  const gh = ['pre-commit', 'pre-push'].filter((n) => existsSync(join(dir, n)) && calls(n).test(readFileSync(join(dir, n), 'utf8')))
-  const lacking = ['pre-commit', 'pre-push'].filter((n) => !gh.includes(n))
+  const NAMES = ['pre-commit', 'pre-push']
+  const gh = NAMES.filter((n) => existsSync(join(dir, n)) && calls(n).test(readFileSync(join(dir, n), 'utf8')))
+  const lacking = NAMES.filter((n) => !gh.includes(n))
+  const verb = (ns: string[]) => `git ${ns.map((n) => (n === 'pre-commit' ? 'commit' : 'push')).join(' and git ')} ${ns.length > 1 ? 'are' : 'is'}`
   // the git hooks close what an agent hook cannot see: git aliases, and on pre-push merge, cherry-pick, am and commit-tree
-  if (!lacking.length) add('OK', 'hooks git', `pre-commit, pre-push in ${dir}`)
-  else if (hd.customHooksPath !== null) {
-    // the exact line for the existing hook manager (Husky, Lefthook, a shared directory): the pinned runtime, else this copy
-    const rt = existsSync(join(repo.stateDir, 'runtime', 'bin', 'stopbar.mjs')) ? join(repo.stateDir, 'runtime') : PKG_ROOT
-    const bin = join(rt, 'bin', 'stopbar.mjs').replace(/\\/g, '/')
-    let cli = cliOf({})
-    try { cli = cliOf(readConfig(repo)) } catch { /* reported by the config.json check */ }
-    add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in the custom core.hooksPath (${dir}): git ${lacking.map((n) => (n === 'pre-commit' ? 'commit' : 'push')).join(' and git ')} ` +
-      `${lacking.length > 1 ? 'are' : 'is'} NOT gated by Stopbar in this repository. Stopbar does not write shared or tracked hooks; a human adds one line to each hook of the existing hook manager: ` +
-      lacking.map((n) => `${n}: node "${bin}" git-hook ${n}`).join('; ') + ` (or \`${cli} git-hook pre-commit|pre-push\`); ` +
+  if (!lacking.length) { add('OK', 'hooks git', `pre-commit, pre-push in ${dir}`); return {clients: found, git: gh.length} }
+  let cli = cliOf({})
+  try { cli = cliOf(readConfig(repo)) } catch { /* reported by the config.json check */ }
+  const pinned = existsSync(join(repo.stateDir, 'runtime', 'bin', 'stopbar.mjs'))
+  const hint = portableHookHint(dir, repo.root, cli, pinned, lacking)
+  // a git hook that was there and is gone is a FAIL (an agent or a tool removed the gate); never configured is a WARN
+  const gone = lacking.map((n) => ({n, why: hookWasThere(repo, dir, n, ev, calls(n), gh.length === 1)})).filter((x) => x.why)
+  if (gone.length) {
+    add('FAIL', 'hooks git', `the Stopbar ${gone.map((g) => g.n).join(' and ')} hook ${gone.length > 1 ? 'were' : 'was'} configured and ${gone.length > 1 ? 'are' : 'is'} gone from ${dir} ` +
+      `(${gone.map((g) => `${g.n}: ${g.why}`).join('; ')}): ${verb(gone.map((g) => g.n))} NOT gated by Stopbar. A human restores ${hd.customHooksPath !== null ? `the line: ${hint}` : 'it: `stopbar upgrade --hooks git`'}`)
+  } else if (hd.customHooksPath !== null) {
+    add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in the custom core.hooksPath (${dir}): ${verb(lacking)} NOT gated by Stopbar in this repository. ` +
+      `Stopbar does not write shared or tracked hooks; a human chains them in the existing hook manager: ${hint}; ` +
       'or runs `stopbar upgrade --hooks git --force-hooks` to write them there, keeping a .stopbar-backup')
-  }
-  else add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in ${dir}: the git hooks close git aliases, and on pre-push merge, cherry-pick, am and commit-tree, which an agent hook does not see; a human runs \`stopbar upgrade --hooks git\``)
+  } else add('WARN', 'hooks git', `no Stopbar ${lacking.join(' and ')} hook in ${dir}: the git hooks close git aliases, and on pre-push merge, cherry-pick, am and commit-tree, which an agent hook does not see; a human runs \`stopbar upgrade --hooks git\``)
   return {clients: found, git: gh.length}
+}
+
+/** Why the git hook `n` counts as configured before (so its absence is a FAIL), or null:
+ *  - the last `human:init`, or an upgrade after it, wrote it (event field gitHooksWritten, since 1.2.2);
+ *  - a `git-hook` run of it is logged since the last init or reset;
+ *  - a tracked hook file (custom core.hooksPath inside the tree) calls it in HEAD;
+ *  - the other hook is in place and the log does not say that Stopbar left this one out (`partial`).
+ *  Reads only: the event log is never written here. */
+function hookWasThere(repo: Repo, dir: string, n: string, ev: Ev[], call: RegExp, partial: boolean): string | null {
+  let lastInit = -1, lastStart = -1
+  ev.forEach((e, i) => { if (e.source === 'human:init') lastInit = i; if (e.source === 'human:init' || e.source === 'human:reset') lastStart = i })
+  let wroteBy: string | null = null, skipped = false
+  for (const e of ev.slice(Math.max(lastInit, 0))) {
+    if ((e.source !== 'human:init' && e.source !== 'human:upgrade') || !Array.isArray(e.gitHooksWritten)) continue
+    if ((e.gitHooksWritten as unknown[]).includes(n)) wroteBy = e.source === 'human:upgrade' ? 'upgrade' : 'init'
+    else if (e.source === 'human:init') skipped = true
+  }
+  if (wroteBy) return `written by stopbar ${wroteBy}`
+  if (ev.slice(lastStart + 1).some((e) => e.source === 'hook-timing' && e.adapter === 'git' && e.gitHook === n)) return 'it ran since the last init or reset'
+  const rel = relative(repo.root, join(dir, n))
+  if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+    try { if (call.test(git(repo.root, ['show', `HEAD:${rel.replace(/\\/g, '/')}`]))) return `HEAD:${rel.replace(/\\/g, '/')} calls it` } catch { /* not tracked */ }
+  }
+  if (partial && !skipped) return 'only the other hook is in place'
+  return null
+}
+
+/** On Windows, a gate command `bash ...` with a bare `bash` may start WSL's bash (System32 or WindowsApps) instead of Git
+ *  Bash: another file system and PATH, so the gate fails or tests something else. */
+export function wslBashWarning(cmds: string[], whereBash: () => string | null, platform: string = process.platform): string | null {
+  if (platform !== 'win32' || !cmds.some((c) => /^bash(?:\.exe)?\s/i.test(c.trim()))) return null
+  const first = whereBash()
+  if (!first || !/\\(?:WindowsApps|System32)\\bash\.exe$/i.test(first)) return null
+  return `buildCmd or fullTestCmd starts with a bare \`bash\`, and the first bash on PATH is WSL (${first}): the gate runs in WSL, not in Git Bash. ` +
+    'A human runs `stopbar init --force` with the full path to Git Bash in --build / --test (e.g. "C:/Program Files/Git/bin/bash.exe" ...)'
+}
+function checkWslBash(cmds: string[], add: (s: Check['status'], n: string, d: string) => void) {
+  const where = () => {
+    try { return execFileSync('where', ['bash'], {encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true}).split(/\r?\n/)[0].trim() || null } catch { return null }
+  }
+  const w = wslBashWarning(cmds, where)
+  if (w) add('WARN', 'gate shell', w)
 }
 
 /** The real hook pipeline (in process) on a scratch repository inside <git-dir>/stopbar/doctor-run. */
@@ -161,7 +208,8 @@ function dryRun(base: string, add: (s: Check['status'], n: string, d: string) =>
   }
 }
 
-export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code: number; msg: string}> {
+/** `strict`: a [WARN] fails too (exit 1), for CI. The repository's event log is only read (attest hashes it). */
+export async function doctor(o: {repo?: string; json?: boolean; strict?: boolean}): Promise<{code: number; msg: string}> {
   const checks: Check[] = []
   const add = (status: Check['status'], name: string, detail: string) => { checks.push({status, name, detail}) }
   const [maj, min] = process.versions.node.split('.').map(Number)
@@ -195,6 +243,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
       if (missing.length) add('WARN', 'safeTools', `missing default ${missing.join(', ')}: these local tools count as outbound after a secret read; add them to config.safeTools or run \`stopbar init --force ...\``)
       if (cfg.baseRef) add(hasRefTree(repo.root, cfg.baseRef) ? 'OK' : 'FAIL', 'baseRef', hasRefTree(repo.root, cfg.baseRef) ? `${cfg.baseRef} resolves to a tree` : `${cfg.baseRef} does not resolve in git (existing-test checks will fail closed)`)
       for (const [k, v] of [['buildCmd', cfg.buildCmd], ['fullTestCmd', cfg.fullTestCmd]]) if (hasChain(v)) add('FAIL', 'config.json', `${k} has shell operators: it can never pass as a gate`)
+      checkWslBash([cfg.buildCmd, cfg.fullTestCmd], add)
       try {
         const s = readState(repo), v = decode(s.kernel)
         add(v.halted ? 'WARN' : 'OK', 'state.json', `revision ${v.treeRev}; ${v.halted ? 'HALTED' : 'running'}; spent ${v.spent}/${v.capNow}; tainted ${v.testsTainted}`)
@@ -208,7 +257,7 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
       const same = existsSync(join(PKG_ROOT, 'dist', 'kernel.gen.js')) && sha(rt) === sha(join(PKG_ROOT, 'dist', 'kernel.gen.js'))
       add(same ? 'OK' : 'WARN', 'pinned runtime', `${join(repo.stateDir, 'runtime')}${same ? ' (same kernel as this package)' : ' differs from this package: a human runs `stopbar upgrade` to re-pin (state and gates are kept)'}`)
     } else if (cfgOk) add('WARN', 'pinned runtime', 'none: hooks run an unpinned copy (init --no-pin)')
-    const others = checkOtherClients(repo, add)
+    const others = checkOtherClients(repo, ev.events, add)
     const claudeHas = ['settings.json', 'settings.local.json'].some((n) => { const h = hooksIn(join(repo!.root, '.claude', n)); return h !== null && Object.keys(stopbarCommands(h)).length > 0 })
     // Claude Code hooks named at the last init or upgrade must be there, also when other hooks (now the git hooks by
     // default) exist; without any client hooks, the Claude Code ones are reported as missing (v1.0 output)
@@ -218,8 +267,10 @@ export async function doctor(o: {repo?: string; json?: boolean}): Promise<{code:
     try { dryRun(repo.stateDir, add) } catch (e) { add('FAIL', 'dry run', String(e)) }
   }
   const fails = checks.filter((c) => c.status === 'FAIL').length, warns = checks.filter((c) => c.status === 'WARN').length
-  const msg = o.json ? JSON.stringify({version: VERSION, ok: fails === 0, fails, warns, checks}, null, 1)
-    : [`stopbar doctor (Stopbar ${VERSION})`, ...checks.map((c) => `[${c.status.padEnd(4)}] ${c.name.padEnd(18)} ${c.detail}`),
-      `RESULT: ${fails ? `FAIL (${fails} problem(s), ${warns} warning(s))` : `OK (${warns} warning(s))`}`].join('\n')
-  return {code: fails ? 1 : 0, msg}
+  const strictFail = o.strict === true && warns > 0
+  const ok = fails === 0 && !strictFail
+  const msg = o.json ? JSON.stringify({version: VERSION, ok, fails, warns, ...(o.strict ? {strict: true} : {}), checks}, null, 1)
+    : [`stopbar doctor (Stopbar ${VERSION})${o.strict ? ' --strict' : ''}`, ...checks.map((c) => `[${c.status.padEnd(4)}] ${c.name.padEnd(18)} ${c.detail}`),
+      `RESULT: ${fails ? `FAIL (${fails} problem(s), ${warns} warning(s))` : strictFail ? `FAIL (strict: ${warns} warning(s))` : `OK (${warns} warning(s))`}`].join('\n')
+  return {code: ok ? 0 : 1, msg}
 }

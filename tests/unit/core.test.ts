@@ -7,7 +7,7 @@ import {test} from 'node:test'
 import {fileURLToPath} from 'node:url'
 import {decode, encodeInput, initKernel, kstep, MACHINE} from '../../dist/engine.js'
 import * as G from '../../dist/kernel.gen.js'
-import {changesSinceHead, changesSinceRef, digest, diffEntries, FailClosed, findRepo, inRef, oidOf, parseIndex, refEntries} from '../../dist/repo.js'
+import {changesSinceHead, changesSinceRef, digest, diffEntries, FailClosed, findRepo, inRef, oidOf, parseIndex, readHooksPath, refEntries} from '../../dist/repo.js'
 import {appendEvent, readEvents, validateState} from '../../dist/store.js'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -179,4 +179,40 @@ test('F4 attestation: an events.jsonl with more than 130000 lines stays consiste
   const a = attestation(d)
   assert.equal(a.consistent, true, JSON.stringify(a.checks))
   assert.ok(a.log.entries > 140000)
+})
+
+test('1.2.2 readHooksPath: core.hooksPath from .git/config (and commondir, config.worktree) without a git process', () => {
+  const d = join(TMP, 'hooks-path'), gd = join(d, '.git')
+  rmSync(d, {recursive: true, force: true}); mkdirSync(gd, {recursive: true})
+  const r = {root: d, gitDir: gd, stateDir: join(gd, 'stopbar')}
+  assert.equal(readHooksPath(r), null, 'no config')
+  writeFileSync(join(gd, 'config'), '[core]\n\trepositoryformatversion = 0\n[remote "o"]\n\thooksPath = nope\n')
+  assert.equal(readHooksPath(r), null, 'hooksPath outside [core]')
+  writeFileSync(join(gd, 'config'), '[core]\n\tbare = false\n[Core]\n\tHooksPath = .husky ; comment\n')
+  assert.deepEqual(readHooksPath(r), {raw: '.husky', dir: resolve(d, '.husky')})
+  writeFileSync(join(gd, 'config'), '[core] hooksPath = "custom hooks/x" # c\n')
+  assert.deepEqual(readHooksPath(r), {raw: 'custom hooks/x', dir: resolve(d, 'custom hooks/x')})
+  writeFileSync(join(gd, 'config'), '[core]\n\thooksPath = .git/hooks\n')
+  assert.equal(readHooksPath(r), null, 'the default <common-dir>/hooks is not custom')
+  // a worktree: its gitdir has commondir; config.worktree wins over the shared config
+  const wt = join(gd, 'worktrees', 'w'), wr = {root: join(TMP, 'hooks-path-wt'), gitDir: wt, stateDir: join(wt, 'stopbar')}
+  mkdirSync(wt, {recursive: true}); writeFileSync(join(wt, 'commondir'), '../..\n')
+  writeFileSync(join(gd, 'config'), '[core]\n\thooksPath = .husky\n')
+  assert.deepEqual(readHooksPath(wr), {raw: '.husky', dir: resolve(wr.root, '.husky')})
+  writeFileSync(join(wt, 'config.worktree'), '[core]\n\thooksPath = wt-hooks\n')
+  assert.deepEqual(readHooksPath(wr), {raw: 'wt-hooks', dir: resolve(wr.root, 'wt-hooks')})
+})
+
+test('1.2.2 stopbar run: on Windows the gate command gets no inherited PWD; doctor warns when a bare bash is WSL', async () => {
+  const {gateEnv} = await import('../../dist/run.js')
+  const env = {PATH: '/usr/bin', PWD: 'C:/foo', Path: 'x'}
+  assert.deepEqual(gateEnv(env, 'win32'), {PATH: '/usr/bin', Path: 'x'})
+  assert.equal(gateEnv(env, 'linux'), env)
+  const {wslBashWarning} = await import('../../dist/doctor.js')
+  const wsl = () => String.raw`C:\Users\u\AppData\Local\Microsoft\WindowsApps\bash.exe`
+  assert.match(wslBashWarning(['bash scripts/build.sh', 'npm test'], wsl, 'win32') ?? '', /WSL .*full path to Git Bash/)
+  assert.match(wslBashWarning(['npm run build', 'bash -c x'], () => String.raw`C:\Windows\System32\bash.exe`, 'win32') ?? '', /WSL/)
+  assert.equal(wslBashWarning(['bash scripts/build.sh', 'npm test'], () => String.raw`C:\Program Files\Git\usr\bin\bash.exe`, 'win32'), null)
+  assert.equal(wslBashWarning(['"C:/Program Files/Git/bin/bash.exe" build.sh', 'npm test'], wsl, 'win32'), null)
+  assert.equal(wslBashWarning(['bash build.sh', 'npm test'], wsl, 'linux'), null)
 })

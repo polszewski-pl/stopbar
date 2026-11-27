@@ -211,6 +211,6 @@ export function initProbe(o: InitOptions = {}): InitResult {
     .replaceAll('__NAME__', name).replace('__RUN__', command)
   mkdirSync(dir, {recursive: true})
   writeFileSync(file, text)
-  const needs = lang === 'ts' ? `\n  (needs stopbar in the project, so that 'stopbar/probe' resolves: npm install --save-dev stopbar)` : ''
+  const needs = lang === 'ts' ? `\n  (\`stopbar probe\` resolves 'stopbar/probe' itself; an editor or tsc needs stopbar in the project: npm install --save-dev stopbar)` : ''
   return {file, lang, command, message: `wrote ${file}\nrun it:\n  ${command}${needs}`}
 }
